@@ -18,6 +18,7 @@
  *          └──────┴───────────────────────────┴───┴────────┘
  */
 
+import { EQ_RANGE_DB } from "../config/eq";
 import { DB_MAX, DB_MIN, F_MAX, F_MIN, clamp, hzToNorm, normToHz } from "../config/scales";
 
 export interface Rect {
@@ -107,6 +108,25 @@ export function yOfDb(l: PlotLayout, db: number): number {
 export function dbOfY(l: PlotLayout, y: number): number {
   const t = 1 - (y - l.plot.y) / l.plot.h;
   return DB_MIN + clamp(t, 0, 1) * (DB_MAX - DB_MIN);
+}
+
+/**
+ * The EQ's own vertical scale, laid over the level axis.
+ *
+ * A gain is not a level, so it cannot share the dB axis — there is no level a
+ * "+6 dB boost" belongs at. It gets the conventional treatment instead: zero at
+ * the vertical centre, ±`EQ_RANGE_DB` across the full height. The two scales
+ * coexist because the EQ curve is drawn in the accent colour and nothing else
+ * is.
+ */
+export function yOfGain(l: PlotLayout, gainDb: number): number {
+  const half = l.plot.h / 2;
+  return l.plot.y + half - (clamp(gainDb, -EQ_RANGE_DB, EQ_RANGE_DB) / EQ_RANGE_DB) * half;
+}
+
+export function gainOfY(l: PlotLayout, y: number): number {
+  const half = l.plot.h / 2;
+  return clamp(((l.plot.y + half - y) / half) * EQ_RANGE_DB, -EQ_RANGE_DB, EQ_RANGE_DB);
 }
 
 /** Distance in pixels from a point to a keyframe, for hit testing. */

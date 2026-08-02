@@ -94,6 +94,7 @@ Everything else hangs off those two axes:
 
 | Gizmo | Where | What it sets |
 |---|---|---|
+| Parametric EQ | on the plot | a gain curve applied before anything else. Double-click to add a band |
 | Colour keyframes | on the plot | the surface. Right-click to add, drag to move, `Del` to remove |
 | LED keyframes | track under the axis | which LED indices cover which frequencies |
 | Threshold / clamp | rail to the right | the dB window: dark below, full brightness above |
@@ -102,6 +103,36 @@ Everything else hangs off those two axes:
 The curve box is deliberately bounded by the two handles: its top edge *is* the
 clamp line and its bottom edge *is* the threshold line, so the mapping can be
 read straight across from a band rather than mentally rescaled.
+
+The gizmo checkboxes are **visibility, not bypass**. A hidden EQ still shapes
+the spectrum and a hidden threshold still cuts; nothing in that panel touches
+the signal.
+
+### The EQ
+
+Bands are the RBJ cookbook biquads — bell, two shelves, two pass filters —
+evaluated as `|H(e^jw)|` and summed in dB, which is what cascading them does.
+The engine works on band magnitudes rather than samples, so it never runs a
+filter; the *shape* is the entire specification, and computing it properly
+means the engine can use the same coefficients instead of being
+reverse-engineered from a drawing. `ui/src/config/eq.test.ts` asserts the
+closed-form properties (a bell is exactly its gain at centre, a pass filter is
+−3.01 dB at cutoff when `Q = 1/√2`) rather than values captured from a run.
+
+Gain gets its own vertical scale — zero at the centre of the plot, ±24 dB over
+the full height — because a gain is not a level and there is no level a "+6 dB
+boost" belongs at. The EQ is applied upstream of the plot, so the bars always
+show what the LEDs are actually fed.
+
+### Reverse and mirror
+
+Both are spatial: they rearrange where colour lands on the wall and change
+nothing about the analysis, so they apply at the very end and are deliberately
+invisible to the graph. Mirror folds the whole range into each half — low end at
+both tips, high end at the centre — and reverse flips the result, which is what
+puts bass in the middle when the two are combined. An even-length strip has no
+LED at its centre, so the fold approaches the top of the range rather than
+landing on it; `render.test.ts` pins that to one index.
 
 **Only the colour surface and master brightness are in the wire protocol so
 far.** The rest is authored locally, persisted to `localStorage`, and previewed

@@ -8,12 +8,16 @@ import {
   Group,
   NumberInput,
   Popover,
+  Select,
+  Slider,
   Stack,
   Text,
   Tooltip,
   useMantineTheme,
 } from "@mantine/core";
 import { useElementSize, useHotkeys, useMergedRef, useWindowEvent } from "@mantine/hooks";
+
+import { Field } from "../components/Field";
 
 import { oklabToHex } from "../color/oklab";
 import { ColorSurface } from "../color/surface";
@@ -24,6 +28,15 @@ import {
   type EditorConfig,
   type LedKeyframe,
 } from "../config/editor";
+import {
+  EQ_Q_MAX,
+  EQ_Q_MIN,
+  EQ_RANGE_DB,
+  EQ_TYPE_OPTIONS,
+  hasGain,
+  type EqBand,
+  type EqType,
+} from "../config/eq";
 import { DB_MAX, DB_MIN, clamp, formatHz, hzToNorm, snapHz } from "../config/scales";
 import { SpectrumCanvas } from "./SpectrumCanvas";
 import { GizmoLayer, type GizmoTarget } from "./GizmoLayer";
@@ -31,9 +44,11 @@ import {
   computeLayout,
   curveBox,
   dbOfY,
+  gainOfY,
   hzOfX,
   xOfHz,
   yOfDb,
+  yOfGain,
   type PlotLayout,
 } from "./layout";
 import { dbToLevel, type SpectrumFrame } from "./paint";
@@ -51,6 +66,7 @@ interface Props {
   onChange: (config: EditorConfig) => void;
   frame: SpectrumFrame;
   ledCount: number;
+  sampleRate: number;
 }
 
 /** Where the pointer was, relative to the thing it grabbed. */
@@ -60,7 +76,7 @@ interface Grab {
   dy: number;
 }
 
-export function SpectrumEditor({ config, onChange, frame, ledCount }: Props) {
+export function SpectrumEditor({ config, onChange, frame, ledCount, sampleRate }: Props) {
   const theme = useMantineTheme();
   const palette = theme.other.plot;
 
@@ -88,8 +104,8 @@ export function SpectrumEditor({ config, onChange, frame, ledCount }: Props) {
       event.stopPropagation();
       const p = localPoint(event);
       setGrab({ target, ...grabOffset(target, config, layout, p) });
-      if (target.kind === "color" || target.kind === "led") setSelected(target);
-      else setSelected(null);
+      const selectable = target.kind === "color" || target.kind === "led" || target.kind === "eq";
+      setSelected(selectable ? target : null);
     },
     [config, layout, localPoint],
   );
@@ -112,6 +128,10 @@ export function SpectrumEditor({ config, onChange, frame, ledCount }: Props) {
       setSelected(null);
     } else if (selected.kind === "led" && config.ledKeyframes.length > MIN_LED_KEYFRAMES) {
       onChange({ ...config, ledKeyframes: config.ledKeyframes.filter((k) => k.id !== selected.id) });
+      setSelected(null);
+    } else if (selected.kind === "eq") {
+      // No minimum: an EQ with no bands is flat, which is a valid state.
+      onChange({ ...config, eq: config.eq.filter((b) => b.id !== selected.id) });
       setSelected(null);
     }
   }, [config, onChange, selected]);
@@ -159,18 +179,51 @@ export function SpectrumEditor({ config, onChange, frame, ledCount }: Props) {
     [config, layout, ledCount, localPoint, onChange],
   );
 
+  const addEq = useCallback(
+    (event: ReactMouseEvent) => {
+      event.preventDefault();
+      const p = localPoint(event);
+      const band: EqBand = {
+        id: nextId("eq"),
+        type: "peak",
+        hz: snapHz(hzOfX(layout, p.x)),
+        // Placed at the height it was dropped, so a double-click high on the
+        // plot is already a boost rather than a no-op the user has to then drag.
+        gain: Math.round(gainOfY(layout, p.y) * 2) / 2,
+        q: 1,
+      };
+      onChange({ ...config, eq: sortByHz([...config.eq, band]) });
+      setSelected({ kind: "eq", id: band.id });
+    },
+    [config, layout, localPoint, onChange],
+  );
+
+  const updateEq = useCallback(
+    (id: string, patch: Partial<EqBand>) => {
+      onChange({ ...config, eq: config.eq.map((b) => (b.id === id ? { ...b, ...patch } : b)) });
+    },
+    [config, onChange],
+  );
+
   const selectedColor =
     selected?.kind === "color"
       ? config.colorKeyframes.find((k) => k.id === selected.id)
       : undefined;
   const selectedLed =
     selected?.kind === "led" ? config.ledKeyframes.find((k) => k.id === selected.id) : undefined;
+  const selectedEq =
+    selected?.kind === "eq" ? config.eq.find((b) => b.id === selected.id) : undefined;
 
   const anchor = selectedColor
     ? { x: xOfHz(layout, selectedColor.hz), y: yOfDb(layout, selectedColor.db) }
     : selectedLed
       ? { x: xOfHz(layout, selectedLed.hz), y: layout.track.y + 14 }
-      : null;
+      : selectedEq
+        ? {
+            x: xOfHz(layout, selectedEq.hz),
+            y: yOfGain(layout, hasGain(selectedEq.type) ? selectedEq.gain : 0),
+          }
+        : null;
 
   return (
     <Box
@@ -182,11 +235,13 @@ export function SpectrumEditor({ config, onChange, frame, ledCount }: Props) {
         layout={layout}
         config={config}
         palette={palette}
+        sampleRate={sampleRate}
         selected={selected}
         active={grab?.target ?? null}
         onGrab={onGrabTarget}
         onAddColor={addColor}
         onAddLed={addLed}
+        onAddEq={addEq}
         onClearSelection={clearSelection}
       />
 
@@ -301,6 +356,65 @@ export function SpectrumEditor({ config, onChange, frame, ledCount }: Props) {
               />
             </Stack>
           )}
+
+          {selectedEq && (
+            <Stack gap="xs" w={210}>
+              <Group justify="space-between" gap="xs">
+                <Text size="xs" c="dimmed" tt="uppercase" fw={700}>
+                  EQ band
+                </Text>
+                <Tooltip label="Delete (Del)">
+                  <ActionIcon color="red" aria-label="Delete EQ band" onClick={removeSelected}>
+                    <TrashIcon />
+                  </ActionIcon>
+                </Tooltip>
+              </Group>
+              <Select
+                label="Type"
+                data={EQ_TYPE_OPTIONS}
+                value={selectedEq.type}
+                allowDeselect={false}
+                comboboxProps={{ withinPortal: true }}
+                onChange={(value) => updateEq(selectedEq.id, { type: (value as EqType) ?? "peak" })}
+              />
+              <NumberInput
+                label="Frequency"
+                suffix=" Hz"
+                min={20}
+                max={20_000}
+                value={Math.round(selectedEq.hz)}
+                onChange={(value) =>
+                  updateEq(selectedEq.id, { hz: clamp(Number(value) || 20, 20, 20_000) })
+                }
+              />
+              {hasGain(selectedEq.type) && (
+                <NumberInput
+                  label="Gain"
+                  suffix=" dB"
+                  step={0.5}
+                  decimalScale={1}
+                  min={-EQ_RANGE_DB}
+                  max={EQ_RANGE_DB}
+                  value={selectedEq.gain}
+                  onChange={(value) =>
+                    updateEq(selectedEq.id, {
+                      gain: clamp(Number(value) || 0, -EQ_RANGE_DB, EQ_RANGE_DB),
+                    })
+                  }
+                />
+              )}
+              <Field label="Q" value={selectedEq.q.toFixed(2)}>
+                <Slider
+                  min={EQ_Q_MIN}
+                  max={EQ_Q_MAX}
+                  step={0.05}
+                  value={selectedEq.q}
+                  onChange={(q) => updateEq(selectedEq.id, { q })}
+                  label={(v) => v.toFixed(2)}
+                />
+              </Field>
+            </Stack>
+          )}
         </Popover.Dropdown>
       </Popover>
     </Box>
@@ -327,6 +441,15 @@ function grabOffset(
   if (target.kind === "led") {
     const k = config.ledKeyframes.find((c) => c.id === target.id);
     if (k) return { dx: xOfHz(layout, k.hz) - p.x, dy: 0 };
+  }
+  if (target.kind === "eq") {
+    const b = config.eq.find((c) => c.id === target.id);
+    if (b) {
+      return {
+        dx: xOfHz(layout, b.hz) - p.x,
+        dy: yOfGain(layout, hasGain(b.type) ? b.gain : 0) - p.y,
+      };
+    }
   }
   return { dx: 0, dy: 0 };
 }
@@ -358,6 +481,22 @@ function applyDrag(
         ...config,
         ledKeyframes: sortByHz(
           config.ledKeyframes.map((k) => (k.id === id ? { ...k, hz } : k)),
+        ),
+      };
+    }
+    case "eq": {
+      const id = grab.target.id;
+      const hz = snapHz(hzOfX(layout, x));
+      return {
+        ...config,
+        eq: sortByHz(
+          config.eq.map((b) => {
+            if (b.id !== id) return b;
+            // A pass filter has no gain to drag, so vertical movement is
+            // discarded rather than silently stored and never used.
+            const gain = hasGain(b.type) ? round1(gainOfY(layout, y)) : 0;
+            return { ...b, hz, gain };
+          }),
         ),
       };
     }

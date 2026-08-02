@@ -1,4 +1,4 @@
-import { Divider, Paper, Select, Slider, Stack, Text } from "@mantine/core";
+import { Checkbox, Divider, Paper, Select, Slider, Stack, Text } from "@mantine/core";
 
 import { CURVE_OPTIONS, type CurveType } from "../config/curve";
 import { SAMPLE_LENGTHS, type EditorConfig } from "../config/editor";
@@ -106,7 +106,34 @@ export function SettingsPanel({ config, onChange, brightness, onBrightness, samp
             label={(v) => `${Math.round(v * 100)}%`}
           />
         </Field>
+
+        <Stack gap="xs">
+          <Checkbox
+            label="Reverse"
+            checked={config.reverse}
+            onChange={(e) => onChange({ ...config, reverse: e.currentTarget.checked })}
+          />
+          <Checkbox
+            label="Mirror"
+            checked={config.mirror}
+            onChange={(e) => onChange({ ...config, mirror: e.currentTarget.checked })}
+          />
+          <Text size="xs" c="dimmed" lh={1.35}>
+            {describeLayout(config.mirror, config.reverse)}
+          </Text>
+        </Stack>
       </Stack>
     </Paper>
   );
+}
+
+/**
+ * Spelled out rather than left to the checkbox labels: the combination of the
+ * two is not something anyone should have to work out from first principles.
+ */
+function describeLayout(mirror: boolean, reverse: boolean): string {
+  if (mirror && reverse) return "Bass in the middle, treble at both ends.";
+  if (mirror) return "Bass at both ends, treble in the middle.";
+  if (reverse) return "Treble at the start of the strip, bass at the end.";
+  return "Bass at the start of the strip, treble at the end.";
 }

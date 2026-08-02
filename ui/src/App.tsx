@@ -25,13 +25,14 @@ import {
   withSurface,
   type EditorConfig,
 } from "./config/editor";
+import { DEFAULT_SAMPLE_RATE, EqCurve } from "./config/eq";
 import { GizmoPanel } from "./components/GizmoPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { StripPreview } from "./components/StripPreview";
 import { DEFAULT_URL, EngineClient, decodeStrip, type Frame, type Status } from "./engine";
 import { SpectrumEditor } from "./spectrum/SpectrumEditor";
 import type { SpectrumFrame } from "./spectrum/paint";
-import { renderStrip } from "./spectrum/render";
+import { applyEq, renderStrip } from "./spectrum/render";
 
 /** Sampled once at load: a later save must not change what a reconnect does. */
 const HAD_LOCAL_CONFIG = hasStoredConfig();
@@ -87,7 +88,14 @@ export default function App() {
   const demo = useDemoFrame(status !== "connected");
   const live: SpectrumFrame | null =
     status === "connected" && frame ? { levels: frame.levels, centers: frame.centers } : null;
-  const spectrum = live ?? demo;
+  const captured = live ?? demo;
+
+  const sampleRate = frame?.sampleRate || DEFAULT_SAMPLE_RATE;
+
+  // The EQ is upstream of everything: the plot and the strip are both shown
+  // post-EQ, so the bars never disagree with what the LEDs are being fed.
+  const eqCurve = useMemo(() => new EqCurve(config.eq, sampleRate), [config.eq, sampleRate]);
+  const spectrum = useMemo(() => applyEq(captured, eqCurve), [captured, eqCurve]);
 
   const previewStrip = useMemo(
     () => renderStrip(config, spectrum, ledCount, brightness),
@@ -148,10 +156,12 @@ export default function App() {
                 onChange={applyConfig}
                 frame={spectrum}
                 ledCount={ledCount}
+                sampleRate={sampleRate}
               />
               <Text size="xs" c="dimmed">
-                Right-click the graph to add a colour keyframe · right-click the LED track to add a
-                sector · click to select, <Kbd size="xs">Del</Kbd> to remove
+                Right-click the graph for a colour keyframe · double-click for an EQ band ·
+                right-click the LED track for a sector · click to select,{" "}
+                <Kbd size="xs">Del</Kbd> to remove
               </Text>
             </Stack>
           </Paper>
@@ -161,7 +171,9 @@ export default function App() {
           <Stack gap="md">
             <StripPreview
               label="Preview"
-              hint={`${ledCount} LEDs`}
+              hint={[`${ledCount} LEDs`, config.mirror && "mirrored", config.reverse && "reversed"]
+                .filter(Boolean)
+                .join(" · ")}
               colors={previewStrip}
               height={30}
             />

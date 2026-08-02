@@ -10,6 +10,7 @@
 
 import { DEFAULT_SURFACE, type SurfaceConfig } from "../color/surface";
 import type { CurveConfig } from "./curve";
+import type { EqBand } from "./eq";
 import { DB_MAX, DB_MIN, dbToNorm, hzToNorm, normToDb, normToHz } from "./scales";
 
 /** A colour authored at a point on the spectrum plot. */
@@ -37,11 +38,18 @@ export interface GizmoFlags {
   colorKeyframes: boolean;
   ledKeyframes: boolean;
   curve: boolean;
+  eq: boolean;
 }
 
 export interface EditorConfig {
   colorKeyframes: ColorKeyframe[];
   ledKeyframes: LedKeyframe[];
+  /** Applied to the spectrum before anything else looks at it. */
+  eq: EqBand[];
+  /** Play the strip back to front. */
+  reverse: boolean;
+  /** Fold the whole range into each half of the strip. */
+  mirror: boolean;
   /** dB below which a band is dark. */
   threshold: number;
   /** dB at and above which a band is at full brightness. */
@@ -79,13 +87,18 @@ export const DEFAULT_CONFIG: EditorConfig = {
     { id: nextId("led"), led: 0, hz: 20 },
     { id: nextId("led"), led: 149, hz: 20_000 },
   ],
+  // Flat. The EQ is a correction layer, so having it do nothing until asked is
+  // the only honest default.
+  eq: [],
+  reverse: false,
+  mirror: false,
   threshold: -62,
   clamp: -6,
   curve: { type: "linear", p1: { x: 0.25, y: 0.1 }, p2: { x: 0.25, y: 1 } },
   decay: 0.82,
   sampleLength: 2048,
   blend: DEFAULT_SURFACE.sigma,
-  gizmos: { thresholds: true, colorKeyframes: true, ledKeyframes: true, curve: true },
+  gizmos: { thresholds: true, colorKeyframes: true, ledKeyframes: true, curve: true, eq: true },
 };
 
 /** The half of the config the engine understands today. */
@@ -132,6 +145,9 @@ export function loadConfig(): EditorConfig {
       ledKeyframes: Array.isArray(parsed.ledKeyframes) && parsed.ledKeyframes.length
         ? parsed.ledKeyframes
         : DEFAULT_CONFIG.ledKeyframes,
+      // Empty is a legitimate EQ, so unlike the keyframes this only guards
+      // against the field being absent or the wrong shape.
+      eq: Array.isArray(parsed.eq) ? parsed.eq : DEFAULT_CONFIG.eq,
       curve: { ...DEFAULT_CONFIG.curve, ...parsed.curve },
       gizmos: { ...DEFAULT_CONFIG.gizmos, ...parsed.gizmos },
       threshold: clampDb(parsed.threshold, DEFAULT_CONFIG.threshold),

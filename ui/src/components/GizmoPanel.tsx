@@ -8,6 +8,7 @@ interface Props {
 }
 
 const ITEMS: Array<{ key: keyof GizmoFlags; label: string }> = [
+  { key: "eq", label: "Parametric EQ" },
   { key: "thresholds", label: "Threshold handles" },
   { key: "colorKeyframes", label: "Colour keyframes" },
   { key: "ledKeyframes", label: "LED keyframes" },
@@ -17,6 +18,9 @@ const ITEMS: Array<{ key: keyof GizmoFlags; label: string }> = [
 /**
  * Which overlays are drawn. Hiding a gizmo hides its handles too, so the plot
  * can be read as a plain analyser without anything to catch a stray click.
+ *
+ * These are visibility, not bypass: a hidden EQ still shapes the spectrum, and
+ * a hidden threshold still cuts. Nothing here changes the signal.
  */
 export function GizmoPanel({ config, onChange }: Props) {
   const value = ITEMS.filter((i) => config.gizmos[i.key]).map((i) => i.key);
@@ -26,6 +30,9 @@ export function GizmoPanel({ config, onChange }: Props) {
       <Stack gap="sm">
         <Text size="xs" c="dimmed" fw={700} tt="uppercase" lts="0.08em">
           Gizmos
+        </Text>
+        <Text size="xs" c="dimmed">
+          Visibility only — everything stays in the signal path.
         </Text>
         <Checkbox.Group
           value={value}

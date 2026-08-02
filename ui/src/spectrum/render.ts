@@ -12,10 +12,54 @@ import { oklabToDisplay, type Rgb } from "../color/display";
 import { ColorSurface } from "../color/surface";
 import { evalCurve } from "../config/curve";
 import { toSurface, type EditorConfig, type LedKeyframe } from "../config/editor";
-import { clamp, hzToNorm, normToHz } from "../config/scales";
+import type { EqCurve } from "../config/eq";
+import { DB_MAX, DB_MIN, clamp, hzToNorm, normToHz } from "../config/scales";
 import { levelToDb, type SpectrumFrame } from "./paint";
 
 const BLACK: Rgb = [0, 0, 0];
+
+const DB_SPAN = DB_MAX - DB_MIN;
+
+/**
+ * The EQ, applied to the analyser's output before anything else sees it.
+ *
+ * This runs upstream of the plot as well as the strip, so the bars always show
+ * what the LEDs are actually fed. Hiding the EQ gizmo hides the curve, not its
+ * effect — the same way hiding the threshold handles does not stop the
+ * threshold cutting.
+ */
+export function applyEq(frame: SpectrumFrame, curve: EqCurve): SpectrumFrame {
+  if (curve.isFlat) return frame;
+  return {
+    centers: frame.centers,
+    levels: frame.levels.map((level, i) => {
+      const hz = frame.centers[i];
+      if (hz === undefined) return level;
+      // Levels are a linear remap of the dB axis, so a dB gain is a fixed
+      // fraction of the range rather than a multiply.
+      return clamp(level + curve.gainAt(hz) / DB_SPAN, 0, 1);
+    }),
+  };
+}
+
+/**
+ * Which logical LED an output position shows.
+ *
+ * Both transforms are spatial, not spectral — they rearrange where colours land
+ * on the wall and change nothing about the analysis — so they are applied here
+ * at the very end and are deliberately invisible to the graph.
+ *
+ * Mirror folds the whole range into each half, so both ends of the strip show
+ * the low end and the centre shows the high end. Reverse then flips what that
+ * lookup returns, which is what puts bass in the middle when both are on.
+ */
+export function sourceIndex(i: number, n: number, mirror: boolean, reverse: boolean): number {
+  if (n <= 1) return 0;
+  let u = i / (n - 1);
+  if (mirror) u = u < 0.5 ? u * 2 : (1 - u) * 2;
+  if (reverse) u = 1 - u;
+  return Math.round(u * (n - 1));
+}
 
 /**
  * The frequency an LED displays.
@@ -82,7 +126,8 @@ export function renderStrip(
   const out: Rgb[] = new Array(ledCount);
 
   for (let i = 0; i < ledCount; i++) {
-    const hz = ledFrequency(config.ledKeyframes, i);
+    const led = sourceIndex(i, ledCount, config.mirror, config.reverse);
+    const hz = ledFrequency(config.ledKeyframes, led);
     if (hz === null) {
       out[i] = BLACK;
       continue;

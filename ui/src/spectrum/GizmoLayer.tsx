@@ -4,32 +4,43 @@ import type { EditorConfig } from "../config/editor";
 import { DB_TICKS, FREQ_TICKS, formatHz } from "../config/scales";
 import type { PlotPalette } from "../theme";
 import { CurveGizmo } from "./CurveGizmo";
+import { EqGizmo } from "./EqGizmo";
 import { curveBox, railLaneX, xOfHz, yOfDb, type PlotLayout } from "./layout";
 
 /** Anything that can be grabbed. Also what a selection points at. */
 export type GizmoTarget =
   | { kind: "color"; id: string }
   | { kind: "led"; id: string }
+  | { kind: "eq"; id: string }
   | { kind: "threshold" }
   | { kind: "clamp" }
   | { kind: "curve"; point: 1 | 2 };
 
 export function sameTarget(a: GizmoTarget | null, b: GizmoTarget | null): boolean {
   if (!a || !b || a.kind !== b.kind) return false;
-  if (a.kind === "color" || a.kind === "led") return a.id === (b as typeof a).id;
+  if (a.kind === "color" || a.kind === "led" || a.kind === "eq") {
+    return a.id === (b as typeof a).id;
+  }
   if (a.kind === "curve") return a.point === (b as typeof a).point;
   return true;
+}
+
+/** The id in a target that carries one, or null. */
+export function targetId(target: GizmoTarget | null, kind: "color" | "led" | "eq"): string | null {
+  return target?.kind === kind ? target.id : null;
 }
 
 interface Props {
   layout: PlotLayout;
   config: EditorConfig;
   palette: PlotPalette;
+  sampleRate: number;
   selected: GizmoTarget | null;
   active: GizmoTarget | null;
   onGrab: (target: GizmoTarget, event: ReactPointerEvent) => void;
   onAddColor: (event: ReactMouseEvent) => void;
   onAddLed: (event: ReactMouseEvent) => void;
+  onAddEq: (event: ReactMouseEvent) => void;
   onClearSelection: () => void;
 }
 
@@ -52,11 +63,13 @@ export const GizmoLayer = memo(function GizmoLayer({
   layout,
   config,
   palette,
+  sampleRate,
   selected,
   active,
   onGrab,
   onAddColor,
   onAddLed,
+  onAddEq,
   onClearSelection,
 }: Props) {
   const { plot, gutter, axis, track } = layout;
@@ -72,7 +85,11 @@ export const GizmoLayer = memo(function GizmoLayer({
       height={layout.height}
       style={{ position: "absolute", inset: 0, pointerEvents: "none", userSelect: "none" }}
     >
-      {/* Background target: right-click adds a keyframe, left-click deselects. */}
+      {/*
+        Background target. Right-click adds a colour keyframe and double-click
+        adds an EQ band — the two gestures share the plot, so they cannot share
+        a button, and double-click is what every EQ already uses.
+      */}
       <rect
         x={plot.x}
         y={plot.y}
@@ -81,6 +98,7 @@ export const GizmoLayer = memo(function GizmoLayer({
         fill="transparent"
         style={{ pointerEvents: "all", cursor: "crosshair" }}
         onContextMenu={onAddColor}
+        onDoubleClick={onAddEq}
         onPointerDown={onClearSelection}
       />
 
@@ -111,6 +129,20 @@ export const GizmoLayer = memo(function GizmoLayer({
             />
           );
         })}
+
+      {/* Under the threshold lines: the EQ fills an area, and a filled shape
+          drawn last would bury them. */}
+      {gizmos.eq && (
+        <EqGizmo
+          layout={layout}
+          bands={config.eq}
+          sampleRate={sampleRate}
+          palette={palette}
+          selectedId={targetId(selected, "eq")}
+          activeId={targetId(active, "eq")}
+          onGrab={(id, e) => onGrab({ kind: "eq", id }, e)}
+        />
+      )}
 
       {gizmos.thresholds && (
         <>
