@@ -1,0 +1,316 @@
+//! WebSocket bridge to the editor UI.
+//!
+//! The engine stays a headless service and the UI is just a client. That keeps
+//! the real-time path completely insulated: nothing the browser does can block
+//! analysis, and the UI can be reloaded, closed, or never opened at all without
+//! the strip noticing.
+//!
+//! # Threading
+//!
+//! One thread accepts connections and one more per client. Clients read a shared
+//! snapshot under a mutex — the analysis thread writes it once per frame and
+//! never waits on a reader, because the lock is held only for a memcpy.
+//!
+//! Commands travel the other way over an unbounded channel, drained by the
+//! engine between frames. A UI that floods commands therefore cannot stall
+//! rendering; it just queues.
+//!
+//! # Wire format
+//!
+//! JSON, because the volume is trivial on localhost and being able to watch the
+//! traffic in devtools is worth more than the bytes. The one concession is the
+//! strip preview, sent as a hex string rather than a nested array — at 600 LEDs
+//! that is the difference between roughly 1 KB and 8 KB per frame.
+
+use std::io::ErrorKind;
+use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::color::SurfaceConfig;
+
+pub const DEFAULT_PORT: u16 = 9001;
+
+/// How often each client is served. The analyser runs far faster; the UI is a
+/// display, and 30 fps is past the point of visible improvement.
+const SEND_INTERVAL: Duration = Duration::from_millis(33);
+
+/// What the UI is shown each frame.
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Snapshot {
+    /// Bar level per band, 0..1.
+    pub levels: Vec<f32>,
+    /// Band centre frequencies, so the UI can label its axis without
+    /// reimplementing the band scale.
+    pub centers: Vec<f32>,
+    /// The strip as the firmware will drive it, hex-encoded RGB.
+    pub strip: String,
+    pub sample_rate: f64,
+    pub connected: bool,
+    pub dropped_frames: u64,
+}
+
+/// What the UI can change.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum Command {
+    /// Replace the colour surface. Applied on the next frame.
+    Surface { surface: SurfaceConfig },
+    /// Master brightness, 0..1.
+    Brightness { value: f32 },
+    /// Ask for the current configuration, e.g. after a reload.
+    RequestState,
+}
+
+/// Sent once on connect, and on request, so the UI can populate its editor with
+/// whatever the engine is actually using rather than guessing.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct State {
+    pub surface: SurfaceConfig,
+    pub brightness: f32,
+    pub led_count: usize,
+    pub band_count: usize,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum Outbound<'a> {
+    Frame(&'a Snapshot),
+    State(&'a State),
+    Error { message: String },
+}
+
+pub struct UiServer {
+    snapshot: Arc<Mutex<Snapshot>>,
+    state: Arc<Mutex<State>>,
+    commands: Receiver<Command>,
+    port: u16,
+}
+
+impl UiServer {
+    /// Bind and start accepting. Returns an error if the port is taken, rather
+    /// than silently running without a UI.
+    pub fn start(port: u16, initial: State) -> Result<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", port))
+            .with_context(|| format!("could not bind 127.0.0.1:{port} for the UI server"))?;
+
+        let snapshot = Arc::new(Mutex::new(Snapshot::default()));
+        let state = Arc::new(Mutex::new(initial));
+        let (tx, commands) = mpsc::channel();
+
+        {
+            let snapshot = Arc::clone(&snapshot);
+            let state = Arc::clone(&state);
+            std::thread::Builder::new()
+                .name("ui-accept".into())
+                .spawn(move || accept_loop(listener, snapshot, state, tx))
+                .context("could not spawn the UI accept thread")?;
+        }
+
+        Ok(Self { snapshot, state, commands, port })
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Publish the latest frame. Called once per analysis frame; holds the lock
+    /// only long enough to swap the contents.
+    pub fn publish(&self, update: impl FnOnce(&mut Snapshot)) {
+        if let Ok(mut guard) = self.snapshot.lock() {
+            update(&mut guard);
+        }
+    }
+
+    /// Keep the advertised state in step with what the engine is really using.
+    pub fn update_state(&self, update: impl FnOnce(&mut State)) {
+        if let Ok(mut guard) = self.state.lock() {
+            update(&mut guard);
+        }
+    }
+
+    /// Non-blocking drain of everything the UI has asked for.
+    pub fn commands(&self) -> impl Iterator<Item = Command> + '_ {
+        self.commands.try_iter()
+    }
+}
+
+/// Hex-encode RGB triplets for the strip preview.
+pub fn encode_strip(leds: &[[u8; 3]]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(leds.len() * 6);
+    for px in leds {
+        for &c in px {
+            out.push(HEX[(c >> 4) as usize] as char);
+            out.push(HEX[(c & 0x0F) as usize] as char);
+        }
+    }
+    out
+}
+
+fn accept_loop(
+    listener: TcpListener,
+    snapshot: Arc<Mutex<Snapshot>>,
+    state: Arc<Mutex<State>>,
+    tx: Sender<Command>,
+) {
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { continue };
+        let snapshot = Arc::clone(&snapshot);
+        let state = Arc::clone(&state);
+        let tx = tx.clone();
+
+        // A panic in one client thread must not take down the engine, so each
+        // is isolated and simply ends if its connection misbehaves.
+        let _ = std::thread::Builder::new()
+            .name("ui-client".into())
+            .spawn(move || {
+                if let Err(e) = serve_client(stream, snapshot, state, tx) {
+                    // Disconnects are routine; log at a level that does not
+                    // clutter the terminal display.
+                    let _ = e;
+                }
+            });
+    }
+}
+
+fn serve_client(
+    stream: TcpStream,
+    snapshot: Arc<Mutex<Snapshot>>,
+    state: Arc<Mutex<State>>,
+    tx: Sender<Command>,
+) -> Result<()> {
+    stream.set_nodelay(true).ok();
+    let mut socket = tungstenite::accept(stream).context("websocket handshake failed")?;
+
+    // Reads must not block the send loop, so the socket is polled instead.
+    socket
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_millis(1)))
+        .ok();
+
+    send_state(&mut socket, &state)?;
+
+    loop {
+        // Drain anything the client has sent.
+        loop {
+            match socket.read() {
+                Ok(tungstenite::Message::Text(text)) => {
+                    match serde_json::from_str::<Command>(&text) {
+                        Ok(Command::RequestState) => send_state(&mut socket, &state)?,
+                        Ok(cmd) => {
+                            if tx.send(cmd).is_err() {
+                                return Ok(()); // engine is gone
+                            }
+                        }
+                        Err(e) => {
+                            let msg = serde_json::to_string(&Outbound::Error {
+                                message: format!("could not parse command: {e}"),
+                            })?;
+                            socket.send(tungstenite::Message::Text(msg.into()))?;
+                        }
+                    }
+                }
+                Ok(tungstenite::Message::Close(_)) => return Ok(()),
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(e))
+                    if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    break
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        let payload = {
+            let guard = snapshot.lock().map_err(|_| anyhow::anyhow!("snapshot lock poisoned"))?;
+            serde_json::to_string(&Outbound::Frame(&guard))?
+        };
+        socket.send(tungstenite::Message::Text(payload.into()))?;
+
+        std::thread::sleep(SEND_INTERVAL);
+    }
+}
+
+fn send_state(
+    socket: &mut tungstenite::WebSocket<TcpStream>,
+    state: &Arc<Mutex<State>>,
+) -> Result<()> {
+    let payload = {
+        let guard = state.lock().map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+        serde_json::to_string(&Outbound::State(&guard))?
+    };
+    socket.send(tungstenite::Message::Text(payload.into()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_encodes_as_lowercase_hex() {
+        assert_eq!(encode_strip(&[[0, 0, 0]]), "000000");
+        assert_eq!(encode_strip(&[[255, 255, 255]]), "ffffff");
+        assert_eq!(encode_strip(&[[0x1A, 0x2B, 0x3C], [4, 5, 6]]), "1a2b3c040506");
+        assert_eq!(encode_strip(&[]), "");
+    }
+
+    /// 600 LEDs is where this project is headed; the hex encoding is what keeps
+    /// the per-frame payload reasonable there.
+    #[test]
+    fn strip_payload_stays_small_at_600_leds() {
+        let leds = vec![[0x80u8; 3]; 600];
+        assert_eq!(encode_strip(&leds).len(), 3600);
+    }
+
+    #[test]
+    fn commands_parse_from_the_ui_wire_format() {
+        let cmd: Command = serde_json::from_str(r#"{"type":"brightness","value":0.5}"#).unwrap();
+        assert!(matches!(cmd, Command::Brightness { value } if (value - 0.5).abs() < 1e-6));
+
+        let cmd: Command = serde_json::from_str(r#"{"type":"requestState"}"#).unwrap();
+        assert!(matches!(cmd, Command::RequestState));
+
+        // Deeper delimiter: the hex colour contains `"#`, which would close a
+        // single-hash raw string.
+        let json = r##"{"type":"surface","surface":{"keyframes":[{"x":0,"y":1,"color":"#ff0000"}],"sigma":0.25}}"##;
+        let cmd: Command = serde_json::from_str(json).unwrap();
+        match cmd {
+            Command::Surface { surface } => {
+                assert_eq!(surface.keyframes.len(), 1);
+                assert_eq!(surface.keyframes[0].color, "#ff0000");
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    /// A malformed command must be reported, not crash the client thread.
+    #[test]
+    fn malformed_commands_are_rejected_cleanly() {
+        assert!(serde_json::from_str::<Command>(r#"{"type":"nonsense"}"#).is_err());
+        assert!(serde_json::from_str::<Command>("not json").is_err());
+    }
+
+    /// Round-trips the surface through the wire format, so an edit made in the
+    /// UI reconstructs exactly.
+    #[test]
+    fn surface_survives_a_round_trip() {
+        let original = SurfaceConfig::default();
+        let json = serde_json::to_string(&original).unwrap();
+        let back: SurfaceConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back.keyframes.len(), original.keyframes.len());
+        for (a, b) in original.keyframes.iter().zip(&back.keyframes) {
+            assert_eq!(a.color, b.color);
+            assert!((a.x - b.x).abs() < 1e-6 && (a.y - b.y).abs() < 1e-6);
+        }
+        assert!((back.sigma - original.sigma).abs() < 1e-6);
+    }
+}

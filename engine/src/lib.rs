@@ -5,7 +5,10 @@
 //! dumb pixel expander. See the project plan for the rationale.
 
 pub mod capture;
+pub mod color;
 pub mod dsp;
 pub mod engine;
+pub mod link;
+pub mod ui;
 
 pub use engine::{Engine, EngineConfig};

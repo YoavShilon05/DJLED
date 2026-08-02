@@ -12,3 +12,7 @@ yarn-error.log*
 
 # Rust
 /engine/target
+
+# UI
+/ui/node_modules
+/ui/dist

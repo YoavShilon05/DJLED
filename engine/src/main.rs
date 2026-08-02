@@ -1,58 +1,264 @@
-//! Headless spectrum monitor.
+//! DJLED engine — capture, analyse, colour, and drive the strip.
 //!
-//! Renders the analyser's band levels as an ASCII bar graph, so the entire DSP
-//! chain can be validated against real music before any hardware exists. This is
-//! phase 0 of the project: the riskiest parts — loopback capture and the
-//! analysis ladder — proved out first, with nothing else to hide behind.
+//! Runs with or without hardware. Without `--port` it uses a mock link, so the
+//! whole pipeline can be watched in the terminal before the Arduino is wired up.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use clap::{Parser, ValueEnum};
+
 use djled_engine::capture::LoopbackCapture;
+use djled_engine::color::{RenderConfig, Renderer, SurfaceConfig};
+use djled_engine::link::protocol::TestPattern;
+use djled_engine::link::serial::DEFAULT_BAUD;
+use djled_engine::link::{expand_bands_to_leds, Link, MockLink, SerialLink};
+use djled_engine::ui::{encode_strip, Command, State, UiServer};
 use djled_engine::{Engine, EngineConfig};
 
-const HEIGHT: usize = 24;
-const TARGET_FPS: u64 = 30;
+const BAR_HEIGHT: usize = 20;
+const TARGET_FPS: u64 = 60;
+
+#[derive(Parser, Debug)]
+#[command(about = "Audio-reactive LED wall engine", version)]
+struct Args {
+    /// Serial port to drive, e.g. COM3. Omit to run without hardware.
+    #[arg(long)]
+    port: Option<String>,
+
+    #[arg(long, default_value_t = DEFAULT_BAUD)]
+    baud: u32,
+
+    /// LEDs on the strip. Ignored with --port; the firmware reports its own.
+    #[arg(long, default_value_t = 150)]
+    leds: usize,
+
+    /// Frequency bands, and therefore colours sent per frame.
+    #[arg(long, default_value_t = 48)]
+    bands: usize,
+
+    /// List serial ports and exit.
+    #[arg(long)]
+    list_ports: bool,
+
+    /// Capture for N seconds, report what arrived, and exit.
+    #[arg(long, value_name = "SECONDS")]
+    probe: Option<f64>,
+
+    /// Show a wiring diagnostic pattern instead of audio.
+    #[arg(long, value_enum)]
+    test: Option<Pattern>,
+
+    /// Master brightness, 0..1. The software half of the power budget.
+    #[arg(long, default_value_t = 1.0)]
+    brightness: f32,
+
+    /// Port for the editor UI to connect to.
+    #[arg(long, default_value_t = djled_engine::ui::DEFAULT_PORT)]
+    ui_port: u16,
+
+    /// Run without the UI server, leaving the port free.
+    #[arg(long)]
+    no_ui: bool,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum Pattern {
+    /// Red, green, blue in turn — confirms channel order.
+    Rgb,
+    /// A dot walking the strip — confirms LED count and direction.
+    Chase,
+    /// Full white — reveals voltage droop and where injection is needed.
+    White,
+}
+
+impl From<Pattern> for TestPattern {
+    fn from(p: Pattern) -> Self {
+        match p {
+            Pattern::Rgb => TestPattern::Rgb,
+            Pattern::Chase => TestPattern::Chase,
+            Pattern::White => TestPattern::White,
+        }
+    }
+}
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let probe_secs = match args.first().map(String::as_str) {
-        Some("--probe") => Some(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3.0)),
-        Some(other) => anyhow::bail!("unknown argument '{other}' (expected --probe [seconds])"),
-        None => None,
+    let args = Args::parse();
+
+    if args.list_ports {
+        let ports = SerialLink::available();
+        if ports.is_empty() {
+            println!("no serial ports found");
+        } else {
+            println!("serial ports:");
+            for p in ports {
+                println!("  {p}");
+            }
+        }
+        return Ok(());
+    }
+
+    let (mut link, led_count): (Box<dyn Link>, usize) = match &args.port {
+        Some(path) => {
+            let link = SerialLink::open(path, args.baud)
+                .with_context(|| available_ports_hint(path))?;
+            let count = link.hello().led_count as usize;
+            (Box::new(link), count)
+        }
+        None => (Box::new(MockLink::new(args.leds)), args.leds),
     };
 
+    if let Some(pattern) = args.test {
+        link.send_test(pattern.into())?;
+        println!("{}", link.describe());
+        println!("showing {:?} pattern — ctrl-c to stop", pattern);
+        // Hold the port open; the firmware keeps rendering on its own.
+        loop {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
     let mut capture = LoopbackCapture::new(0.25)?;
-    let cfg = EngineConfig::default();
+    let cfg = EngineConfig {
+        scale: djled_engine::dsp::bands::BandScaleConfig {
+            band_count: args.bands,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let mut engine = Engine::new(&cfg, capture.sample_rate());
 
-    print_header(&capture, &engine);
+    let mut renderer = Renderer::new(
+        RenderConfig { brightness: args.brightness, ..Default::default() },
+        &SurfaceConfig::default(),
+        engine.band_count(),
+    )
+    .map_err(anyhow::Error::msg)?;
 
-    if let Some(secs) = probe_secs {
+    print_header(&capture, &engine, link.as_ref(), led_count);
+
+    if let Some(secs) = args.probe {
         return probe(&mut capture, &mut engine, secs);
     }
 
+    // The UI is optional by design: the engine is a headless service and
+    // nothing about the strip depends on a browser being attached.
+    let server = if args.no_ui {
+        None
+    } else {
+        let state = State {
+            surface: SurfaceConfig::default(),
+            brightness: args.brightness,
+            led_count,
+            band_count: engine.band_count(),
+        };
+        match UiServer::start(args.ui_port, state) {
+            Ok(s) => {
+                println!("  editor   ws://127.0.0.1:{} — run `npm run dev` in ui/\n", s.port());
+                Some(s)
+            }
+            Err(e) => {
+                println!("  editor   unavailable: {e}\n");
+                None
+            }
+        }
+    };
+
+    run(&mut capture, &mut engine, &mut renderer, link.as_mut(), led_count, server.as_ref())
+}
+
+fn available_ports_hint(requested: &str) -> String {
+    let ports = SerialLink::available();
+    if ports.is_empty() {
+        format!("could not open {requested}, and no serial ports are visible at all")
+    } else {
+        format!("could not open {requested}. Available: {}", ports.join(", "))
+    }
+}
+
+fn run(
+    capture: &mut LoopbackCapture,
+    engine: &mut Engine,
+    renderer: &mut Renderer,
+    link: &mut dyn Link,
+    led_count: usize,
+    server: Option<&UiServer>,
+) -> Result<()> {
     let mut buf = vec![0.0f32; 8192];
+    let mut leds = vec![[0u8; 3]; led_count];
     let mut last_draw = Instant::now();
     let frame = Duration::from_millis(1000 / TARGET_FPS);
     let mut first = true;
+    let mut dropped = 0u64;
+    let mut status = String::new();
+
+    let centers: Vec<f32> = engine.plan().bands.iter().map(|b| b.center as f32).collect();
+    let sample_rate = capture.sample_rate();
 
     loop {
         let n = capture.read(&mut buf);
         if n == 0 {
-            // Loopback delivers nothing at all while the endpoint is idle, so
-            // this is the normal state when no audio is playing, not an error.
+            // Loopback is genuinely idle when nothing is playing; not an error.
             std::thread::sleep(Duration::from_millis(2));
             continue;
         }
 
-        engine.push(&buf[..n]);
+        if !engine.push(&buf[..n]) {
+            continue;
+        }
 
-        // The analyser runs at ~187 frames/s; redrawing that fast would just
-        // burn a core on terminal I/O.
+        // Applied before rendering so an edit takes effect on this frame rather
+        // than the next one.
+        if let Some(server) = server {
+            for cmd in server.commands() {
+                match cmd {
+                    Command::Surface { surface } => match renderer.set_surface(&surface) {
+                        Ok(()) => {
+                            status.clear();
+                            server.update_state(|s| s.surface = surface);
+                        }
+                        // Reported through the status line rather than stdout:
+                        // printing here would tear the redrawn display.
+                        Err(e) => status = format!("surface rejected: {e}"),
+                    },
+                    Command::Brightness { value } => {
+                        let mut cfg = renderer.config().clone();
+                        cfg.brightness = value.clamp(0.0, 1.0);
+                        renderer.set_config(cfg);
+                        server.update_state(|s| s.brightness = value.clamp(0.0, 1.0));
+                    }
+                    Command::RequestState => {}
+                }
+            }
+        }
+
+        let pixels = renderer.render(engine.levels());
+        if !link.send(pixels)? {
+            dropped += 1;
+        }
+
+        // The analyser runs far faster than any display needs; redrawing and
+        // republishing at its rate would just burn a core on formatting.
         if last_draw.elapsed() >= frame {
-            draw(engine.levels(), first);
+            expand_bands_to_leds(pixels, &mut leds);
+
+            if let Some(server) = server {
+                let strip = encode_strip(&leds);
+                let levels = engine.levels().to_vec();
+                server.publish(|snap| {
+                    snap.levels = levels;
+                    snap.strip = strip;
+                    snap.dropped_frames = dropped;
+                    snap.sample_rate = sample_rate;
+                    snap.connected = true;
+                    if snap.centers.len() != centers.len() {
+                        snap.centers = centers.clone();
+                    }
+                });
+            }
+
+            draw(engine.levels(), &leds, dropped, &status, first);
             last_draw = Instant::now();
             first = false;
         }
@@ -61,7 +267,7 @@ fn main() -> Result<()> {
 
 /// Capture for a fixed duration and report what arrived, then exit.
 ///
-/// Distinguishes the three states that matter when bringing this up: the stream
+/// Separates the three states worth distinguishing during bring-up: the stream
 /// failed to open, the stream opened but nothing is playing, or audio is
 /// flowing. Loopback legitimately delivers nothing while the endpoint is idle,
 /// so silence is not by itself a fault.
@@ -114,23 +320,21 @@ fn probe(capture: &mut LoopbackCapture, engine: &mut Engine, secs: f64) -> Resul
     println!("\n  loudest bands");
     for &i in ranked.iter().take(5) {
         let b = &plan.bands[i];
-        println!(
-            "    {:6.0} - {:6.0} Hz  N={:<5} {:.2}",
-            b.lo, b.hi, b.fft_size, hottest[i]
-        );
+        println!("    {:6.0} - {:6.0} Hz  N={:<5} {:.2}", b.lo, b.hi, b.fft_size, hottest[i]);
     }
     Ok(())
 }
 
-fn print_header(capture: &LoopbackCapture, engine: &Engine) {
-    println!("DJLED spectrum monitor");
+fn print_header(capture: &LoopbackCapture, engine: &Engine, link: &dyn Link, led_count: usize) {
+    println!("DJLED");
     println!(
-        "  device   {} ({} ch @ {:.0} Hz)",
+        "  audio    {} ({} ch @ {:.0} Hz)",
         capture.device_name(),
         capture.channels(),
         capture.sample_rate()
     );
-    println!("  bands    {}", engine.band_count());
+    println!("  output   {}", link.describe());
+    println!("  bands    {} across {led_count} LEDs", engine.band_count());
     println!("  tiers");
     for line in engine.plan().describe_tiers() {
         println!("           {line}");
@@ -138,23 +342,27 @@ fn print_header(capture: &LoopbackCapture, engine: &Engine) {
 
     let unresolved: Vec<_> = engine.plan().unresolved().map(|(i, _)| i).collect();
     if !unresolved.is_empty() {
-        println!("  WARNING  bands {unresolved:?} could not be resolved by any FFT size");
+        println!(
+            "  WARNING  bands {unresolved:?} cannot be resolved by any available FFT size.\n\
+             {:11}Lower --bands, or raise the bottom of the range.",
+            ""
+        );
     }
 
     println!("\n  play something. ctrl-c to quit.\n");
 }
 
-fn draw(levels: &[f32], first: bool) {
-    let mut out = String::with_capacity((levels.len() + 8) * (HEIGHT + 3));
+fn draw(levels: &[f32], leds: &[[u8; 3]], dropped: u64, status: &str, first: bool) {
+    let mut out = String::with_capacity(levels.len() * (BAR_HEIGHT + 4) + leds.len() * 24);
 
     if !first {
-        // Rewind over the bars plus the axis line drawn last time.
-        out.push_str(&format!("\x1b[{}A", HEIGHT + 1));
+        // Rewind over the bars, the strip preview and the status line.
+        out.push_str(&format!("\x1b[{}A", BAR_HEIGHT + 3));
     }
 
-    for row in (0..HEIGHT).rev() {
+    for row in (0..BAR_HEIGHT).rev() {
         for &level in levels {
-            let filled = level * HEIGHT as f32 - row as f32;
+            let filled = level * BAR_HEIGHT as f32 - row as f32;
             out.push(match filled {
                 f if f >= 0.75 => '█',
                 f if f >= 0.5 => '▓',
@@ -171,6 +379,28 @@ fn draw(levels: &[f32], first: bool) {
         out.push_str(if i % 8 == 0 { "┬ " } else { "─ " });
     }
     out.push('\n');
+
+    // The strip as the firmware will actually drive it, at the same width as
+    // the bars so the two line up.
+    let width = levels.len() * 2;
+    for col in 0..width {
+        let start = col * leds.len() / width;
+        let end = ((col + 1) * leds.len() / width).max(start + 1).min(leds.len());
+        let n = (end - start) as u32;
+        let mut acc = [0u32; 3];
+        for px in &leds[start..end] {
+            for c in 0..3 {
+                acc[c] += px[c] as u32;
+            }
+        }
+        out.push_str(&format!("\x1b[48;2;{};{};{}m ", acc[0] / n, acc[1] / n, acc[2] / n));
+    }
+    out.push_str("\x1b[0m\n");
+
+    out.push_str(&format!(
+        "  {} LEDs   dropped frames: {dropped}   {status}\x1b[K\n",
+        leds.len()
+    ));
 
     let mut stdout = std::io::stdout().lock();
     let _ = stdout.write_all(out.as_bytes());
