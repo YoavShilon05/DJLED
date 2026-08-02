@@ -10,12 +10,12 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 
 use djled_engine::capture::LoopbackCapture;
-use djled_engine::color::{RenderConfig, Renderer, SurfaceConfig};
+use djled_engine::color::{Geometry, RenderConfig, Renderer};
 use djled_engine::link::protocol::TestPattern;
 use djled_engine::link::serial::DEFAULT_BAUD;
 use djled_engine::link::{expand_bands_to_leds, Link, MockLink, SerialLink};
 use djled_engine::ui::{encode_strip, Command, State, UiServer};
-use djled_engine::{Engine, EngineConfig};
+use djled_engine::{Engine, EngineConfig, ShowConfig};
 
 const BAR_HEIGHT: usize = 20;
 const TARGET_FPS: u64 = 60;
@@ -120,7 +120,7 @@ fn main() -> Result<()> {
     }
 
     let mut capture = LoopbackCapture::new(0.25)?;
-    let cfg = EngineConfig {
+    let mut cfg = EngineConfig {
         scale: djled_engine::dsp::bands::BandScaleConfig {
             band_count: args.bands,
             ..Default::default()
@@ -129,10 +129,19 @@ fn main() -> Result<()> {
     };
     let mut engine = Engine::new(&cfg, capture.sample_rate());
 
+    let show = ShowConfig::spanning(led_count);
     let mut renderer = Renderer::new(
         RenderConfig { brightness: args.brightness, ..Default::default() },
-        &SurfaceConfig::default(),
-        engine.band_count(),
+        &show.surface,
+        show.layout(),
+        show.intensity(),
+        Geometry {
+            centers: engine.centers().to_vec(),
+            // One colour per band keeps the wire format exactly as it was; see
+            // `color::strip` for why these are strip positions, not bands.
+            points: engine.band_count(),
+            leds: led_count,
+        },
     )
     .map_err(anyhow::Error::msg)?;
 
@@ -148,10 +157,12 @@ fn main() -> Result<()> {
         None
     } else {
         let state = State {
-            surface: SurfaceConfig::default(),
+            config: show.clone(),
             brightness: args.brightness,
             led_count,
             band_count: engine.band_count(),
+            db_floor: cfg.post.db_floor,
+            db_ceil: cfg.post.db_ceil,
         };
         match UiServer::start(args.ui_port, state) {
             Ok(s) => {
@@ -165,7 +176,16 @@ fn main() -> Result<()> {
         }
     };
 
-    run(&mut capture, &mut engine, &mut renderer, link.as_mut(), led_count, server.as_ref())
+    run(
+        &mut capture,
+        &mut engine,
+        &mut cfg,
+        show,
+        &mut renderer,
+        link.as_mut(),
+        led_count,
+        server.as_ref(),
+    )
 }
 
 fn available_ports_hint(requested: &str) -> String {
@@ -177,9 +197,12 @@ fn available_ports_hint(requested: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     capture: &mut LoopbackCapture,
     engine: &mut Engine,
+    engine_cfg: &mut EngineConfig,
+    mut show: ShowConfig,
     renderer: &mut Renderer,
     link: &mut dyn Link,
     led_count: usize,
@@ -193,8 +216,12 @@ fn run(
     let mut dropped = 0u64;
     let mut status = String::new();
 
-    let centers: Vec<f32> = engine.plan().bands.iter().map(|b| b.center as f32).collect();
+    let centers: Vec<f32> = engine.centers().to_vec();
     let sample_rate = capture.sample_rate();
+
+    // The initial config is applied through the same path an edit takes, so
+    // startup cannot diverge from what the editor would produce.
+    apply_show(engine, engine_cfg, renderer, &show, &show, true, sample_rate);
 
     loop {
         let n = capture.read(&mut buf);
@@ -213,15 +240,30 @@ fn run(
         if let Some(server) = server {
             for cmd in server.commands() {
                 match cmd {
-                    Command::Surface { surface } => match renderer.set_surface(&surface) {
-                        Ok(()) => {
-                            status.clear();
-                            server.update_state(|s| s.surface = surface);
+                    Command::Config { config } => {
+                        let next = *config;
+                        match renderer.set_surface(&next.surface) {
+                            Ok(()) => {
+                                apply_show(
+                                    engine,
+                                    engine_cfg,
+                                    renderer,
+                                    &next,
+                                    &show,
+                                    false,
+                                    sample_rate,
+                                );
+                                show = next.clone();
+                                status.clear();
+                                server.update_state(|s| s.config = next);
+                            }
+                            // Reported through the status line rather than
+                            // stdout: printing here would tear the display.
+                            // The rest of the config is dropped with it, so a
+                            // half-applied edit is not left behind.
+                            Err(e) => status = format!("config rejected: {e}"),
                         }
-                        // Reported through the status line rather than stdout:
-                        // printing here would tear the redrawn display.
-                        Err(e) => status = format!("surface rejected: {e}"),
-                    },
+                    }
                     Command::Brightness { value } => {
                         let mut cfg = renderer.config().clone();
                         cfg.brightness = value.clamp(0.0, 1.0);
@@ -263,6 +305,51 @@ fn run(
             first = false;
         }
     }
+}
+
+/// Push a configuration into the stages it touches.
+///
+/// Everything is compared against what is already in force, because the two
+/// expensive cases must not fire on every keyframe drag: resampling the EQ walks
+/// every band, and a hop change rebuilds the analyser outright — which resets
+/// the floor tracker and the ballistics, so it is worth a visible hiccup only
+/// when the user actually asked for it.
+fn apply_show(
+    engine: &mut Engine,
+    engine_cfg: &mut EngineConfig,
+    renderer: &mut Renderer,
+    next: &ShowConfig,
+    current: &ShowConfig,
+    force: bool,
+    sample_rate: f64,
+) {
+    if force || next.hop() != current.hop() {
+        engine_cfg.hop = next.hop();
+        *engine = Engine::new(engine_cfg, sample_rate);
+        // A rebuilt analyser has no EQ or ballistics, so both are reinstalled
+        // below regardless of whether they were what changed.
+        engine.set_eq(&next.eq);
+        engine.set_decay(next.decay());
+    } else {
+        if !eq_matches(&next.eq, &current.eq) {
+            engine.set_eq(&next.eq);
+        }
+        if next.decay() != current.decay() {
+            engine.set_decay(next.decay());
+        }
+    }
+
+    renderer.set_layout(next.layout());
+    renderer.set_intensity(next.intensity());
+}
+
+/// Structural comparison; `EqBand` is not `PartialEq` because it holds floats
+/// and an exact-equality derive on those would be a trap elsewhere.
+fn eq_matches(a: &[djled_engine::dsp::eq::EqBand], b: &[djled_engine::dsp::eq::EqBand]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x.kind == y.kind && x.hz == y.hz && x.gain == y.gain && x.q == y.q
+        })
 }
 
 /// Capture for a fixed duration and report what arrived, then exit.

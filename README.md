@@ -134,17 +134,61 @@ puts bass in the middle when the two are combined. An even-length strip has no
 LED at its centre, so the fold approaches the top of the range rather than
 landing on it; `render.test.ts` pins that to one index.
 
-**Only the colour surface and master brightness are in the wire protocol so
-far.** The rest is authored locally, persisted to `localStorage`, and previewed
-by `ui/src/spectrum/render.ts`, which is the reference the engine should be
-checked against when those fields are added. That is what the two strips at the
-bottom show: `Preview` is the full config applied locally, `Engine` is what the
-wall is actually doing. They diverge exactly where the backend has not caught
-up yet.
+The whole configuration crosses the wire as one `ShowConfig` message, including
+on the hot path where dragging a keyframe sends one per pointer move. Each stage
+in the engine compares against what it already holds, so applying it is a few
+float comparisons — and one message means the two sides cannot end up
+disagreeing about which half of an edit landed.
+
+The two strips at the bottom are the check on that: `Preview` is the config
+applied locally in the browser, `Engine` is what the wall is actually doing.
+They should agree.
 
 Styling is Mantine with a theme and no per-component overrides — `src/theme.ts`
 holds every colour decision, including the palette the canvas and SVG layers
 paint with, and `src/styles.css` is two rules long.
+
+## Where each control acts
+
+The editor's controls land in three different places, and which one matters:
+
+| Control | Stage | Why there |
+|---|---|---|
+| EQ | `dsp/post.rs`, after AGC, before the range map | see below |
+| Decay | release ballistics in `dsp/post.rs` | it *is* the release time |
+| Frame hop | rebuilds the analyser | changes how often transforms run |
+| Threshold, clamp, curve | `color/intensity.rs` | output shaping, not analysis |
+| LED sectors, reverse, mirror | `color/strip.rs` | spatial, applied last |
+
+**The EQ sits after the AGC and before the range map**, and both ends are load-
+bearing. Before the AGC, an authored boost looks like drift and gets unwound
+over the AGC time constant. After the range map — applied to the normalised
+level, where zero *is* the floor — a boost would lift silence and make an idle
+strip glow. Both are pinned by tests in `dsp/post.rs`.
+
+**"Frame hop" is not an FFT window length.** Every band already draws from the
+smallest transform that can resolve it, five tiers from 8192 down to 128, so
+there is no single window to set; this is how often those transforms run.
+
+## Spatial mapping without a firmware change
+
+LED sectors, reverse and mirror are per-LED, and the protocol carries per-band
+colour. Those look incompatible, but the firmware only ever *spreads N colours
+across the strip* — it cannot tell whether colour *j* means "band j" or "strip
+position j/N". So the meaning changed and the wire did not: the PC now computes
+the whole spatial mapping and sends control points in strip space.
+
+The alternative was per-LED frames, which is 1800 bytes at 600 LEDs and caps the
+display at 27 fps, on a board that cannot evaluate a sector table and an Oklab
+surface inside an interrupt-disabled strip write.
+
+The cost is spatial resolution: sector boundaries and the mirror fold are
+smoothed over `leds / bands` LEDs — three at 150 LEDs, twelve at 600. Raise
+`--bands` to sharpen them.
+
+One consequence worth knowing: the surface's x axis is now log frequency rather
+than band index, which is what the editor was always drawing. The two agreed
+only approximately before.
 
 ## Colour
 
@@ -182,7 +226,7 @@ next during the blackout.
 ## Tests
 
 ```bash
-cargo test --manifest-path engine/Cargo.toml   # 97
+cargo test --manifest-path engine/Cargo.toml   # 151
 cd ui && npm test && npm run typecheck
 ```
 
@@ -190,6 +234,19 @@ The ones worth knowing about live in `engine/tests/artifacts.rs`: they assert th
 reported bug stays fixed, and one of them independently computes what a naive
 analyser would produce, so the suppression tests are not merely asserting that
 nothing ever happens.
+
+`engine/tests/pipeline.rs` covers the other failure mode: a control that is
+computed correctly and then dropped on the way to the wire. Every editor control
+has an end-to-end test that its effect reaches the LED bytes — mirroring lights
+both ends, a sector confines a tone to its own LEDs, a 24 dB cut halves the
+output — because the unit tests for each stage all pass whether or not anything
+is plugged into them.
+
+The EQ is asserted against closed-form properties on **both** sides — a bell is
+exactly its gain at centre, a pass filter is −3.01 dB at cutoff when `Q = 1/√2`,
+cascades add in dB — rather than against values captured from a run. A
+transcription slip in either implementation's coefficients fails its own tests
+instead of being baked in as the new expectation.
 
 ## Scaling to 600 LEDs
 

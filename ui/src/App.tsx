@@ -18,11 +18,11 @@ import { ledBytesToDisplay, type Rgb } from "./color/display";
 import {
   DEFAULT_CONFIG,
   clearConfig,
+  fromEngineConfig,
   hasStoredConfig,
   loadConfig,
   saveConfig,
-  toSurface,
-  withSurface,
+  toEngineConfig,
   type EditorConfig,
 } from "./config/editor";
 import { DEFAULT_SAMPLE_RATE, EqCurve } from "./config/eq";
@@ -37,12 +37,16 @@ import { applyEq, renderStrip } from "./spectrum/render";
 /** Sampled once at load: a later save must not change what a reconnect does. */
 const HAD_LOCAL_CONFIG = hasStoredConfig();
 
+/** The engine's default dB window, until it reports its own. */
+const DEFAULT_DB_SPAN = 60;
+
 export default function App() {
   const [config, setConfig] = useState<EditorConfig>(loadConfig);
   const [status, setStatus] = useState<Status>("connecting");
   const [frame, setFrame] = useState<Frame | null>(null);
   const [brightness, setBrightness] = useState(1);
   const [ledCount, setLedCount] = useState(150);
+  const [dbSpan, setDbSpan] = useState(DEFAULT_DB_SPAN);
   const [error, setError] = useState<string | null>(null);
 
   const clientRef = useRef<EngineClient | null>(null);
@@ -55,10 +59,11 @@ export default function App() {
       onState: (state) => {
         setBrightness(state.brightness);
         setLedCount(state.ledCount);
-        // The engine's surface is authoritative on first connect, but only if
+        setDbSpan(Math.max(1, state.dbCeil - state.dbFloor));
+        // The engine's config is authoritative on first connect, but only if
         // nothing has been authored here — otherwise a reconnect would throw
         // away unsaved edits.
-        if (!HAD_LOCAL_CONFIG) setConfig((c) => withSurface(c, state.surface));
+        if (!HAD_LOCAL_CONFIG) setConfig((c) => fromEngineConfig(c, state.config));
       },
     });
     clientRef.current = client;
@@ -73,9 +78,7 @@ export default function App() {
       setConfig(next);
       setError(null);
       persist(next);
-      // Only the colour surface exists in the protocol so far; the rest of the
-      // config is previewed locally until the engine grows the fields.
-      clientRef.current?.setSurface(toSurface(next));
+      clientRef.current?.setConfig(toEngineConfig(next));
     },
     [persist],
   );
@@ -92,10 +95,14 @@ export default function App() {
 
   const sampleRate = frame?.sampleRate || DEFAULT_SAMPLE_RATE;
 
-  // The EQ is upstream of everything: the plot and the strip are both shown
-  // post-EQ, so the bars never disagree with what the LEDs are being fed.
+  // Live levels arrive with the EQ already in them — the engine applies it
+  // between the AGC and the range map. Applying it again here would double it,
+  // so the local pass exists only to keep the curve meaningful while offline.
   const eqCurve = useMemo(() => new EqCurve(config.eq, sampleRate), [config.eq, sampleRate]);
-  const spectrum = useMemo(() => applyEq(captured, eqCurve), [captured, eqCurve]);
+  const spectrum = useMemo(
+    () => (live ? captured : applyEq(captured, eqCurve, dbSpan)),
+    [live, captured, eqCurve, dbSpan],
+  );
 
   const previewStrip = useMemo(
     () => renderStrip(config, spectrum, ledCount, brightness),

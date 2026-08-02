@@ -1,0 +1,408 @@
+//! Where on the strip each frequency lands.
+//!
+//! # Why this does not need a firmware change
+//!
+//! The protocol carries a fixed number of colours per frame and the firmware
+//! spreads them across the strip — 149 bytes regardless of whether there are
+//! 150 LEDs or 600. Those colours were previously one-per-band. They are now
+//! one per *strip position*, and the firmware cannot tell the difference: it
+//! interpolates N colours across the run either way.
+//!
+//! That is what makes LED sectors, reverse and mirror implementable at all. The
+//! alternative — per-LED frames — is 1800 bytes at 600 LEDs and caps the
+//! display at 27 fps, and an ATmega cannot evaluate a sector table and an Oklab
+//! surface inside an interrupt-disabled strip write.
+//!
+//! The cost is spatial resolution: sector boundaries and the mirror fold are
+//! smoothed over `leds / points` LEDs, twelve at 600 LEDs and 48 bands. Raise
+//! `--bands` to sharpen them.
+
+use serde::{Deserialize, Serialize};
+
+use super::intensity::IntensityConfig;
+
+/// The editor's frequency axis. Fixed rather than derived from the band plan so
+/// that a keyframe authored at 250 Hz lands on 250 Hz whatever the plan does.
+pub const F_MIN: f32 = 20.0;
+pub const F_MAX: f32 = 20_000.0;
+
+pub fn hz_to_norm(hz: f32) -> f32 {
+    ((hz / F_MIN).ln() / (F_MAX / F_MIN).ln()).clamp(0.0, 1.0)
+}
+
+pub fn norm_to_hz(n: f32) -> f32 {
+    F_MIN * ((F_MAX / F_MIN).ln() * n.clamp(0.0, 1.0)).exp()
+}
+
+/// A frequency pinned to an LED index. Consecutive keyframes define a sector.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LedKeyframe {
+    pub led: usize,
+    pub hz: f32,
+}
+
+impl Default for LedKeyframe {
+    fn default() -> Self {
+        Self { led: 0, hz: F_MIN }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LayoutConfig {
+    /// Empty means the whole axis spread evenly across the whole strip.
+    pub led_keyframes: Vec<LedKeyframe>,
+    /// Play the strip back to front.
+    pub reverse: bool,
+    /// Fold the whole range into each half.
+    pub mirror: bool,
+}
+
+impl LayoutConfig {
+    pub fn spanning(led_count: usize) -> Self {
+        Self {
+            led_keyframes: vec![
+                LedKeyframe { led: 0, hz: F_MIN },
+                LedKeyframe { led: led_count.saturating_sub(1), hz: F_MAX },
+            ],
+            reverse: false,
+            mirror: false,
+        }
+    }
+}
+
+/// Which logical LED an output position shows.
+///
+/// Both transforms are spatial: they rearrange where colour lands on the wall
+/// and change nothing about the analysis, which is why they apply at the very
+/// end and are invisible to the editor's graph.
+///
+/// Mirror folds the whole range into each half, so both ends of the strip show
+/// the low end and the centre shows the high end. Reverse then flips what that
+/// lookup returns, which is what puts bass in the middle when both are on.
+pub fn source_position(u: f32, mirror: bool, reverse: bool) -> f32 {
+    let mut u = u.clamp(0.0, 1.0);
+    if mirror {
+        u = if u < 0.5 { u * 2.0 } else { (1.0 - u) * 2.0 };
+    }
+    if reverse {
+        u = 1.0 - u;
+    }
+    u
+}
+
+/// The frequency an LED displays, or `None` if it falls outside every sector.
+///
+/// Sectors are ordered by index, not by frequency — a sector may run downwards
+/// in frequency if that is how it was authored. Interpolation is linear on the
+/// *log* axis, which is what makes "LED 0 at 20 Hz, LED 50 at 2 kHz" spread
+/// evenly across the first fifty rather than piling seven octaves into the last
+/// few.
+pub fn led_frequency(sorted: &[LedKeyframe], led: f32) -> Option<f32> {
+    let first = sorted.first()?;
+    let last = sorted.last()?;
+    if led < first.led as f32 || led > last.led as f32 {
+        return None;
+    }
+    if sorted.len() == 1 {
+        return Some(first.hz);
+    }
+
+    for pair in sorted.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if led > b.led as f32 {
+            continue;
+        }
+        let span = b.led as f32 - a.led as f32;
+        let t = if span <= 0.0 { 0.0 } else { (led - a.led as f32) / span };
+        return Some(norm_to_hz(hz_to_norm(a.hz) + t * (hz_to_norm(b.hz) - hz_to_norm(a.hz))));
+    }
+    Some(last.hz)
+}
+
+/// The analyser's level at an arbitrary frequency, interpolated on the log axis.
+pub fn level_at(levels: &[f32], centers: &[f32], hz: f32) -> f32 {
+    let n = levels.len().min(centers.len());
+    if n == 0 {
+        return 0.0;
+    }
+    if hz <= centers[0] {
+        return levels[0];
+    }
+    if hz >= centers[n - 1] {
+        return levels[n - 1];
+    }
+    for i in 1..n {
+        if hz > centers[i] {
+            continue;
+        }
+        let (lo, hi) = (hz_to_norm(centers[i - 1]), hz_to_norm(centers[i]));
+        let t = if hi > lo { (hz_to_norm(hz) - lo) / (hi - lo) } else { 0.0 };
+        return levels[i - 1] + t * (levels[i] - levels[i - 1]);
+    }
+    levels[n - 1]
+}
+
+/// What one wire colour is sampled from.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ControlPoint {
+    /// Surface x — position on the frequency axis, 0..1.
+    pub x: f32,
+    /// Surface y — the band's level, 0..1.
+    pub y: f32,
+    /// Brightness from the intensity stage, applied in linear light.
+    pub gain: f32,
+}
+
+/// Turns band levels into the control points the wire carries.
+pub struct StripMap {
+    layout: LayoutConfig,
+    intensity: IntensityConfig,
+    /// Sorted by LED index; sectors are defined by index order.
+    sorted: Vec<LedKeyframe>,
+    centers: Vec<f32>,
+    led_count: usize,
+    points: Vec<ControlPoint>,
+}
+
+impl StripMap {
+    pub fn new(
+        layout: LayoutConfig,
+        intensity: IntensityConfig,
+        centers: &[f32],
+        point_count: usize,
+        led_count: usize,
+    ) -> Self {
+        let mut map = Self {
+            layout: LayoutConfig::default(),
+            intensity,
+            sorted: Vec::new(),
+            centers: centers.to_vec(),
+            led_count,
+            points: vec![ControlPoint::default(); point_count],
+        };
+        map.set_layout(layout);
+        map
+    }
+
+    pub fn set_layout(&mut self, layout: LayoutConfig) {
+        // An empty or single keyframe list cannot define a sector, so it falls
+        // back to the whole axis rather than blanking the strip.
+        let mut sorted = layout.led_keyframes.clone();
+        sorted.sort_by_key(|k| k.led);
+        if sorted.len() < 2 {
+            sorted = LayoutConfig::spanning(self.led_count).led_keyframes;
+        }
+        self.sorted = sorted;
+        self.layout = layout;
+    }
+
+    pub fn set_intensity(&mut self, intensity: IntensityConfig) {
+        self.intensity = intensity;
+    }
+
+    pub fn layout(&self) -> &LayoutConfig {
+        &self.layout
+    }
+
+    pub fn intensity(&self) -> &IntensityConfig {
+        &self.intensity
+    }
+
+    pub fn map(&mut self, levels: &[f32]) -> &[ControlPoint] {
+        let last_point = self.points.len().saturating_sub(1).max(1) as f32;
+        let last_led = self.led_count.saturating_sub(1).max(1) as f32;
+
+        for i in 0..self.points.len() {
+            let u = source_position(i as f32 / last_point, self.layout.mirror, self.layout.reverse);
+            let point = match led_frequency(&self.sorted, u * last_led) {
+                // Outside every sector: the LED is not addressed, so it is dark.
+                None => ControlPoint { x: u, y: 0.0, gain: 0.0 },
+                Some(hz) => {
+                    let level = level_at(levels, &self.centers, hz).clamp(0.0, 1.0);
+                    ControlPoint {
+                        x: hz_to_norm(hz),
+                        y: level,
+                        gain: self.intensity.brightness(level),
+                    }
+                }
+            };
+            self.points[i] = point;
+        }
+        &self.points
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keyframes(pairs: &[(usize, f32)]) -> Vec<LedKeyframe> {
+        pairs.iter().map(|&(led, hz)| LedKeyframe { led, hz }).collect()
+    }
+
+    #[test]
+    fn frequency_axis_round_trips() {
+        for hz in [20.0, 100.0, 1000.0, 20_000.0] {
+            assert!((norm_to_hz(hz_to_norm(hz)) - hz).abs() / hz < 1e-4);
+        }
+        assert_eq!(hz_to_norm(F_MIN), 0.0);
+        assert_eq!(hz_to_norm(F_MAX), 1.0);
+    }
+
+    /// The example from the spec: LED 0 at 20 Hz and LED 50 at 2 kHz means the
+    /// first fifty LEDs cover 20–2000 Hz, spread evenly in log frequency.
+    #[test]
+    fn sectors_spread_evenly_on_the_log_axis() {
+        let k = keyframes(&[(0, 20.0), (50, 2000.0), (149, 20_000.0)]);
+        assert!((led_frequency(&k, 0.0).unwrap() - 20.0).abs() < 0.01);
+        assert!((led_frequency(&k, 50.0).unwrap() - 2000.0).abs() < 1.0);
+        assert!((led_frequency(&k, 149.0).unwrap() - 20_000.0).abs() < 1.0);
+
+        // Halfway along the first sector is the geometric mean, not the mean.
+        let mid = led_frequency(&k, 25.0).unwrap();
+        assert!((mid - (20.0f32 * 2000.0).sqrt()).abs() < 1.0, "midpoint was {mid}");
+    }
+
+    #[test]
+    fn leds_outside_every_sector_are_dark() {
+        let k = keyframes(&[(20, 100.0), (80, 5000.0)]);
+        assert!(led_frequency(&k, 0.0).is_none());
+        assert!(led_frequency(&k, 19.0).is_none());
+        assert!(led_frequency(&k, 20.0).is_some());
+        assert!(led_frequency(&k, 80.0).is_some());
+        assert!(led_frequency(&k, 81.0).is_none());
+    }
+
+    // The two cases the feature was specified by.
+    #[test]
+    fn mirror_puts_the_low_end_at_both_tips() {
+        assert_eq!(source_position(0.0, true, false), 0.0);
+        assert_eq!(source_position(1.0, true, false), 0.0);
+        assert_eq!(source_position(0.5, true, false), 1.0);
+    }
+
+    #[test]
+    fn mirror_with_reverse_puts_the_low_end_in_the_middle() {
+        assert_eq!(source_position(0.0, true, true), 1.0);
+        assert_eq!(source_position(1.0, true, true), 1.0);
+        assert_eq!(source_position(0.5, true, true), 0.0);
+    }
+
+    #[test]
+    fn mirror_is_symmetric_about_the_centre() {
+        for i in 0..=100 {
+            let u = i as f32 / 100.0;
+            let a = source_position(u, true, false);
+            let b = source_position(1.0 - u, true, false);
+            assert!((a - b).abs() < 1e-6, "asymmetric at {u}: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn reverse_alone_flips_end_to_end() {
+        assert_eq!(source_position(0.0, false, true), 1.0);
+        assert_eq!(source_position(1.0, false, true), 0.0);
+    }
+
+    #[test]
+    fn level_lookup_interpolates_between_centres() {
+        let centers = [100.0, 1000.0, 10_000.0];
+        let levels = [0.0, 1.0, 0.0];
+        assert_eq!(level_at(&levels, &centers, 100.0), 0.0);
+        assert_eq!(level_at(&levels, &centers, 1000.0), 1.0);
+        // Geometric midpoint of the first span is halfway up on the log axis.
+        let mid = level_at(&levels, &centers, (100.0f32 * 1000.0).sqrt());
+        assert!((mid - 0.5).abs() < 1e-3, "log interpolation gave {mid}");
+
+        // Outside the measured range the ends hold rather than extrapolate.
+        assert_eq!(level_at(&levels, &centers, 20.0), 0.0);
+        assert_eq!(level_at(&levels, &centers, 20_000.0), 0.0);
+    }
+
+    fn centers(n: usize) -> Vec<f32> {
+        (0..n).map(|i| norm_to_hz(i as f32 / (n - 1) as f32)).collect()
+    }
+
+    #[test]
+    fn default_layout_spans_the_whole_axis_in_order() {
+        let c = centers(48);
+        let mut map = StripMap::new(
+            LayoutConfig::spanning(150),
+            IntensityConfig::default(),
+            &c,
+            48,
+            150,
+        );
+        let points = map.map(&[1.0; 48]).to_vec();
+        assert!(points[0].x < 0.01, "first point was at {}", points[0].x);
+        assert!(points[47].x > 0.99, "last point was at {}", points[47].x);
+        assert!(points.windows(2).all(|w| w[1].x >= w[0].x), "axis was not monotonic");
+    }
+
+    #[test]
+    fn mirrored_output_is_symmetric() {
+        let c = centers(48);
+        let layout = LayoutConfig { mirror: true, ..LayoutConfig::spanning(150) };
+        let mut map = StripMap::new(layout, IntensityConfig::default(), &c, 48, 150);
+
+        let levels: Vec<f32> = (0..48).map(|i| i as f32 / 47.0).collect();
+        let points = map.map(&levels).to_vec();
+        for i in 0..48 {
+            let (a, b) = (points[i], points[47 - i]);
+            assert!((a.x - b.x).abs() < 1e-5, "point {i} broke symmetry");
+            assert!((a.gain - b.gain).abs() < 1e-5);
+        }
+    }
+
+    /// The whole point of the threshold: nothing under it reaches the strip.
+    #[test]
+    fn quiet_bands_are_cut_by_the_threshold() {
+        let c = centers(48);
+        let intensity = IntensityConfig { threshold: -40.0, clamp: -10.0, curve: Default::default() };
+        let mut map = StripMap::new(LayoutConfig::spanning(150), intensity, &c, 48, 150);
+
+        let points = map.map(&[0.1; 48]).to_vec(); // -72 dB, well under
+        assert!(points.iter().all(|p| p.gain == 0.0), "threshold let signal through");
+
+        let points = map.map(&[1.0; 48]).to_vec();
+        assert!(points.iter().all(|p| p.gain == 1.0), "clamp did not saturate");
+    }
+
+    #[test]
+    fn silence_produces_no_light_under_any_layout() {
+        let c = centers(48);
+        for mirror in [false, true] {
+            for reverse in [false, true] {
+                let layout = LayoutConfig { mirror, reverse, ..LayoutConfig::spanning(150) };
+                let mut map = StripMap::new(layout, IntensityConfig::default(), &c, 48, 150);
+                let points = map.map(&[0.0; 48]).to_vec();
+                assert!(
+                    points.iter().all(|p| p.gain == 0.0),
+                    "mirror={mirror} reverse={reverse} lit up on silence"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_degenerate_keyframe_list_still_lights_the_strip() {
+        let c = centers(48);
+        for list in [vec![], keyframes(&[(0, 1000.0)])] {
+            let layout = LayoutConfig { led_keyframes: list, reverse: false, mirror: false };
+            let mut map = StripMap::new(layout, IntensityConfig::default(), &c, 48, 150);
+            let points = map.map(&[1.0; 48]).to_vec();
+            assert!(points.iter().any(|p| p.gain > 0.0), "fallback layout went dark");
+        }
+    }
+
+    #[test]
+    fn parses_the_editor_wire_format() {
+        let json = r#"{"ledKeyframes":[{"id":"a","led":0,"hz":20},{"id":"b","led":149,"hz":20000}],"reverse":true,"mirror":false}"#;
+        let layout: LayoutConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(layout.led_keyframes.len(), 2);
+        assert_eq!(layout.led_keyframes[1].led, 149);
+        assert!(layout.reverse && !layout.mirror);
+    }
+}

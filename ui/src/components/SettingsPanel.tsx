@@ -38,9 +38,9 @@ export function SettingsPanel({ config, onChange, brightness, onBrightness, samp
         </Field>
 
         <Field
-          label="Sample length"
-          value={`${((config.sampleLength / rate) * 1000).toFixed(0)} ms`}
-          hint="Samples captured before each transform. Longer resolves bass; shorter reacts faster."
+          label="Frame hop"
+          value={`${((config.sampleLength / rate) * 1000).toFixed(1)} ms`}
+          hint="New samples between analysis frames. Shorter reacts faster and costs more CPU. The FFT window is picked per band, so there is no single length to set."
         >
           <Select
             data={SAMPLE_LENGTHS.map((n) => ({ value: String(n), label: `${n} samples` }))}

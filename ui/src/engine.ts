@@ -9,8 +9,31 @@
  */
 
 import type { SurfaceConfig } from "./color/surface";
+import type { CurveConfig } from "./config/curve";
+import type { EqBand } from "./config/eq";
+import type { LedKeyframe } from "./config/editor";
 
 export const DEFAULT_URL = "ws://127.0.0.1:9001";
+
+/**
+ * The engine's `ShowConfig`, verbatim.
+ *
+ * Everything the editor holds that the engine acts on, in one message. The
+ * colour keyframes travel as the normalised surface because that is the form
+ * the renderer samples; the rest is sent as authored.
+ */
+export interface ShowConfig {
+  surface: SurfaceConfig;
+  eq: EqBand[];
+  ledKeyframes: LedKeyframe[];
+  reverse: boolean;
+  mirror: boolean;
+  threshold: number;
+  clamp: number;
+  curve: CurveConfig;
+  decay: number;
+  sampleLength: number;
+}
 
 export interface Frame {
   levels: number[];
@@ -24,10 +47,13 @@ export interface Frame {
 }
 
 export interface EngineState {
-  surface: SurfaceConfig;
+  config: ShowConfig;
   brightness: number;
   ledCount: number;
   bandCount: number;
+  /** Analyser dB window. The EQ is authored in these terms, not the plot's. */
+  dbFloor: number;
+  dbCeil: number;
 }
 
 export type Status = "connecting" | "connected" | "offline";
@@ -124,8 +150,16 @@ export class EngineClient {
     }
   }
 
-  setSurface(surface: SurfaceConfig): void {
-    this.send({ type: "surface", surface });
+  /**
+   * Push the whole configuration.
+   *
+   * Sent as one message even on the hot path — dragging a keyframe produces one
+   * of these per pointer move. The engine compares each stage against what it
+   * already has, so the cost is a few float comparisons, and a single message
+   * means the two sides cannot disagree about which half of an edit landed.
+   */
+  setConfig(config: ShowConfig): void {
+    this.send({ type: "config", config });
   }
 
   setBrightness(value: number): void {

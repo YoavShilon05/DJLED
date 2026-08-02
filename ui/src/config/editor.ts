@@ -1,14 +1,13 @@
 /**
  * Everything the editor holds, and the one place it is translated for the engine.
  *
- * Only the colour surface and the master brightness exist in the wire protocol
- * today. The rest — thresholds, LED regions, the intensity curve, decay, sample
- * length — is authored here and persisted here, waiting for the engine side to
- * grow the fields. Keeping the whole config in one shape now means that later
- * change is a serialiser, not a rewrite.
+ * The whole config crosses the wire as a single `ShowConfig`; `toEngineConfig`
+ * and `fromEngineConfig` are the only two places that shape is known, so a
+ * protocol change lands here rather than being spread across the editor.
  */
 
 import { DEFAULT_SURFACE, type SurfaceConfig } from "../color/surface";
+import type { ShowConfig } from "../engine";
 import type { CurveConfig } from "./curve";
 import type { EqBand } from "./eq";
 import { DB_MAX, DB_MIN, dbToNorm, hzToNorm, normToDb, normToHz } from "./scales";
@@ -64,7 +63,15 @@ export interface EditorConfig {
   gizmos: GizmoFlags;
 }
 
-export const SAMPLE_LENGTHS = [256, 512, 1024, 2048, 4096, 8192];
+/**
+ * Analysis hop, in samples. Matches the engine's `MIN_HOP`..`MAX_HOP`; anything
+ * outside is clamped there rather than rejected.
+ *
+ * Not an FFT window length — the engine draws every band from the smallest
+ * transform that can still resolve it, five tiers from 8192 down to 128, so
+ * there is no single window to set. This is how often those transforms run.
+ */
+export const SAMPLE_LENGTHS = [64, 128, 256, 512, 1024, 2048];
 
 let counter = 0;
 export function nextId(prefix: string): string {
@@ -95,13 +102,18 @@ export const DEFAULT_CONFIG: EditorConfig = {
   threshold: -62,
   clamp: -6,
   curve: { type: "linear", p1: { x: 0.25, y: 0.1 }, p2: { x: 0.25, y: 1 } },
+  // Both match the engine's own defaults, so a fresh editor connecting does not
+  // immediately push a change and rebuild the analyser.
   decay: 0.82,
-  sampleLength: 2048,
+  sampleLength: 256,
   blend: DEFAULT_SURFACE.sigma,
   gizmos: { thresholds: true, colorKeyframes: true, ledKeyframes: true, curve: true, eq: true },
 };
 
-/** The half of the config the engine understands today. */
+/**
+ * Colour keyframes in the form the renderer samples: normalised over the unit
+ * square, with x on the log frequency axis and y the band's level.
+ */
 export function toSurface(config: EditorConfig): SurfaceConfig {
   return {
     sigma: config.blend,
@@ -113,17 +125,44 @@ export function toSurface(config: EditorConfig): SurfaceConfig {
   };
 }
 
-/** Adopt a surface pushed by the engine, leaving UI-only settings untouched. */
-export function withSurface(config: EditorConfig, surface: SurfaceConfig): EditorConfig {
+/** Everything the engine acts on. Gizmo visibility stays here, as it should. */
+export function toEngineConfig(config: EditorConfig): ShowConfig {
+  return {
+    surface: toSurface(config),
+    eq: config.eq,
+    ledKeyframes: config.ledKeyframes,
+    reverse: config.reverse,
+    mirror: config.mirror,
+    threshold: config.threshold,
+    clamp: config.clamp,
+    curve: config.curve,
+    decay: config.decay,
+    sampleLength: config.sampleLength,
+  };
+}
+
+/** Adopt what the engine is running, leaving editor-only settings untouched. */
+export function fromEngineConfig(config: EditorConfig, show: ShowConfig): EditorConfig {
   return {
     ...config,
-    blend: surface.sigma,
-    colorKeyframes: surface.keyframes.map((k) => ({
+    blend: show.surface.sigma,
+    colorKeyframes: show.surface.keyframes.map((k) => ({
       id: nextId("ck"),
       hz: normToHz(k.x),
       db: normToDb(k.y),
       color: k.color,
     })),
+    // Ids are the editor's own bookkeeping and never cross the wire, so they
+    // are minted fresh rather than expected back.
+    eq: show.eq.map((b) => ({ ...b, id: nextId("eq") })),
+    ledKeyframes: show.ledKeyframes.map((k) => ({ ...k, id: nextId("led") })),
+    reverse: show.reverse,
+    mirror: show.mirror,
+    threshold: show.threshold,
+    clamp: show.clamp,
+    curve: show.curve,
+    decay: show.decay,
+    sampleLength: show.sampleLength,
   };
 }
 

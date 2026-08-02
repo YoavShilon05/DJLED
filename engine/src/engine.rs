@@ -2,6 +2,7 @@
 
 use crate::dsp::bands::{BandPlan, BandScaleConfig};
 use crate::dsp::dcblock::DcBlocker;
+use crate::dsp::eq::{EqBand, EqCurve};
 use crate::dsp::fastpath::{FastPath, FastPathConfig};
 use crate::dsp::mrstft::{MultiResStft, DEFAULT_HOP};
 use crate::dsp::post::{PostConfig, PostProcessor};
@@ -41,6 +42,7 @@ pub struct Engine {
     stft: MultiResStft,
     fast: Option<FastPath>,
     post: PostProcessor,
+    centers: Vec<f32>,
     magnitudes: Vec<f32>,
     scratch: Vec<f32>,
 }
@@ -62,11 +64,31 @@ impl Engine {
             post: PostProcessor::new(cfg.post.clone(), &centers, dt),
             magnitudes: vec![0.0; n],
             scratch: Vec::new(),
+            centers,
         }
     }
 
     pub fn sample_rate(&self) -> f64 {
         self.sample_rate
+    }
+
+    /// Band centre frequencies. Needed to sample the EQ and to map a strip
+    /// position back to a level.
+    pub fn centers(&self) -> &[f32] {
+        &self.centers
+    }
+
+    /// Install a parametric EQ. Sampled at the band centres once here rather
+    /// than per frame — the response only changes when the user edits it.
+    pub fn set_eq(&mut self, bands: &[EqBand]) {
+        let curve = EqCurve::new(bands, self.sample_rate as f32);
+        self.post.set_eq_db(&curve.table(&self.centers));
+    }
+
+    /// Retune the release ballistics. See [`PostProcessor::set_decay`].
+    pub fn set_decay(&mut self, decay: f32) {
+        let n = self.centers.len();
+        self.post.set_decay(decay, n);
     }
 
     pub fn plan(&self) -> &BandPlan {

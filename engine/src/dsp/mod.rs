@@ -13,6 +13,7 @@
 pub mod bands;
 pub mod biquad;
 pub mod dcblock;
+pub mod eq;
 pub mod fastpath;
 pub mod mrstft;
 pub mod post;

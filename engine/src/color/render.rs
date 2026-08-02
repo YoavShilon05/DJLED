@@ -4,7 +4,9 @@
 //! reordering in the firmware via its template parameter, so the wire protocol
 //! stays in the order humans expect.
 
+use super::intensity::IntensityConfig;
 use super::oklab::LinearRgb;
+use super::strip::{ControlPoint, LayoutConfig, StripMap};
 use super::surface::{ColorSurface, SurfaceConfig};
 
 #[derive(Clone, Debug)]
@@ -31,22 +33,57 @@ impl Default for RenderConfig {
     }
 }
 
+/// How many colours go on the wire, and what they are spread across.
+#[derive(Clone, Debug)]
+pub struct Geometry {
+    /// Band centre frequencies, for looking a level up by frequency.
+    pub centers: Vec<f32>,
+    /// Colours per frame. Kept at the band count so the wire format is unchanged.
+    pub points: usize,
+    pub leds: usize,
+}
+
 pub struct Renderer {
     surface: ColorSurface,
     cfg: RenderConfig,
-    /// Carried quantisation error per band per channel.
+    map: StripMap,
+    /// Carried quantisation error per control point per channel.
     error: Vec<[f32; 3]>,
     pixels: Vec<[u8; 3]>,
 }
 
 impl Renderer {
-    pub fn new(cfg: RenderConfig, surface: &SurfaceConfig, band_count: usize) -> Result<Self, String> {
+    pub fn new(
+        cfg: RenderConfig,
+        surface: &SurfaceConfig,
+        layout: LayoutConfig,
+        intensity: IntensityConfig,
+        geometry: Geometry,
+    ) -> Result<Self, String> {
+        let points = geometry.points;
         Ok(Self {
             surface: ColorSurface::new(surface)?,
             cfg,
-            error: vec![[0.0; 3]; band_count],
-            pixels: vec![[0; 3]; band_count],
+            map: StripMap::new(layout, intensity, &geometry.centers, points, geometry.leds),
+            error: vec![[0.0; 3]; points],
+            pixels: vec![[0; 3]; points],
         })
+    }
+
+    pub fn set_layout(&mut self, layout: LayoutConfig) {
+        self.map.set_layout(layout);
+    }
+
+    pub fn set_intensity(&mut self, intensity: IntensityConfig) {
+        self.map.set_intensity(intensity);
+    }
+
+    pub fn layout(&self) -> &LayoutConfig {
+        self.map.layout()
+    }
+
+    pub fn intensity(&self) -> &IntensityConfig {
+        self.map.intensity()
     }
 
     pub fn config(&self) -> &RenderConfig {
@@ -68,19 +105,20 @@ impl Renderer {
         &self.surface
     }
 
-    /// One RGB triplet per band.
+    /// One RGB triplet per control point, ready for the wire.
     pub fn pixels(&self) -> &[[u8; 3]] {
         &self.pixels
     }
 
     pub fn render(&mut self, levels: &[f32]) -> &[[u8; 3]] {
-        debug_assert_eq!(levels.len(), self.pixels.len());
-        let last = self.pixels.len().saturating_sub(1).max(1) as f32;
         let trim = (self.cfg.gamma - 1.0).abs() > 1e-6;
+        let master = self.cfg.brightness.clamp(0.0, 1.0);
 
-        for (i, &level) in levels.iter().enumerate() {
-            let x = i as f32 / last;
-            let lab = self.surface.sample(x, level);
+        // Borrowed separately from `self.surface`, which the loop also needs.
+        let points: &[ControlPoint] = self.map.map(levels);
+
+        for (i, point) in points.iter().enumerate() {
+            let lab = self.surface.sample(point.x, point.y);
             let mut rgb = lab.to_linear_rgb().clamped();
 
             if trim {
@@ -91,7 +129,10 @@ impl Renderer {
                 );
             }
 
-            let scale = 255.0 * self.cfg.brightness.clamp(0.0, 1.0);
+            // The intensity curve and the master both scale linear light, which
+            // is where a brightness belongs: the LED is driven linearly, so
+            // halving the byte really does halve the light.
+            let scale = 255.0 * master * point.gain.clamp(0.0, 1.0);
             let channels = [rgb.r * scale, rgb.g * scale, rgb.b * scale];
 
             for (c, &target) in channels.iter().enumerate() {
@@ -121,10 +162,27 @@ impl Renderer {
 mod tests {
     use super::*;
 
+    use super::super::strip::norm_to_hz;
+
     const BANDS: usize = 48;
 
     fn renderer(cfg: RenderConfig) -> Renderer {
-        Renderer::new(cfg, &SurfaceConfig::default(), BANDS).unwrap()
+        // Intensity stage disabled, so these keep measuring quantisation and
+        // master brightness rather than the curve. It gets its own test below.
+        renderer_with(cfg, IntensityConfig::pass_through())
+    }
+
+    fn renderer_with(cfg: RenderConfig, intensity: IntensityConfig) -> Renderer {
+        let centers: Vec<f32> =
+            (0..BANDS).map(|i| norm_to_hz(i as f32 / (BANDS - 1) as f32)).collect();
+        Renderer::new(
+            cfg,
+            &SurfaceConfig::default(),
+            LayoutConfig::spanning(150),
+            intensity,
+            Geometry { centers, points: BANDS, leds: 150 },
+        )
+        .unwrap()
     }
 
     #[test]
@@ -212,6 +270,48 @@ mod tests {
             for c in 0..3 {
                 assert!(d[c] <= b[c], "half brightness was not dimmer: {d:?} vs {b:?}");
             }
+        }
+    }
+
+    /// The intensity stage has to actually reach the wire — the tests above
+    /// deliberately bypass it, so this is the one that would catch it being
+    /// computed and then dropped.
+    #[test]
+    fn threshold_reaches_the_output() {
+        let cfg = RenderConfig { dither: false, ..Default::default() };
+        let intensity =
+            IntensityConfig { threshold: -40.0, clamp: -10.0, curve: Default::default() };
+
+        // -72 dB on the editor's axis: comfortably under the threshold.
+        let mut r = renderer_with(cfg.clone(), intensity);
+        assert!(
+            r.render(&[0.1; BANDS]).iter().all(|px| px == &[0, 0, 0]),
+            "signal under the threshold still lit the strip"
+        );
+
+        let mut open = renderer_with(cfg, IntensityConfig::pass_through());
+        assert!(
+            open.render(&[0.1; BANDS]).iter().any(|px| px.iter().any(|&c| c > 0)),
+            "the same signal was dark without a threshold, so the test proves nothing"
+        );
+    }
+
+    /// Reverse must reorder the wire colours, not merely be accepted and lost.
+    #[test]
+    fn reverse_flips_the_control_points() {
+        let cfg = RenderConfig { dither: false, ..Default::default() };
+        let levels: Vec<f32> = (0..BANDS).map(|i| i as f32 / (BANDS - 1) as f32).collect();
+
+        let mut forward = renderer_with(cfg.clone(), IntensityConfig::pass_through());
+        let a = forward.render(&levels).to_vec();
+
+        let mut backward = renderer_with(cfg, IntensityConfig::pass_through());
+        backward.set_layout(LayoutConfig { reverse: true, ..LayoutConfig::spanning(150) });
+        let b = backward.render(&levels).to_vec();
+
+        assert_ne!(a, b, "reverse changed nothing");
+        for (i, px) in b.iter().enumerate() {
+            assert_eq!(px, &a[BANDS - 1 - i], "point {i} is not the mirror of the forward render");
         }
     }
 

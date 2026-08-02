@@ -3,12 +3,19 @@
 //! - [`oklab`] — the perceptual space interpolation happens in, and the
 //!   conversions either side of it.
 //! - [`surface`] — the 2D keyframe field over (strip position × intensity).
-//! - [`render`] — sampling that field per band and quantising to LED bytes.
+//! - [`intensity`] — level to brightness: threshold, clamp and the curve.
+//! - [`strip`] — where each frequency lands on the wall: LED sectors, reverse
+//!   and mirror.
+//! - [`render`] — sampling the field at those points and quantising to bytes.
 
+pub mod intensity;
 pub mod oklab;
 pub mod render;
+pub mod strip;
 pub mod surface;
 
+pub use intensity::{IntensityConfig, IntensityCurve};
 pub use oklab::{LinearRgb, Oklab};
-pub use render::{RenderConfig, Renderer};
+pub use render::{Geometry, RenderConfig, Renderer};
+pub use strip::{LayoutConfig, LedKeyframe, StripMap};
 pub use surface::{ColorSurface, Keyframe, SurfaceConfig};

@@ -31,7 +31,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::color::SurfaceConfig;
+use crate::show::ShowConfig;
 
 pub const DEFAULT_PORT: u16 = 9001;
 
@@ -59,8 +59,14 @@ pub struct Snapshot {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Command {
-    /// Replace the colour surface. Applied on the next frame.
-    Surface { surface: SurfaceConfig },
+    /// Replace the whole show configuration.
+    ///
+    /// One message rather than one per control, including on the hot path where
+    /// dragging a keyframe sends one of these per pointer move. Applying it is
+    /// cheap because each stage compares against what it already has, and a
+    /// single message means the two sides cannot end up disagreeing about which
+    /// half of an edit landed.
+    Config { config: Box<ShowConfig> },
     /// Master brightness, 0..1.
     Brightness { value: f32 },
     /// Ask for the current configuration, e.g. after a reload.
@@ -72,10 +78,14 @@ pub enum Command {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct State {
-    pub surface: SurfaceConfig,
+    pub config: ShowConfig,
     pub brightness: f32,
     pub led_count: usize,
     pub band_count: usize,
+    /// Analyser dB window. The EQ is authored in these terms, so the editor
+    /// needs them to preview a gain at the right size.
+    pub db_floor: f32,
+    pub db_ceil: f32,
 }
 
 #[derive(Serialize)]
@@ -253,6 +263,7 @@ fn send_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::color::SurfaceConfig;
 
     #[test]
     fn strip_encodes_as_lowercase_hex() {
@@ -280,12 +291,26 @@ mod tests {
 
         // Deeper delimiter: the hex colour contains `"#`, which would close a
         // single-hash raw string.
-        let json = r##"{"type":"surface","surface":{"keyframes":[{"x":0,"y":1,"color":"#ff0000"}],"sigma":0.25}}"##;
+        let json = r##"{"type":"config","config":{"surface":{"keyframes":[{"x":0,"y":1,"color":"#ff0000"}],"sigma":0.25}}}"##;
         let cmd: Command = serde_json::from_str(json).unwrap();
         match cmd {
-            Command::Surface { surface } => {
-                assert_eq!(surface.keyframes.len(), 1);
-                assert_eq!(surface.keyframes[0].color, "#ff0000");
+            Command::Config { config } => {
+                assert_eq!(config.surface.keyframes.len(), 1);
+                assert_eq!(config.surface.keyframes[0].color, "#ff0000");
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_full_config_command_parses() {
+        let json = r#"{"type":"config","config":{"mirror":true,"threshold":-50,"sampleLength":512}}"#;
+        let cmd: Command = serde_json::from_str(json).unwrap();
+        match cmd {
+            Command::Config { config } => {
+                assert!(config.mirror);
+                assert_eq!(config.threshold, -50.0);
+                assert_eq!(config.hop(), 512);
             }
             other => panic!("parsed as {other:?}"),
         }

@@ -21,23 +21,28 @@ const BLACK: Rgb = [0, 0, 0];
 const DB_SPAN = DB_MAX - DB_MIN;
 
 /**
- * The EQ, applied to the analyser's output before anything else sees it.
+ * The EQ, for the offline preview only.
  *
- * This runs upstream of the plot as well as the strip, so the bars always show
- * what the LEDs are actually fed. Hiding the EQ gizmo hides the curve, not its
- * effect — the same way hiding the threshold handles does not stop the
- * threshold cutting.
+ * When the engine is connected its levels already have the EQ in them — it is
+ * applied there between the AGC and the range map, which is where it belongs —
+ * so applying it again here would double it. This exists so the curve still
+ * does something visible with nothing running.
+ *
+ * It is an approximation of the engine's version, in two ways worth knowing:
+ * the gain is a fraction of the analyser's dB window (hence `dbSpan`, reported
+ * by the engine), and a band already at zero is left alone, because the editor
+ * cannot see how far below the floor it actually sits and a boost applied to a
+ * floored level would make an idle strip glow.
  */
-export function applyEq(frame: SpectrumFrame, curve: EqCurve): SpectrumFrame {
+export function applyEq(frame: SpectrumFrame, curve: EqCurve, dbSpan: number): SpectrumFrame {
   if (curve.isFlat) return frame;
+  const span = dbSpan > 0 ? dbSpan : DB_SPAN;
   return {
     centers: frame.centers,
     levels: frame.levels.map((level, i) => {
       const hz = frame.centers[i];
-      if (hz === undefined) return level;
-      // Levels are a linear remap of the dB axis, so a dB gain is a fixed
-      // fraction of the range rather than a multiply.
-      return clamp(level + curve.gainAt(hz) / DB_SPAN, 0, 1);
+      if (hz === undefined || level <= 0) return level;
+      return clamp(level + curve.gainAt(hz) / span, 0, 1);
     }),
   };
 }

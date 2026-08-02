@@ -9,6 +9,8 @@ pub mod color;
 pub mod dsp;
 pub mod engine;
 pub mod link;
+pub mod show;
 pub mod ui;
 
 pub use engine::{Engine, EngineConfig};
+pub use show::ShowConfig;
