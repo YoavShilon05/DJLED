@@ -1,15 +1,43 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Alert,
+  Badge,
+  Button,
+  Container,
+  Flex,
+  Group,
+  Kbd,
+  Paper,
+  Stack,
+  Text,
+  Title,
+} from "@mantine/core";
+import { useDebouncedCallback } from "@mantine/hooks";
 
-import { ColorSurface, DEFAULT_SURFACE, cloneSurface, type SurfaceConfig } from "./color/surface";
-import { DEFAULT_URL, EngineClient, decodeStrip, type Frame, type Status } from "./engine";
+import { ledBytesToDisplay, type Rgb } from "./color/display";
+import {
+  DEFAULT_CONFIG,
+  clearConfig,
+  hasStoredConfig,
+  loadConfig,
+  saveConfig,
+  toSurface,
+  withSurface,
+  type EditorConfig,
+} from "./config/editor";
+import { GizmoPanel } from "./components/GizmoPanel";
+import { SettingsPanel } from "./components/SettingsPanel";
 import { StripPreview } from "./components/StripPreview";
-import { SurfaceEditor } from "./components/SurfaceEditor";
+import { DEFAULT_URL, EngineClient, decodeStrip, type Frame, type Status } from "./engine";
+import { SpectrumEditor } from "./spectrum/SpectrumEditor";
+import type { SpectrumFrame } from "./spectrum/paint";
+import { renderStrip } from "./spectrum/render";
 
-const PRESET_KEY = "djled.surface";
+/** Sampled once at load: a later save must not change what a reconnect does. */
+const HAD_LOCAL_CONFIG = hasStoredConfig();
 
 export default function App() {
-  const [surface, setSurface] = useState<SurfaceConfig>(loadPreset);
-  const [selected, setSelected] = useState<number | null>(null);
+  const [config, setConfig] = useState<EditorConfig>(loadConfig);
   const [status, setStatus] = useState<Status>("connecting");
   const [frame, setFrame] = useState<Frame | null>(null);
   const [brightness, setBrightness] = useState(1);
@@ -17,7 +45,6 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
 
   const clientRef = useRef<EngineClient | null>(null);
-  const compiled = useMemo(() => new ColorSurface(surface), [surface]);
 
   useEffect(() => {
     const client = new EngineClient(DEFAULT_URL, {
@@ -27,10 +54,10 @@ export default function App() {
       onState: (state) => {
         setBrightness(state.brightness);
         setLedCount(state.ledCount);
-        // The engine's surface is authoritative on connect, but only if nothing
-        // has been authored here yet — otherwise reconnecting would silently
-        // discard unsaved edits.
-        if (!localStorage.getItem(PRESET_KEY)) setSurface(state.surface);
+        // The engine's surface is authoritative on first connect, but only if
+        // nothing has been authored here — otherwise a reconnect would throw
+        // away unsaved edits.
+        if (!HAD_LOCAL_CONFIG) setConfig((c) => withSurface(c, state.surface));
       },
     });
     clientRef.current = client;
@@ -38,167 +65,156 @@ export default function App() {
     return () => client.close();
   }, []);
 
-  const applySurface = useCallback((next: SurfaceConfig) => {
-    setSurface(next);
-    setError(null);
-    clientRef.current?.setSurface(next);
+  const persist = useDebouncedCallback(saveConfig, 400);
+
+  const applyConfig = useCallback(
+    (next: EditorConfig) => {
+      setConfig(next);
+      setError(null);
+      persist(next);
+      // Only the colour surface exists in the protocol so far; the rest of the
+      // config is previewed locally until the engine grows the fields.
+      clientRef.current?.setSurface(toSurface(next));
+    },
+    [persist],
+  );
+
+  const applyBrightness = useCallback((value: number) => {
+    setBrightness(value);
+    clientRef.current?.setBrightness(value);
   }, []);
 
-  // Demo levels keep the editor alive while offline, so a palette can be
-  // authored with nothing running.
-  const demo = useDemoLevels(status !== "connected");
-  const levels = status === "connected" && frame ? frame.levels : demo;
-  const centers = frame?.centers ?? [];
-  const pixels = status === "connected" && frame ? decodeStrip(frame.strip) : null;
+  const demo = useDemoFrame(status !== "connected");
+  const live: SpectrumFrame | null =
+    status === "connected" && frame ? { levels: frame.levels, centers: frame.centers } : null;
+  const spectrum = live ?? demo;
 
-  const selectedKeyframe = selected !== null ? surface.keyframes[selected] : undefined;
+  const previewStrip = useMemo(
+    () => renderStrip(config, spectrum, ledCount, brightness),
+    [config, spectrum, ledCount, brightness],
+  );
+
+  const engineStrip = useMemo<Rgb[] | null>(
+    () =>
+      live && frame
+        ? decodeStrip(frame.strip).map(([r, g, b]) => ledBytesToDisplay(r, g, b))
+        : null,
+    [live, frame],
+  );
 
   return (
-    <div className="app">
-      <header>
-        <h1>DJLED</h1>
-        <span className={`status status-${status}`}>
-          {status === "connected"
-            ? `${frame?.sampleRate ? `${(frame.sampleRate / 1000).toFixed(1)} kHz` : "live"} · ${ledCount} LEDs`
-            : status === "connecting"
-              ? "connecting…"
-              : "offline — editing locally"}
-        </span>
-      </header>
-
-      {error && <div className="error">{error}</div>}
-
-      <main>
-        <section className="editor-pane">
-          <div className="labels">
-            <span>intensity ↑</span>
-            <span>frequency →</span>
-          </div>
-          <SurfaceEditor
-            surface={surface}
-            onChange={applySurface}
-            levels={levels}
-            centers={centers}
-            selected={selected}
-            onSelect={setSelected}
-          />
-        </section>
-
-        <aside>
-          <h2>keyframe</h2>
-          {selectedKeyframe ? (
-            <div className="field">
-              <input
-                type="color"
-                value={selectedKeyframe.color}
-                onChange={(e) => {
-                  const next = cloneSurface(surface);
-                  next.keyframes[selected!] = {
-                    ...next.keyframes[selected!],
-                    color: e.target.value,
-                  };
-                  applySurface(next);
-                }}
-              />
-              <code>{selectedKeyframe.color}</code>
-              <button
-                disabled={surface.keyframes.length <= 2}
-                onClick={() => {
-                  const next = cloneSurface(surface);
-                  next.keyframes.splice(selected!, 1);
-                  applySurface(next);
-                  setSelected(null);
-                }}
-              >
-                delete
-              </button>
-            </div>
-          ) : (
-            <p className="muted">select a point to change its colour</p>
-          )}
-
-          <h2>blend radius</h2>
-          <input
-            type="range"
-            min={0.05}
-            max={0.6}
-            step={0.01}
-            value={surface.sigma}
-            onChange={(e) => applySurface({ ...cloneSurface(surface), sigma: +e.target.value })}
-          />
-          <code>{surface.sigma.toFixed(2)}</code>
-          <p className="muted">
-            how far each point's influence reaches. smaller is crisper, larger blurs
-            neighbouring colours together.
-          </p>
-
-          <h2>brightness</h2>
-          <input
-            type="range"
-            min={0}
-            max={1}
-            step={0.01}
-            value={brightness}
-            onChange={(e) => {
-              const v = +e.target.value;
-              setBrightness(v);
-              clientRef.current?.setBrightness(v);
+    <Container size={1600} py="md">
+      <Stack gap="md">
+        <Group justify="space-between" align="center">
+          <Group gap="sm" align="baseline">
+            <Title order={1} size="h4" tt="uppercase" lts="0.12em">
+              DJLED
+            </Title>
+            <StatusBadge status={status} frame={frame} ledCount={ledCount} />
+          </Group>
+          <Button
+            variant="default"
+            onClick={() => {
+              clearConfig();
+              applyConfig(DEFAULT_CONFIG);
             }}
-          />
-          <code>{Math.round(brightness * 100)}%</code>
+          >
+            Reset
+          </Button>
+        </Group>
 
-          <h2>preset</h2>
-          <div className="row">
-            <button onClick={() => localStorage.setItem(PRESET_KEY, JSON.stringify(surface))}>
-              save
-            </button>
-            <button
-              onClick={() => {
-                localStorage.removeItem(PRESET_KEY);
-                applySurface(cloneSurface(DEFAULT_SURFACE));
-                setSelected(null);
-              }}
-            >
-              reset
-            </button>
-          </div>
-          {frame && frame.droppedFrames > 0 && (
-            <p className="muted">dropped frames: {frame.droppedFrames}</p>
-          )}
-        </aside>
-      </main>
+        {error && (
+          <Alert color="red" variant="light" title="Engine error">
+            {error}
+          </Alert>
+        )}
 
-      <section className="strip-pane">
-        <h2>strip</h2>
-        <StripPreview
-          pixels={pixels}
-          surface={compiled}
-          levels={levels}
-          ledCount={ledCount}
-        />
-      </section>
-    </div>
+        <Flex gap="md" align="flex-start" direction={{ base: "column", md: "row" }}>
+          <Stack gap="md" w={{ base: "100%", md: 280 }} style={{ flexShrink: 0 }}>
+            <SettingsPanel
+              config={config}
+              onChange={applyConfig}
+              brightness={brightness}
+              onBrightness={applyBrightness}
+              sampleRate={frame?.sampleRate ?? 0}
+            />
+            <GizmoPanel config={config} onChange={applyConfig} />
+          </Stack>
+
+          <Paper flex={1} miw={0}>
+            <Stack gap="sm">
+              <SpectrumEditor
+                config={config}
+                onChange={applyConfig}
+                frame={spectrum}
+                ledCount={ledCount}
+              />
+              <Text size="xs" c="dimmed">
+                Right-click the graph to add a colour keyframe · right-click the LED track to add a
+                sector · click to select, <Kbd size="xs">Del</Kbd> to remove
+              </Text>
+            </Stack>
+          </Paper>
+        </Flex>
+
+        <Paper>
+          <Stack gap="md">
+            <StripPreview
+              label="Preview"
+              hint={`${ledCount} LEDs`}
+              colors={previewStrip}
+              height={30}
+            />
+            {engineStrip && (
+              <StripPreview
+                label="Engine"
+                hint={
+                  frame && frame.droppedFrames > 0 ? `${frame.droppedFrames} dropped` : "live"
+                }
+                colors={engineStrip}
+                height={18}
+              />
+            )}
+          </Stack>
+        </Paper>
+      </Stack>
+    </Container>
   );
 }
 
-function loadPreset(): SurfaceConfig {
-  try {
-    const raw = localStorage.getItem(PRESET_KEY);
-    if (!raw) return cloneSurface(DEFAULT_SURFACE);
-    const parsed = JSON.parse(raw) as SurfaceConfig;
-    // A corrupt or hand-edited preset must not brick the editor.
-    if (!Array.isArray(parsed.keyframes) || parsed.keyframes.length === 0) {
-      return cloneSurface(DEFAULT_SURFACE);
-    }
-    return parsed;
-  } catch {
-    return cloneSurface(DEFAULT_SURFACE);
+function StatusBadge({
+  status,
+  frame,
+  ledCount,
+}: {
+  status: Status;
+  frame: Frame | null;
+  ledCount: number;
+}) {
+  if (status === "connected") {
+    const rate = frame?.sampleRate ? `${(frame.sampleRate / 1000).toFixed(1)} kHz` : "live";
+    return <Badge color="teal">{`${rate} · ${ledCount} LEDs`}</Badge>;
   }
+  if (status === "connecting") return <Badge color="gray">connecting…</Badge>;
+  return <Badge color="yellow">offline — editing locally</Badge>;
 }
 
-/** A slow synthetic spectrum, so the editor is not a dead flat line offline. */
-function useDemoLevels(active: boolean): number[] {
-  const [levels, setLevels] = useState<number[]>(() => new Array(48).fill(0));
+const DEMO_BANDS = 48;
+
+/**
+ * A slow synthetic spectrum, so the editor is not a dead flat line offline.
+ * Centres are log-spaced across the same range the axis draws, so the demo bars
+ * land on the grid exactly as real bands would.
+ */
+function useDemoFrame(active: boolean): SpectrumFrame {
+  const centers = useMemo(
+    () =>
+      Array.from({ length: DEMO_BANDS }, (_, i) =>
+        20 * Math.pow(1000, i / (DEMO_BANDS - 1)),
+      ),
+    [],
+  );
+  const [levels, setLevels] = useState<number[]>(() => new Array(DEMO_BANDS).fill(0));
 
   useEffect(() => {
     if (!active) return;
@@ -208,11 +224,11 @@ function useDemoLevels(active: boolean): number[] {
       raf = requestAnimationFrame(tick);
       const t = (performance.now() - start) / 1000;
       setLevels(
-        Array.from({ length: 48 }, (_, i) => {
-          const x = i / 47;
-          const envelope = Math.exp(-x * 1.5);
+        Array.from({ length: DEMO_BANDS }, (_, i) => {
+          const x = i / (DEMO_BANDS - 1);
+          const envelope = Math.exp(-x * 1.4);
           const wobble = 0.5 + 0.5 * Math.sin(t * 2 + x * 9);
-          return Math.min(1, envelope * wobble * 1.4);
+          return Math.min(1, 0.15 + envelope * wobble * 1.5);
         }),
       );
     };
@@ -220,5 +236,5 @@ function useDemoLevels(active: boolean): number[] {
     return () => cancelAnimationFrame(raf);
   }, [active]);
 
-  return levels;
+  return useMemo(() => ({ levels, centers }), [levels, centers]);
 }

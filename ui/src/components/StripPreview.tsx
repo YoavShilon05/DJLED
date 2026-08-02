@@ -1,68 +1,66 @@
-/**
- * The strip as it will actually look on the wall.
- *
- * When the engine is connected this draws the pixels it reports, which have
- * already been through the colour surface, brightness scaling and temporal
- * dithering — ground truth rather than a re-derivation. Offline it falls back to
- * sampling the surface locally so the preview stays useful while authoring with
- * nothing running.
- */
+import { useLayoutEffect, useRef } from "react";
+import { Group, Stack, Text } from "@mantine/core";
 
-import { useEffect, useRef } from "react";
-
-import { oklabToHex } from "../color/oklab";
-import { ColorSurface } from "../color/surface";
+import type { Rgb } from "../color/display";
 
 interface Props {
-  /** Engine-reported pixels, or null when offline. */
-  pixels: Array<[number, number, number]> | null;
-  /** Used to synthesise a preview when offline. */
-  surface: ColorSurface;
-  levels: number[];
-  ledCount: number;
+  label: string;
+  hint?: string;
+  /** Already in display sRGB — see `color/display.ts`. */
+  colors: Rgb[];
+  height?: number;
 }
 
-export function StripPreview({ pixels, surface, levels, ledCount }: Props) {
-  const ref = useRef<HTMLCanvasElement>(null);
+/** One run of LEDs, drawn edge to edge with no gaps — a 10 m strip has 600. */
+export function StripPreview({ label, hint, colors, height = 26 }: Props) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  useEffect(() => {
-    const canvas = ref.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
+  useLayoutEffect(() => {
+    const canvas = canvasRef.current;
+    const ctx = canvas?.getContext("2d");
+    if (!canvas || !ctx) return;
 
-    const rect = canvas.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.max(1, Math.floor(rect.width * dpr));
-    canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+    const w = canvas.clientWidth;
+    canvas.width = Math.max(1, Math.round(w * dpr));
+    canvas.height = Math.round(height * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    const count = pixels?.length || ledCount || 1;
-    const width = rect.width / count;
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, w, height);
+    if (colors.length === 0) return;
 
-    for (let i = 0; i < count; i++) {
-      if (pixels) {
-        const [r, g, b] = pixels[i];
-        // Engine pixels are linear light, as the LED receives them. Encoding to
-        // sRGB here is what makes the screen show the same brightness the eye
-        // will read off the wall.
-        ctx.fillStyle = `rgb(${toSrgbByte(r)} ${toSrgbByte(g)} ${toSrgbByte(b)})`;
-      } else {
-        const t = count > 1 ? i / (count - 1) : 0;
-        const band = Math.min(levels.length - 1, Math.round(t * (levels.length - 1)));
-        ctx.fillStyle = oklabToHex(surface.sample(t, levels[band] ?? 0));
-      }
-      // Overlap by a pixel so sub-pixel widths leave no seams.
-      ctx.fillRect(i * width, 0, width + 1, rect.height);
+    const step = w / colors.length;
+    for (let i = 0; i < colors.length; i++) {
+      const [r, g, b] = colors[i];
+      ctx.fillStyle = `rgb(${r},${g},${b})`;
+      // Overdrawn by a pixel so sub-pixel widths leave no seam between LEDs.
+      ctx.fillRect(i * step, 0, step + 1, height);
     }
-  }, [pixels, surface, levels, ledCount]);
+  }, [colors, height]);
 
-  return <canvas ref={ref} className="strip-preview" />;
-}
-
-/** Linear light byte to its sRGB-encoded equivalent, for display on a monitor. */
-function toSrgbByte(v: number): number {
-  const linear = v / 255;
-  const encoded = linear <= 0.0031308 ? linear * 12.92 : 1.055 * Math.pow(linear, 1 / 2.4) - 0.055;
-  return Math.round(Math.min(1, Math.max(0, encoded)) * 255);
+  return (
+    <Stack gap={6}>
+      <Group justify="space-between" gap="xs">
+        <Text size="xs" c="dimmed" fw={700} tt="uppercase">
+          {label}
+        </Text>
+        {hint && (
+          <Text size="xs" c="dimmed" ff="monospace">
+            {hint}
+          </Text>
+        )}
+      </Group>
+      <canvas
+        ref={canvasRef}
+        style={{
+          display: "block",
+          width: "100%",
+          height,
+          borderRadius: "var(--mantine-radius-sm)",
+          background: "#000",
+        }}
+      />
+    </Stack>
+  );
 }

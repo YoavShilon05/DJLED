@@ -23,7 +23,7 @@
 // Configuration
 // ---------------------------------------------------------------------------
 
-#define LED_PIN     6
+        #define LED_PIN     6
 #define LED_COUNT   150      // 5 m at 30 LEDs/m
 #define MAX_BANDS   64
 
@@ -31,7 +31,7 @@
 // turns a brownout (flickering, random colours, or a board reset mid-frame)
 // into a graceful dimming instead. 150 WS2812B at full white would draw 9 A;
 // this default assumes a modest 5 V 2 A supply, so RAISE IT to match yours.
-#define MAX_MILLIAMPS 2000
+#define MAX_MILLIAMPS 300
 
 // 0% baud error with U2X at 16 MHz, unlike 115200's 2.1%.
 #define BAUD        500000

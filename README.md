@@ -15,7 +15,7 @@ WASAPI loopback ─► analysis ─► colour surface ─► serial ─► Ardui
 | Path | What it is |
 |---|---|
 | `engine/` | Rust. Capture, DSP, colour, wire protocol, UI bridge. |
-| `ui/` | React + TypeScript. The 2D keyframe colour editor. |
+| `ui/` | React + TypeScript + Mantine. The spectrum editor. |
 | `firmware/djled/` | Arduino sketch. |
 | `docs/wiring.md` | **Read before powering anything.** |
 
@@ -82,6 +82,38 @@ confirmed (`dsp/fastpath.rs`).
 
 Latency lands around 32 ms for treble. Bass steady-state is slower by physics,
 but the transient path puts its *perceived* response near 25 ms.
+
+## The editor
+
+One plot does everything. The x axis is log frequency, the y axis is dB, and the
+background is the colour surface — so a bar is not drawn in some arbitrary
+accent colour, it is drawn by *revealing* the field it reaches into. The pixel
+under the tip of a bar is the colour that band will send to the strip.
+
+Everything else hangs off those two axes:
+
+| Gizmo | Where | What it sets |
+|---|---|---|
+| Colour keyframes | on the plot | the surface. Right-click to add, drag to move, `Del` to remove |
+| LED keyframes | track under the axis | which LED indices cover which frequencies |
+| Threshold / clamp | rail to the right | the dB window: dark below, full brightness above |
+| Intensity curve | between those two handles | brightness against level inside that window |
+
+The curve box is deliberately bounded by the two handles: its top edge *is* the
+clamp line and its bottom edge *is* the threshold line, so the mapping can be
+read straight across from a band rather than mentally rescaled.
+
+**Only the colour surface and master brightness are in the wire protocol so
+far.** The rest is authored locally, persisted to `localStorage`, and previewed
+by `ui/src/spectrum/render.ts`, which is the reference the engine should be
+checked against when those fields are added. That is what the two strips at the
+bottom show: `Preview` is the full config applied locally, `Engine` is what the
+wall is actually doing. They diverge exactly where the backend has not caught
+up yet.
+
+Styling is Mantine with a theme and no per-component overrides — `src/theme.ts`
+holds every colour decision, including the palette the canvas and SVG layers
+paint with, and `src/styles.css` is two rules long.
 
 ## Colour
 
