@@ -28,8 +28,17 @@ import {
 import { DEFAULT_SAMPLE_RATE, EqCurve } from "./config/eq";
 import { GizmoPanel } from "./components/GizmoPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { SourcePanel } from "./components/SourcePanel";
 import { StripPreview } from "./components/StripPreview";
-import { DEFAULT_URL, EngineClient, decodeStrip, type Frame, type Status } from "./engine";
+import {
+  DEFAULT_URL,
+  EngineClient,
+  decodeStrip,
+  type AudioSource,
+  type AudioState,
+  type Frame,
+  type Status,
+} from "./engine";
 import { SpectrumEditor } from "./spectrum/SpectrumEditor";
 import type { SpectrumFrame } from "./spectrum/paint";
 import { applyEq, renderStrip } from "./spectrum/render";
@@ -47,19 +56,28 @@ export default function App() {
   const [brightness, setBrightness] = useState(1);
   const [ledCount, setLedCount] = useState(150);
   const [dbSpan, setDbSpan] = useState(DEFAULT_DB_SPAN);
+  const [audio, setAudio] = useState<AudioState | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const clientRef = useRef<EngineClient | null>(null);
 
   useEffect(() => {
     const client = new EngineClient(DEFAULT_URL, {
-      onStatus: setStatus,
+      onStatus: (next) => {
+        setStatus(next);
+        // Nothing is being captured while the engine is away, and leaving the
+        // last device on screen would invite selecting one into the void.
+        if (next !== "connected") setAudio(null);
+      },
       onFrame: setFrame,
       onError: setError,
       onState: (state) => {
         setBrightness(state.brightness);
         setLedCount(state.ledCount);
         setDbSpan(Math.max(1, state.dbCeil - state.dbFloor));
+        // Unlike the rest of the state, this is not an echo of something
+        // authored here: it is the engine reporting what it managed to open.
+        setAudio(state.audio);
         // The engine's config is authoritative on first connect, but only if
         // nothing has been authored here — otherwise a reconnect would throw
         // away unsaved edits.
@@ -86,6 +104,17 @@ export default function App() {
   const applyBrightness = useCallback((value: number) => {
     setBrightness(value);
     clientRef.current?.setBrightness(value);
+  }, []);
+
+  // Deliberately not optimistic: whether a device opens is the engine's to
+  // answer, and showing a selection that failed would be a lie the size of a
+  // silent strip. The panel updates when the engine says it switched.
+  const applySource = useCallback((source: AudioSource) => {
+    clientRef.current?.setSource(source);
+  }, []);
+
+  const refreshSources = useCallback(() => {
+    clientRef.current?.listSources();
   }, []);
 
   const demo = useDemoFrame(status !== "connected");
@@ -146,6 +175,7 @@ export default function App() {
 
         <Flex gap="md" align="flex-start" direction={{ base: "column", md: "row" }}>
           <Stack gap="md" w={{ base: "100%", md: 280 }} style={{ flexShrink: 0 }}>
+            <SourcePanel audio={audio} onSource={applySource} onRefresh={refreshSources} />
             <SettingsPanel
               config={config}
               onChange={applyConfig}

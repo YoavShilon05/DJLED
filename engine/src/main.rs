@@ -9,16 +9,21 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 
-use djled_engine::capture::LoopbackCapture;
+use djled_engine::capture::{self, Capture, Source};
 use djled_engine::color::{Geometry, RenderConfig, Renderer};
 use djled_engine::link::protocol::TestPattern;
 use djled_engine::link::serial::DEFAULT_BAUD;
 use djled_engine::link::{expand_bands_to_leds, Link, MockLink, SerialLink};
-use djled_engine::ui::{encode_strip, Command, State, UiServer};
+use djled_engine::ui::{encode_strip, AudioState, Command, State, UiServer};
 use djled_engine::{Engine, EngineConfig, ShowConfig};
 
 const BAR_HEIGHT: usize = 20;
 const TARGET_FPS: u64 = 60;
+
+/// Ring depth between the audio callback and the analysis thread. It only needs
+/// to cover scheduling jitter; a quarter second is generous and still bounds how
+/// far behind the display can fall.
+const CAPTURE_BUFFER_SECS: f32 = 0.25;
 
 #[derive(Parser, Debug)]
 #[command(about = "Audio-reactive LED wall engine", version)]
@@ -41,6 +46,26 @@ struct Args {
     /// List serial ports and exit.
     #[arg(long)]
     list_ports: bool,
+
+    /// List audio devices and exit.
+    #[arg(long)]
+    list_devices: bool,
+
+    /// What to listen to: a device id from --list-devices, or any unique part of
+    /// a device name. Omit for whatever the PC is playing.
+    #[arg(long, value_name = "DEVICE")]
+    source: Option<String>,
+
+    /// Capture an input rather than what the PC is playing. On its own, the
+    /// default recording device; with --source, it picks the capture half of an
+    /// interface whose two halves share a name.
+    #[arg(long)]
+    input: bool,
+
+    /// Analyse a single channel, counting from 1. Omit to mix them all — worth
+    /// setting for an instrument in one input of a stereo interface.
+    #[arg(long, value_name = "N")]
+    channel: Option<usize>,
 
     /// Capture for N seconds, report what arrived, and exit.
     #[arg(long, value_name = "SECONDS")]
@@ -86,6 +111,11 @@ impl From<Pattern> for TestPattern {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    if args.list_devices {
+        list_devices();
+        return Ok(());
+    }
+
     if args.list_ports {
         let ports = SerialLink::available();
         if ports.is_empty() {
@@ -119,7 +149,7 @@ fn main() -> Result<()> {
         }
     }
 
-    let mut capture = LoopbackCapture::new(0.25)?;
+    let mut capture = Capture::open(&select_source(&args)?, CAPTURE_BUFFER_SECS)?;
     let mut cfg = EngineConfig {
         scale: djled_engine::dsp::bands::BandScaleConfig {
             band_count: args.bands,
@@ -163,6 +193,15 @@ fn main() -> Result<()> {
             band_count: engine.band_count(),
             db_floor: cfg.post.db_floor,
             db_ceil: cfg.post.db_ceil,
+            audio: AudioState {
+                devices: capture::devices(),
+                source: capture.source().clone(),
+                device_name: capture.device_name().to_string(),
+                kind: capture.kind(),
+                channels: capture.channels(),
+                sample_rate: capture.sample_rate(),
+                error: None,
+            },
         };
         match UiServer::start(args.ui_port, state) {
             Ok(s) => {
@@ -188,6 +227,52 @@ fn main() -> Result<()> {
     )
 }
 
+/// The source the flags ask for. Named devices are looked up now rather than at
+/// open time so a typo fails with the list of what was meant, not a stream error.
+fn select_source(args: &Args) -> Result<Source> {
+    let mut source = match &args.source {
+        Some(spec) => Source::find(spec, args.input.then_some(capture::SourceKind::Input))?,
+        None if args.input => Source::default_input(),
+        None => Source::default_output(),
+    };
+    // 1-based on the command line, 0-based everywhere else: nobody calls the
+    // left input of an interface "channel 0".
+    source.channel = args.channel.map(|n| n.max(1) - 1);
+    Ok(source)
+}
+
+fn list_devices() {
+    let devices = capture::devices();
+    if devices.is_empty() {
+        println!("no audio devices found");
+        return;
+    }
+
+    println!("audio devices  (* = system default)\n");
+    let mut kind = None;
+    for device in devices {
+        if kind != Some(device.kind) {
+            println!("  {}", match device.kind {
+                capture::SourceKind::Loopback => "loopback — what the PC is playing",
+                capture::SourceKind::Input => "input — microphones, line in, interface inputs",
+            });
+            kind = Some(device.kind);
+        }
+
+        let format = match (device.channels, device.sample_rate) {
+            (Some(c), Some(r)) => format!("{c} ch @ {r:.0} Hz"),
+            // Nearly always an endpoint something else already holds, which is
+            // information rather than a reason to hide it.
+            _ => "unavailable — in use by another application?".into(),
+        };
+        println!("    {} {:<44} {format}", if device.is_default { "*" } else { " " }, device.name);
+        println!("      --source \"{}\"", device.id);
+    }
+
+    println!("\n  A DAW driving an interface over ASIO owns it outright, so its loopback goes");
+    println!("  silent. Select that interface's input to hear what is plugged into it.");
+}
+
 fn available_ports_hint(requested: &str) -> String {
     let ports = SerialLink::available();
     if ports.is_empty() {
@@ -199,7 +284,7 @@ fn available_ports_hint(requested: &str) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn run(
-    capture: &mut LoopbackCapture,
+    capture: &mut Capture,
     engine: &mut Engine,
     engine_cfg: &mut EngineConfig,
     mut show: ShowConfig,
@@ -217,26 +302,31 @@ fn run(
     let mut status = String::new();
 
     let centers: Vec<f32> = engine.centers().to_vec();
-    let sample_rate = capture.sample_rate();
 
     // The initial config is applied through the same path an edit takes, so
     // startup cannot diverge from what the editor would produce.
-    apply_show(engine, engine_cfg, renderer, &show, &show, true, sample_rate);
+    apply_show(engine, engine_cfg, renderer, &show, &show, true, capture.sample_rate());
 
     loop {
-        let n = capture.read(&mut buf);
-        if n == 0 {
-            // Loopback is genuinely idle when nothing is playing; not an error.
-            std::thread::sleep(Duration::from_millis(2));
-            continue;
+        // Before the idle check, not after: a stream that has died delivers
+        // nothing at all, so anything gated on samples arriving would never
+        // report it. Without this the only symptom is bars that quietly stop.
+        if let Some(fault) = capture.take_fault() {
+            status = format!("audio: {fault}");
+            announce_audio(server, capture, Some(fault));
         }
 
-        if !engine.push(&buf[..n]) {
-            continue;
-        }
-
-        // Applied before rendering so an edit takes effect on this frame rather
-        // than the next one.
+        // Drained before the audio, not after, and so on every pass rather than
+        // only on the ones that complete an analysis frame.
+        //
+        // The order matters more than it looks: a silent source delivers no
+        // samples at all, so commands gated behind audio arriving would never be
+        // seen — and the one command that most needs to get through is the one
+        // that moves off a source which has gone silent. A dead loopback would
+        // otherwise be unescapable from the editor.
+        //
+        // Still before rendering, so an edit takes effect on this frame rather
+        // than the next.
         if let Some(server) = server {
             for cmd in server.commands() {
                 match cmd {
@@ -251,7 +341,7 @@ fn run(
                                     &next,
                                     &show,
                                     false,
-                                    sample_rate,
+                                    capture.sample_rate(),
                                 );
                                 show = next.clone();
                                 status.clear();
@@ -270,9 +360,46 @@ fn run(
                         renderer.set_config(cfg);
                         server.update_state(|s| s.brightness = value.clamp(0.0, 1.0));
                     }
+                    Command::SetSource { source } => {
+                        match switch_source(capture, engine, engine_cfg, renderer, &show, &source) {
+                            Ok(()) => {
+                                status.clear();
+                                announce_audio(Some(server), capture, None);
+                            }
+                            // The old capture is still running — opening the new
+                            // one is what failed, and the alternative to keeping
+                            // it is silence plus a message.
+                            Err(e) => {
+                                let message = format!("{e:#}");
+                                status = format!("audio: {message}");
+                                announce_audio(Some(server), capture, Some(message));
+                            }
+                        }
+                    }
+                    Command::ListSources => {
+                        // Costs a mix-format query per endpoint, so it happens
+                        // when asked and not on a timer. The ring is a quarter
+                        // second deep; this fits inside it comfortably.
+                        let devices = capture::devices();
+                        server.announce_state(|s| s.audio.devices = devices);
+                    }
                     Command::RequestState => {}
                 }
             }
+        }
+
+        let n = capture.read(&mut buf);
+        if n == 0 {
+            // A source is genuinely idle when nothing is playing through it, and
+            // loopback in particular delivers nothing at all rather than
+            // silence. Not an error, so the loop just comes back around — with
+            // the sleep keeping it off a core while it waits.
+            std::thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+
+        if !engine.push(&buf[..n]) {
+            continue;
         }
 
         let pixels = renderer.render(engine.levels());
@@ -288,6 +415,7 @@ fn run(
             if let Some(server) = server {
                 let strip = encode_strip(&leds);
                 let levels = engine.levels().to_vec();
+                let sample_rate = capture.sample_rate();
                 server.publish(|snap| {
                     snap.levels = levels;
                     snap.strip = strip;
@@ -305,6 +433,57 @@ fn run(
             first = false;
         }
     }
+}
+
+/// Move capture to a different endpoint, live.
+///
+/// The new stream is opened *before* the old one is dropped, so a source that
+/// cannot be opened leaves the running one untouched rather than trading a
+/// working strip for an error message.
+///
+/// A rate change is the interesting case: the whole analyser is built around the
+/// sample rate, so it is rebuilt. The renderer is not, and does not need to be —
+/// band edges come from the scale config alone (see `dsp::bands`), so only the
+/// FFT tier each band draws from moves, never the centre frequencies the strip
+/// is mapped against.
+fn switch_source(
+    capture: &mut Capture,
+    engine: &mut Engine,
+    engine_cfg: &mut EngineConfig,
+    renderer: &mut Renderer,
+    show: &ShowConfig,
+    source: &Source,
+) -> Result<()> {
+    let next = Capture::open(source, CAPTURE_BUFFER_SECS)?;
+    let rate_changed = next.sample_rate() != capture.sample_rate();
+    *capture = next;
+
+    if rate_changed {
+        apply_show(engine, engine_cfg, renderer, show, show, true, capture.sample_rate());
+    } else {
+        // A new source is a new signal: carrying the old floor tracker and
+        // ballistics across would spend the first second unwinding a level that
+        // no longer exists.
+        engine.reset();
+    }
+    renderer.reset();
+    Ok(())
+}
+
+/// Tell the editor what is actually being captured.
+///
+/// The device list is deliberately left alone — it is refreshed only when asked
+/// for, and a switch does not change what exists.
+fn announce_audio(server: Option<&UiServer>, capture: &Capture, error: Option<String>) {
+    let Some(server) = server else { return };
+    server.announce_state(|s| {
+        s.audio.source = capture.source().clone();
+        s.audio.device_name = capture.device_name().to_string();
+        s.audio.kind = capture.kind();
+        s.audio.channels = capture.channels();
+        s.audio.sample_rate = capture.sample_rate();
+        s.audio.error = error;
+    });
 }
 
 /// Push a configuration into the stages it touches.
@@ -358,7 +537,7 @@ fn eq_matches(a: &[djled_engine::dsp::eq::EqBand], b: &[djled_engine::dsp::eq::E
 /// failed to open, the stream opened but nothing is playing, or audio is
 /// flowing. Loopback legitimately delivers nothing while the endpoint is idle,
 /// so silence is not by itself a fault.
-fn probe(capture: &mut LoopbackCapture, engine: &mut Engine, secs: f64) -> Result<()> {
+fn probe(capture: &mut Capture, engine: &mut Engine, secs: f64) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs_f64(secs);
     let mut buf = vec![0.0f32; 8192];
     let (mut samples, mut frames) = (0usize, 0usize);
@@ -391,9 +570,26 @@ fn probe(capture: &mut LoopbackCapture, engine: &mut Engine, secs: f64) -> Resul
     println!("  frames   {frames} analysis frames");
     println!("  peak     {peak:.4} ({:.1} dBFS)", 20.0 * peak.max(1e-9).log10());
 
+    if let Some(fault) = capture.take_fault() {
+        println!("\n  The stream failed while probing: {fault}");
+        return Ok(());
+    }
+
     if samples == 0 {
-        println!("\n  Stream opened but delivered nothing. WASAPI loopback is idle when the");
-        println!("  output endpoint is idle — play some audio and probe again.");
+        println!();
+        match capture.kind() {
+            capture::SourceKind::Loopback => {
+                println!("  Stream opened but delivered nothing. WASAPI loopback is idle when the");
+                println!("  output endpoint is idle — play some audio and probe again. If a DAW");
+                println!("  is driving this device over ASIO, nothing will ever arrive here;");
+                println!("  probe the interface's input instead.");
+            }
+            capture::SourceKind::Input => {
+                println!("  Stream opened but delivered nothing, which a capture endpoint should");
+                println!("  never do — it sends silence when idle. Check Windows microphone");
+                println!("  privacy settings, and that nothing else holds the device.");
+            }
+        }
         return Ok(());
     }
     if peak < 1e-6 {
@@ -412,14 +608,9 @@ fn probe(capture: &mut LoopbackCapture, engine: &mut Engine, secs: f64) -> Resul
     Ok(())
 }
 
-fn print_header(capture: &LoopbackCapture, engine: &Engine, link: &dyn Link, led_count: usize) {
+fn print_header(capture: &Capture, engine: &Engine, link: &dyn Link, led_count: usize) {
     println!("DJLED");
-    println!(
-        "  audio    {} ({} ch @ {:.0} Hz)",
-        capture.device_name(),
-        capture.channels(),
-        capture.sample_rate()
-    );
+    println!("  audio    {}", capture.describe());
     println!("  output   {}", link.describe());
     println!("  bands    {} across {led_count} LEDs", engine.band_count());
     println!("  tiers");

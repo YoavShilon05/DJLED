@@ -1,11 +1,11 @@
 # DJLED
 
-An audio-reactive LED wall. The PC captures whatever it is playing, analyses the
-spectrum, maps each frequency band to a colour, and streams the result to an
-Arduino driving a WS2812B strip.
+An audio-reactive LED wall. The PC captures what it is playing — or what an
+instrument is playing into it — analyses the spectrum, maps each frequency band
+to a colour, and streams the result to an Arduino driving a WS2812B strip.
 
 ```
-WASAPI loopback ─► analysis ─► colour surface ─► serial ─► Arduino ─► strip
+loopback / input ─► analysis ─► colour surface ─► serial ─► Arduino ─► strip
                        │                                      (expands bands
                        └──────► WebSocket ─► editor UI         across LEDs)
 ```
@@ -42,12 +42,54 @@ Useful flags:
 
 ```
 --list-ports          find the Arduino
+--list-devices        find an audio source
+--source UR22         listen to a named device instead of the default output
+--input               capture an input rather than what the PC is playing
+--channel 1           analyse one channel instead of mixing them
 --probe 3             capture for 3s and report what arrived
 --test rgb|chase|white   wiring diagnostics, see docs/wiring.md
 --bands 48            frequency bands, and colours sent per frame
 --brightness 0.5      master brightness
 --no-ui               don't open the editor's WebSocket port
 ```
+
+## Where the audio comes from
+
+Two ways in, picked from the **Source** dropdown in the editor or the flags
+above, and switchable while running:
+
+**Loopback** taps a playback endpoint — the mix Windows is already sending to
+the speakers. No cable, no Stereo Mix, no microphone: cpal sets
+`AUDCLNT_STREAMFLAGS_LOOPBACK` for any device whose data flow is `eRender`, so
+it is bit-exact and needs no extra hardware. This is the right source for music.
+
+**Input** taps a capture endpoint — a microphone, a line input, the inputs of an
+audio interface. This is the right source for an instrument, and it is the only
+one that works while a DAW owns the interface: **an ASIO client bypasses the
+render endpoint entirely, so there is nothing on the loopback side to hear.**
+Open FL Studio on a Steinberg and the loopback goes quiet; the interface's
+*input* keeps working, and a guitar plugged into it lights the wall.
+
+A WASAPI endpoint is one or the other, never both, so an interface appears twice
+— usually under the *same name*. That is why the dropdown groups by direction:
+the group heading is the only thing telling the two entries apart.
+
+Two smaller things that matter in practice:
+
+- **Channel, not just device.** A guitar in input 1 of a stereo interface exists
+  on one channel only; mixing it down with a silent neighbour costs 6 dB and
+  adds that neighbour's noise floor. Pick the channel and the other one is never
+  read.
+- **Commands are drained before audio is read**, on every pass of the loop
+  rather than only on passes that complete an analysis frame. A silent source
+  delivers no samples at all, and the command that most needs to get through is
+  the one moving off a source that has gone silent — gate it behind audio
+  arriving and a dead loopback becomes unescapable from the editor.
+
+Switching rebuilds the analyser only when the sample rate actually changes. Band
+edges come from the scale config alone, so a rate change moves which FFT tier
+each band draws from, never the centre frequencies the strip is mapped against —
+which is why the renderer survives untouched.
 
 ## Why the DSP looks the way it does
 
@@ -154,6 +196,7 @@ The editor's controls land in three different places, and which one matters:
 
 | Control | Stage | Why there |
 |---|---|---|
+| Source, channel | `capture.rs` | it is the signal itself; a rate change rebuilds the analyser |
 | EQ | `dsp/post.rs`, after AGC, before the range map | see below |
 | Decay | release ballistics in `dsp/post.rs` | it *is* the release time |
 | Frame hop | rebuilds the analyser | changes how often transforms run |
@@ -226,7 +269,7 @@ next during the blackout.
 ## Tests
 
 ```bash
-cargo test --manifest-path engine/Cargo.toml   # 151
+cargo test --manifest-path engine/Cargo.toml   # 159
 cd ui && npm test && npm run typecheck
 ```
 

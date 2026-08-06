@@ -31,6 +31,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::capture::{DeviceInfo, Source, SourceKind};
 use crate::show::ShowConfig;
 
 pub const DEFAULT_PORT: u16 = 9001;
@@ -69,12 +70,19 @@ pub enum Command {
     Config { config: Box<ShowConfig> },
     /// Master brightness, 0..1.
     Brightness { value: f32 },
+    /// Listen to a different endpoint.
+    SetSource { source: Source },
+    /// Rescan the endpoints, e.g. after plugging an interface in. Handled by the
+    /// engine rather than here so every client sees one list, and so the COM
+    /// enumeration stays on the thread that owns the capture.
+    ListSources,
     /// Ask for the current configuration, e.g. after a reload.
     RequestState,
 }
 
-/// Sent once on connect, and on request, so the UI can populate its editor with
-/// whatever the engine is actually using rather than guessing.
+/// Sent once on connect, on request, and whenever the engine announces a change,
+/// so the UI can populate its editor with whatever the engine is actually using
+/// rather than guessing.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct State {
@@ -86,6 +94,28 @@ pub struct State {
     /// needs them to preview a gain at the right size.
     pub db_floor: f32,
     pub db_ceil: f32,
+    pub audio: AudioState,
+}
+
+/// What is being listened to, and what else could be.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioState {
+    /// Everything selectable, as of the last scan.
+    pub devices: Vec<DeviceInfo>,
+    /// The live selection, as resolved rather than as requested.
+    pub source: Source,
+    /// The endpoint the selection currently resolves to. Not redundant with
+    /// `source`: "the default output" is a selection that names no device, and
+    /// the user still wants to see which one they got.
+    pub device_name: String,
+    pub kind: SourceKind,
+    /// Channels the endpoint delivers, which is what bounds `source.channel`.
+    pub channels: usize,
+    pub sample_rate: f64,
+    /// Why the last switch failed, or how the running stream died. Cleared by
+    /// the next success.
+    pub error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -98,9 +128,16 @@ enum Outbound<'a> {
 
 pub struct UiServer {
     snapshot: Arc<Mutex<Snapshot>>,
-    state: Arc<Mutex<State>>,
+    state: Arc<Mutex<Announced>>,
     commands: Receiver<Command>,
     port: u16,
+}
+
+/// State with a counter, so a client can tell what it holds is stale without the
+/// server tracking who has seen what.
+struct Announced {
+    state: State,
+    version: u64,
 }
 
 impl UiServer {
@@ -111,7 +148,7 @@ impl UiServer {
             .with_context(|| format!("could not bind 127.0.0.1:{port} for the UI server"))?;
 
         let snapshot = Arc::new(Mutex::new(Snapshot::default()));
-        let state = Arc::new(Mutex::new(initial));
+        let state = Arc::new(Mutex::new(Announced { state: initial, version: 0 }));
         let (tx, commands) = mpsc::channel();
 
         {
@@ -138,10 +175,27 @@ impl UiServer {
         }
     }
 
-    /// Keep the advertised state in step with what the engine is really using.
+    /// Keep the advertised state in step with what the engine is really using,
+    /// without telling anyone.
+    ///
+    /// For changes the UI itself originated: a config edit sends one of these
+    /// per pointer move, and echoing them back at drag rate would have the
+    /// editor fighting the user's own hands. New clients still get the current
+    /// values, which is the whole point of holding them.
     pub fn update_state(&self, update: impl FnOnce(&mut State)) {
         if let Ok(mut guard) = self.state.lock() {
-            update(&mut guard);
+            update(&mut guard.state);
+        }
+    }
+
+    /// Change the state *and* push it to everyone connected.
+    ///
+    /// For changes the UI cannot predict — which endpoint is really being
+    /// captured, at what rate, and whether opening it failed.
+    pub fn announce_state(&self, update: impl FnOnce(&mut State)) {
+        if let Ok(mut guard) = self.state.lock() {
+            update(&mut guard.state);
+            guard.version = guard.version.wrapping_add(1);
         }
     }
 
@@ -167,7 +221,7 @@ pub fn encode_strip(leds: &[[u8; 3]]) -> String {
 fn accept_loop(
     listener: TcpListener,
     snapshot: Arc<Mutex<Snapshot>>,
-    state: Arc<Mutex<State>>,
+    state: Arc<Mutex<Announced>>,
     tx: Sender<Command>,
 ) {
     for stream in listener.incoming() {
@@ -193,7 +247,7 @@ fn accept_loop(
 fn serve_client(
     stream: TcpStream,
     snapshot: Arc<Mutex<Snapshot>>,
-    state: Arc<Mutex<State>>,
+    state: Arc<Mutex<Announced>>,
     tx: Sender<Command>,
 ) -> Result<()> {
     stream.set_nodelay(true).ok();
@@ -205,7 +259,7 @@ fn serve_client(
         .set_read_timeout(Some(Duration::from_millis(1)))
         .ok();
 
-    send_state(&mut socket, &state)?;
+    let mut sent = send_state(&mut socket, &state)?;
 
     loop {
         // Drain anything the client has sent.
@@ -213,7 +267,7 @@ fn serve_client(
             match socket.read() {
                 Ok(tungstenite::Message::Text(text)) => {
                     match serde_json::from_str::<Command>(&text) {
-                        Ok(Command::RequestState) => send_state(&mut socket, &state)?,
+                        Ok(Command::RequestState) => sent = send_state(&mut socket, &state)?,
                         Ok(cmd) => {
                             if tx.send(cmd).is_err() {
                                 return Ok(()); // engine is gone
@@ -238,6 +292,17 @@ fn serve_client(
             }
         }
 
+        // Cheap enough to check every frame: one lock and an integer compare,
+        // against a counter the engine only moves when the UI could not have
+        // known what changed.
+        let stale = {
+            let guard = state.lock().map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            guard.version != sent
+        };
+        if stale {
+            sent = send_state(&mut socket, &state)?;
+        }
+
         let payload = {
             let guard = snapshot.lock().map_err(|_| anyhow::anyhow!("snapshot lock poisoned"))?;
             serde_json::to_string(&Outbound::Frame(&guard))?
@@ -248,16 +313,17 @@ fn serve_client(
     }
 }
 
+/// Send the current state, returning the version that went out.
 fn send_state(
     socket: &mut tungstenite::WebSocket<TcpStream>,
-    state: &Arc<Mutex<State>>,
-) -> Result<()> {
-    let payload = {
+    state: &Arc<Mutex<Announced>>,
+) -> Result<u64> {
+    let (payload, version) = {
         let guard = state.lock().map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
-        serde_json::to_string(&Outbound::State(&guard))?
+        (serde_json::to_string(&Outbound::State(&guard.state))?, guard.version)
     };
     socket.send(tungstenite::Message::Text(payload.into()))?;
-    Ok(())
+    Ok(version)
 }
 
 #[cfg(test)]
@@ -314,6 +380,32 @@ mod tests {
             }
             other => panic!("parsed as {other:?}"),
         }
+    }
+
+    /// The dropdown's two messages. The device id is opaque and full of
+    /// punctuation, so this is really checking it survives the trip intact.
+    #[test]
+    fn source_commands_parse_from_the_ui_wire_format() {
+        let json = r#"{"type":"setSource","source":{"id":"wasapi:{0.0.1.00000000}.{9d}","channel":0}}"#;
+        match serde_json::from_str::<Command>(json).unwrap() {
+            Command::SetSource { source } => {
+                assert_eq!(source.id.as_deref(), Some("wasapi:{0.0.1.00000000}.{9d}"));
+                assert_eq!(source.channel, Some(0));
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+
+        // No id: follow the system default for that direction.
+        let json = r#"{"type":"setSource","source":{"kind":"input"}}"#;
+        match serde_json::from_str::<Command>(json).unwrap() {
+            Command::SetSource { source } => {
+                assert_eq!(source, Source::default_input());
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+
+        let cmd: Command = serde_json::from_str(r#"{"type":"listSources"}"#).unwrap();
+        assert!(matches!(cmd, Command::ListSources));
     }
 
     /// A malformed command must be reported, not crash the client thread.
