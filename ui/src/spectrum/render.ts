@@ -1,22 +1,27 @@
 /**
- * What the strip would look like under the current config.
+ * What one spectrum layer paints, per LED.
  *
- * The engine cannot answer this yet — thresholds, LED sectors and the intensity
- * curve are not in the wire protocol — so the editor works it out locally. That
- * is the only way the new controls do anything visible without touching the
- * backend, and when the engine grows these fields this module becomes the
- * reference the two sides are checked against.
+ * The engine cannot answer this — thresholds, LED sectors, the intensity curve
+ * and the whole layer stack are not in the wire protocol — so the editor works
+ * it out locally. That is the only way the controls do anything visible without
+ * touching the backend, and when the engine grows these fields this module
+ * becomes the reference the two sides are checked against.
+ *
+ * Colour and brightness are returned *separately*, as a `Pixel`. The old
+ * single-layer version multiplied the gain straight into the colour, which is
+ * correct when there is nothing underneath; with a stack it would throw away
+ * the coverage the compositor needs to know a dark band is absent rather than
+ * black. See `color/blend.ts`.
  */
 
-import { oklabToDisplay, type Rgb } from "../color/display";
+import { BLACK_PIXEL, type Pixel } from "../color/blend";
+import { oklabToLinearRgb } from "../color/oklab";
 import { ColorSurface } from "../color/surface";
 import { evalCurve } from "../config/curve";
-import { toSurface, type EditorConfig, type LedKeyframe } from "../config/editor";
+import { toSurface, type LedKeyframe, type SpectrumState } from "../config/layers";
 import type { EqCurve } from "../config/eq";
 import { DB_MAX, DB_MIN, clamp, hzToNorm, normToHz } from "../config/scales";
 import { levelToDb, type SpectrumFrame } from "./paint";
-
-const BLACK: Rgb = [0, 0, 0];
 
 const DB_SPAN = DB_MAX - DB_MIN;
 
@@ -51,8 +56,11 @@ export function applyEq(frame: SpectrumFrame, curve: EqCurve, dbSpan: number): S
  * Which logical LED an output position shows.
  *
  * Both transforms are spatial, not spectral — they rearrange where colours land
- * on the wall and change nothing about the analysis — so they are applied here
- * at the very end and are deliberately invisible to the graph.
+ * on the wall and change nothing about the analysis — so they are applied at
+ * the very end, to the *composited* strip, and are deliberately invisible to
+ * every graph. That is also why they live on the master rather than on a layer:
+ * they describe how the strip is mounted, and two layers disagreeing about
+ * which end is which is not an effect anyone wants.
  *
  * Mirror folds the whole range into each half, so both ends of the strip show
  * the low end and the centre shows the high end. Reverse then flips what that
@@ -76,7 +84,9 @@ export function sourceIndex(i: number, n: number, mirror: boolean, reverse: bool
  * 2 kHz" spread evenly across the first 50 LEDs rather than piling seven
  * octaves into the last few.
  *
- * `null` for an LED outside every sector: it is not addressed, so it is dark.
+ * `null` for an LED outside every sector: the layer does not address it, so it
+ * is transparent there — which is what lets one spectrum layer cover part of a
+ * strip and another cover the rest.
  */
 export function ledFrequency(keyframes: LedKeyframe[], led: number): number | null {
   const sorted = [...keyframes].sort((a, b) => a.led - b.led);
@@ -113,35 +123,45 @@ export function levelAt(frame: SpectrumFrame, hz: number): number {
 }
 
 /** Brightness for a level, after the threshold, the clamp and the curve. */
-export function brightnessFor(config: EditorConfig, level: number): number {
+export function brightnessFor(state: SpectrumState, level: number): number {
   const db = levelToDb(level);
-  if (db <= config.threshold) return 0;
-  const window = config.clamp - config.threshold;
+  if (db <= state.threshold) return 0;
+  const window = state.clamp - state.threshold;
   if (window <= 0) return 1;
-  return evalCurve(config.curve, clamp((db - config.threshold) / window, 0, 1));
+  return evalCurve(state.curve, clamp((db - state.threshold) / window, 0, 1));
 }
 
-export function renderStrip(
-  config: EditorConfig,
+/**
+ * One spectrum layer's contribution to every LED.
+ *
+ * Note what alpha is: the brightness the threshold/clamp/curve chain produced.
+ * That is the whole reason a reactive layer stacks sensibly — where a band is
+ * below threshold the layer is *absent*, not black, so whatever is beneath it
+ * survives.
+ */
+export function spectrumPixels(
+  state: SpectrumState,
   frame: SpectrumFrame,
   ledCount: number,
-  masterBrightness = 1,
-): Rgb[] {
-  const surface = new ColorSurface(toSurface(config));
-  const out: Rgb[] = new Array(ledCount);
+): Pixel[] {
+  const surface = new ColorSurface(toSurface(state));
+  const out: Pixel[] = new Array(ledCount);
 
   for (let i = 0; i < ledCount; i++) {
-    const led = sourceIndex(i, ledCount, config.mirror, config.reverse);
-    const hz = ledFrequency(config.ledKeyframes, led);
+    const hz = ledFrequency(state.ledKeyframes, i);
     if (hz === null) {
-      out[i] = BLACK;
+      out[i] = BLACK_PIXEL;
       continue;
     }
     const level = levelAt(frame, hz);
-    const gain = brightnessFor(config, level) * masterBrightness;
+    const alpha = brightnessFor(state, level);
+    if (alpha <= 0) {
+      out[i] = BLACK_PIXEL;
+      continue;
+    }
     // The surface's y is the same normalised level the plot's dB axis shows,
     // so a band is coloured by exactly the field pixel its bar reaches.
-    out[i] = gain <= 0 ? BLACK : oklabToDisplay(surface.sample(hzToNorm(hz), level), gain);
+    out[i] = { rgb: oklabToLinearRgb(surface.sample(hzToNorm(hz), level)), alpha };
   }
   return out;
 }

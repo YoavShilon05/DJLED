@@ -53,6 +53,43 @@ export function normToDb(n: number): number {
   return DB_MIN + clamp(n, 0, 1) * (DB_MAX - DB_MIN);
 }
 
+/* ------------------------------------------------------------- note numbers */
+
+/**
+ * The MIDI ruler, over the same axis.
+ *
+ * Not a second scale — semitones *are* logarithmic in frequency, so a note
+ * number is the existing log-Hz axis relabelled. A440 is note 69 by definition,
+ * and everything below follows from twelve semitones to an octave. Note 21 (A0)
+ * lands at 27.5 Hz and note 127 at 12.5 kHz, both comfortably inside the plot's
+ * 20 Hz–20 kHz range, which is why a spectrum layer can switch source without
+ * moving a single colour keyframe.
+ */
+export function noteToHz(note: number): number {
+  return 440 * Math.pow(2, (note - 69) / 12);
+}
+
+export function hzToNote(hz: number): number {
+  return 69 + 12 * Math.log2(Math.max(hz, 1e-6) / 440);
+}
+
+const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+
+/** "C4", "A#2" — scientific pitch notation, where middle C is C4. */
+export function formatNote(note: number): string {
+  const n = Math.round(note);
+  return `${NOTE_NAMES[((n % 12) + 12) % 12]}${Math.floor(n / 12) - 1}`;
+}
+
+/** Labelled octaves. Every C that falls inside the plot's frequency range. */
+export const NOTE_TICKS = [24, 36, 48, 60, 72, 84, 96, 108, 120].filter((n) => {
+  const hz = noteToHz(n);
+  return hz >= F_MIN && hz <= F_MAX;
+});
+
+/** Unlabelled subdivisions: the F a fifth up from each labelled C. */
+export const NOTE_SUBTICKS = NOTE_TICKS.map((n) => n + 5).filter((n) => noteToHz(n) <= F_MAX);
+
 /** "250 Hz", "1.5k", "20k" — short enough to sit under a tick. */
 export function formatHz(hz: number): string {
   if (hz >= 1000) {

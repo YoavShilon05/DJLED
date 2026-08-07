@@ -16,20 +16,37 @@ import { useDebouncedCallback } from "@mantine/hooks";
 
 import { ledBytesToDisplay, type Rgb } from "./color/display";
 import {
-  DEFAULT_CONFIG,
-  clearConfig,
+  LAYER_KIND_LABEL,
+  findLayer,
+  makeLayer,
+  moveLayer,
+  replaceLayer,
+  type GizmoFlags,
+  type Layer,
+  type LayerKind,
+  type SpectrumState,
+  type StaticState,
+} from "./config/layers";
+import {
+  clearDoc,
+  defaultDoc,
+  drivingLayer,
   fromEngineConfig,
-  hasStoredConfig,
-  loadConfig,
-  saveConfig,
+  hasStoredDoc,
+  loadDoc,
+  saveDoc,
   toEngineConfig,
-  type EditorConfig,
-} from "./config/editor";
+  type MasterConfig,
+  type ShowDoc,
+} from "./config/show";
 import { DEFAULT_SAMPLE_RATE, EqCurve } from "./config/eq";
-import { GizmoPanel } from "./components/GizmoPanel";
-import { SettingsPanel } from "./components/SettingsPanel";
+import { addKeyAt, removeKey, moveKey, stateAt, writeStateAt } from "./config/timeline";
+import { Inspector } from "./components/Inspector";
+import { LayerList } from "./components/LayerList";
+import { MasterPanel } from "./components/MasterPanel";
 import { SourcePanel } from "./components/SourcePanel";
 import { StripPreview } from "./components/StripPreview";
+import { Timeline } from "./components/Timeline";
 import {
   DEFAULT_URL,
   EngineClient,
@@ -39,18 +56,21 @@ import {
   type Frame,
   type Status,
 } from "./engine";
+import { GradientEditor } from "./gradient/GradientEditor";
+import { compositeShow, previewLayer, type RenderInput } from "./render/composite";
 import { SpectrumEditor } from "./spectrum/SpectrumEditor";
 import type { SpectrumFrame } from "./spectrum/paint";
-import { applyEq, renderStrip } from "./spectrum/render";
+import { applyEq } from "./spectrum/render";
+import { useTransport } from "./useTransport";
 
 /** Sampled once at load: a later save must not change what a reconnect does. */
-const HAD_LOCAL_CONFIG = hasStoredConfig();
+const HAD_LOCAL_DOC = hasStoredDoc();
 
 /** The engine's default dB window, until it reports its own. */
 const DEFAULT_DB_SPAN = 60;
 
 export default function App() {
-  const [config, setConfig] = useState<EditorConfig>(loadConfig);
+  const [doc, setDoc] = useState<ShowDoc>(() => loadDoc());
   const [status, setStatus] = useState<Status>("connecting");
   const [frame, setFrame] = useState<Frame | null>(null);
   const [brightness, setBrightness] = useState(1);
@@ -59,6 +79,7 @@ export default function App() {
   const [audio, setAudio] = useState<AudioState | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  const { time, playing, setPlaying, seek } = useTransport(doc.duration);
   const clientRef = useRef<EngineClient | null>(null);
 
   useEffect(() => {
@@ -81,7 +102,7 @@ export default function App() {
         // The engine's config is authoritative on first connect, but only if
         // nothing has been authored here — otherwise a reconnect would throw
         // away unsaved edits.
-        if (!HAD_LOCAL_CONFIG) setConfig((c) => fromEngineConfig(c, state.config));
+        if (!HAD_LOCAL_DOC) setDoc((d) => fromEngineConfig(d, state.config));
       },
     });
     clientRef.current = client;
@@ -89,16 +110,25 @@ export default function App() {
     return () => client.close();
   }, []);
 
-  const persist = useDebouncedCallback(saveConfig, 400);
+  const persist = useDebouncedCallback(saveDoc, 400);
 
-  const applyConfig = useCallback(
-    (next: EditorConfig) => {
-      setConfig(next);
+  /**
+   * Every edit goes through here.
+   *
+   * The engine still runs one analyser and one `ShowConfig`, so only the
+   * driving layer can cross the wire — see `toEngineConfig`. The local preview
+   * shows the true composite regardless, which is why the two strips at the
+   * bottom can legitimately disagree until the backend grows a stack.
+   */
+  const applyDoc = useCallback(
+    (next: ShowDoc) => {
+      setDoc(next);
       setError(null);
       persist(next);
-      clientRef.current?.setConfig(toEngineConfig(next));
+      const config = toEngineConfig(next, time);
+      if (config) clientRef.current?.setConfig(config);
     },
-    [persist],
+    [persist, time],
   );
 
   const applyBrightness = useCallback((value: number) => {
@@ -117,6 +147,8 @@ export default function App() {
     clientRef.current?.listSources();
   }, []);
 
+  /* ------------------------------------------------------------ live input */
+
   const demo = useDemoFrame(status !== "connected");
   const live: SpectrumFrame | null =
     status === "connected" && frame ? { levels: frame.levels, centers: frame.centers } : null;
@@ -124,18 +156,41 @@ export default function App() {
 
   const sampleRate = frame?.sampleRate || DEFAULT_SAMPLE_RATE;
 
+  const focused = findLayer(doc.layers, doc.focusedId);
+  const focusedState = focused ? stateAt(focused, time) : null;
+
   // Live levels arrive with the EQ already in them — the engine applies it
   // between the AGC and the range map. Applying it again here would double it,
   // so the local pass exists only to keep the curve meaningful while offline.
-  const eqCurve = useMemo(() => new EqCurve(config.eq, sampleRate), [config.eq, sampleRate]);
+  const focusedEq =
+    focused?.kind === "spectrum" ? (focusedState as SpectrumState).eq : undefined;
+  const eqCurve = useMemo(
+    () => new EqCurve(focusedEq ?? [], sampleRate),
+    [focusedEq, sampleRate],
+  );
   const spectrum = useMemo(
     () => (live ? captured : applyEq(captured, eqCurve, dbSpan)),
     [live, captured, eqCurve, dbSpan],
   );
 
+  // MIDI has no engine support yet, so a MIDI layer previews against silence
+  // rather than against the audio — showing it react to the microphone would be
+  // a straightforward lie about what the strip will do.
+  const midiFrame = useMemo<SpectrumFrame>(() => ({ levels: [], centers: [] }), []);
+
+  const input = useMemo<RenderInput>(
+    () => ({ audio: spectrum, midi: midiFrame, ledCount, time }),
+    [spectrum, midiFrame, ledCount, time],
+  );
+
   const previewStrip = useMemo(
-    () => renderStrip(config, spectrum, ledCount, brightness),
-    [config, spectrum, ledCount, brightness],
+    () => compositeShow(doc, input, brightness),
+    [doc, input, brightness],
+  );
+
+  const layerStrip = useMemo(
+    () => (focused ? previewLayer(focused, input, brightness) : []),
+    [focused, input, brightness],
   );
 
   const engineStrip = useMemo<Rgb[] | null>(
@@ -146,8 +201,75 @@ export default function App() {
     [live, frame],
   );
 
+  /* --------------------------------------------------------------- editing */
+
+  const patchLayer = useCallback(
+    (id: string, patch: Partial<Layer>) => {
+      const layer = findLayer(doc.layers, id);
+      if (!layer) return;
+      applyDoc({
+        ...doc,
+        layers: replaceLayer(doc.layers, id, { ...layer, ...patch } as Layer),
+      });
+    },
+    [applyDoc, doc],
+  );
+
+  /**
+   * An edit to the focused layer's state, at the playhead.
+   *
+   * With no keys this simply replaces the layer's state. With keys it auto-keys
+   * — the key under the playhead is rewritten, or one is created there — which
+   * is the whole of the snapshot model's authoring story.
+   */
+  const editState = useCallback(
+    (state: SpectrumState | StaticState) => {
+      if (!focused) return;
+      applyDoc({
+        ...doc,
+        layers: replaceLayer(doc.layers, focused.id, writeStateAt(focused, time, state)),
+      });
+    },
+    [applyDoc, doc, focused, time],
+  );
+
+  const addLayer = useCallback(
+    (kind: LayerKind) => {
+      const layer = makeLayer(kind, ledCount);
+      applyDoc({ ...doc, layers: [...doc.layers, layer], focusedId: layer.id });
+    },
+    [applyDoc, doc, ledCount],
+  );
+
+  const removeLayer = useCallback(
+    (id: string) => {
+      if (doc.layers.length <= 1) return;
+      const layers = doc.layers.filter((l) => l.id !== id);
+      applyDoc({
+        ...doc,
+        layers,
+        focusedId: doc.focusedId === id ? layers[layers.length - 1].id : doc.focusedId,
+        soloId: doc.soloId === id ? null : doc.soloId,
+      });
+    },
+    [applyDoc, doc],
+  );
+
+  const setGizmos = useCallback(
+    (gizmos: GizmoFlags) => applyDoc({ ...doc, view: { ...doc.view, gizmos } }),
+    [applyDoc, doc],
+  );
+
+  const setMaster = useCallback(
+    (master: MasterConfig) => applyDoc({ ...doc, master }),
+    [applyDoc, doc],
+  );
+
+  const driving = drivingLayer(doc);
+  const focusedIndex = doc.layers.findIndex((l) => l.id === doc.focusedId);
+
   return (
-    <Container size={1600} py="md">
+    <Container size={1720} py="md">
       <Stack gap="md">
         <Group justify="space-between" align="center">
           <Group gap="sm" align="baseline">
@@ -159,8 +281,8 @@ export default function App() {
           <Button
             variant="default"
             onClick={() => {
-              clearConfig();
-              applyConfig(DEFAULT_CONFIG);
+              clearDoc();
+              applyDoc(defaultDoc(ledCount));
             }}
           >
             Reset
@@ -173,42 +295,143 @@ export default function App() {
           </Alert>
         )}
 
-        <Flex gap="md" align="flex-start" direction={{ base: "column", md: "row" }}>
-          <Stack gap="md" w={{ base: "100%", md: 280 }} style={{ flexShrink: 0 }}>
+        <Flex gap="md" align="flex-start" direction={{ base: "column", lg: "row" }}>
+          <Stack gap="md" w={{ base: "100%", lg: 250 }} style={{ flexShrink: 0 }}>
+            <LayerList
+              layers={doc.layers}
+              focusedId={doc.focusedId}
+              soloId={doc.soloId}
+              onFocus={(id) => applyDoc({ ...doc, focusedId: id })}
+              onToggle={(id) =>
+                patchLayer(id, { enabled: !findLayer(doc.layers, id)?.enabled })
+              }
+              onSolo={(soloId) => applyDoc({ ...doc, soloId })}
+              onMove={(id, delta) => applyDoc({ ...doc, layers: moveLayer(doc.layers, id, delta) })}
+              onAdd={addLayer}
+              onRemove={removeLayer}
+            />
             <SourcePanel audio={audio} onSource={applySource} onRefresh={refreshSources} />
-            <SettingsPanel
-              config={config}
-              onChange={applyConfig}
+            <MasterPanel
+              master={doc.master}
+              onChange={setMaster}
               brightness={brightness}
               onBrightness={applyBrightness}
               sampleRate={frame?.sampleRate ?? 0}
             />
-            <GizmoPanel config={config} onChange={applyConfig} />
           </Stack>
 
-          <Paper flex={1} miw={0}>
-            <Stack gap="sm">
-              <SpectrumEditor
-                config={config}
-                onChange={applyConfig}
-                frame={spectrum}
-                ledCount={ledCount}
-                sampleRate={sampleRate}
-              />
-              <Text size="xs" c="dimmed">
-                Right-click the graph for a colour keyframe · double-click for an EQ band ·
-                right-click the LED track for a sector · click to select,{" "}
-                <Kbd size="xs">Del</Kbd> to remove
-              </Text>
-            </Stack>
-          </Paper>
+          <Stack gap="md" flex={1} miw={0} w={{ base: "100%", lg: "auto" }}>
+            <Paper>
+              <Stack gap="sm">
+                <Group justify="space-between" gap="xs">
+                  <Text size="xs" c="dimmed" fw={700} tt="uppercase" lts="0.08em">
+                    {focused ? focused.name : "No layer"}
+                  </Text>
+                  {focused && (
+                    <Text size="xs" c="dimmed" ff="monospace">
+                      {LAYER_KIND_LABEL[focused.kind]}
+                      {focused.kind === "spectrum" &&
+                        ` · ${(focusedState as SpectrumState).source}`}
+                    </Text>
+                  )}
+                </Group>
+
+                {focused?.kind === "spectrum" && (
+                  <>
+                    <SpectrumEditor
+                      state={focusedState as SpectrumState}
+                      onChange={editState}
+                      gizmos={doc.view.gizmos}
+                      frame={
+                        (focusedState as SpectrumState).source === "midi" ? midiFrame : spectrum
+                      }
+                      ledCount={ledCount}
+                      sampleRate={sampleRate}
+                    />
+                    <Text size="xs" c="dimmed">
+                      Right-click the graph for a colour keyframe · double-click for an EQ
+                      band · right-click the LED track for a sector · click to select,{" "}
+                      <Kbd size="xs">Del</Kbd> to remove
+                    </Text>
+                  </>
+                )}
+
+                {focused?.kind === "static" && (
+                  <>
+                    <GradientEditor
+                      state={focusedState as StaticState}
+                      onChange={editState}
+                      ledCount={ledCount}
+                    />
+                    <Text size="xs" c="dimmed">
+                      Right-click the ramp for a colour stop · drag to move · click to
+                      select, <Kbd size="xs">Del</Kbd> to remove
+                    </Text>
+                  </>
+                )}
+
+                {focused && (
+                  <StripPreview
+                    label="This layer"
+                    hint={`${focused.blendMode} · ${Math.round(focused.opacity * 100)}%`}
+                    colors={layerStrip}
+                    height={18}
+                  />
+                )}
+              </Stack>
+            </Paper>
+
+            <Timeline
+              layers={doc.layers}
+              focusedId={doc.focusedId}
+              time={time}
+              playing={playing}
+              duration={doc.duration}
+              allLanes={doc.view.allLanes}
+              onTime={seek}
+              onPlaying={setPlaying}
+              onDuration={(duration) => applyDoc({ ...doc, duration })}
+              onAllLanes={(allLanes) => applyDoc({ ...doc, view: { ...doc.view, allLanes } })}
+              onAddKey={(id) => {
+                const layer = findLayer(doc.layers, id);
+                if (layer) patchLayer(id, addKeyAt(layer, time));
+              }}
+              onRemoveKey={(id, keyId) => {
+                const layer = findLayer(doc.layers, id);
+                if (layer) patchLayer(id, removeKey(layer, keyId));
+              }}
+              onMoveKey={(id, keyId, t) => {
+                const layer = findLayer(doc.layers, id);
+                if (layer) patchLayer(id, moveKey(layer, keyId, t));
+              }}
+              onFocus={(id) => applyDoc({ ...doc, focusedId: id })}
+            />
+          </Stack>
+
+          <Stack gap="md" w={{ base: "100%", lg: 275 }} style={{ flexShrink: 0 }}>
+            <Inspector
+              layer={focused}
+              state={focusedState}
+              isBottom={focusedIndex === 0}
+              ledCount={ledCount}
+              gizmos={doc.view.gizmos}
+              onLayer={(patch) => focused && patchLayer(focused.id, patch)}
+              onState={editState}
+              onGizmos={setGizmos}
+            />
+          </Stack>
         </Flex>
 
         <Paper>
           <Stack gap="md">
             <StripPreview
               label="Preview"
-              hint={[`${ledCount} LEDs`, config.mirror && "mirrored", config.reverse && "reversed"]
+              hint={[
+                `${ledCount} LEDs`,
+                `${doc.soloId ? 1 : doc.layers.filter((l) => l.enabled).length} layers`,
+                doc.master.mirror && "mirrored",
+                doc.master.reverse && "reversed",
+              ]
                 .filter(Boolean)
                 .join(" · ")}
               colors={previewStrip}
@@ -217,12 +440,18 @@ export default function App() {
             {engineStrip && (
               <StripPreview
                 label="Engine"
-                hint={
-                  frame && frame.droppedFrames > 0 ? `${frame.droppedFrames} dropped` : "live"
-                }
+                hint={frame && frame.droppedFrames > 0 ? `${frame.droppedFrames} dropped` : "live"}
                 colors={engineStrip}
                 height={18}
               />
+            )}
+            {engineStrip && doc.layers.filter((l) => l.enabled).length > 1 && (
+              <Text size="xs" c="dimmed" lh={1.4}>
+                The engine still runs a single analyser and a single surface, so the wall
+                is showing only <b>{driving?.name ?? "one layer"}</b>. Compositing is
+                local until the backend grows a stack — which is why these two strips
+                disagree.
+              </Text>
             )}
           </Stack>
         </Paper>
@@ -257,10 +486,7 @@ const DEMO_BANDS = 48;
  */
 function useDemoFrame(active: boolean): SpectrumFrame {
   const centers = useMemo(
-    () =>
-      Array.from({ length: DEMO_BANDS }, (_, i) =>
-        20 * Math.pow(1000, i / (DEMO_BANDS - 1)),
-      ),
+    () => Array.from({ length: DEMO_BANDS }, (_, i) => 20 * Math.pow(1000, i / (DEMO_BANDS - 1))),
     [],
   );
   const [levels, setLevels] = useState<number[]>(() => new Array(DEMO_BANDS).fill(0));

@@ -1,18 +1,26 @@
 import { Checkbox, Divider, Paper, Select, Slider, Stack, Text } from "@mantine/core";
 
-import { CURVE_OPTIONS, type CurveType } from "../config/curve";
-import { SAMPLE_LENGTHS, type EditorConfig } from "../config/editor";
+import { SAMPLE_LENGTHS, type MasterConfig } from "../config/show";
 import { Field } from "./Field";
 
 interface Props {
-  config: EditorConfig;
-  onChange: (config: EditorConfig) => void;
+  master: MasterConfig;
+  onChange: (master: MasterConfig) => void;
   brightness: number;
   onBrightness: (value: number) => void;
   sampleRate: number;
 }
 
-export function SettingsPanel({ config, onChange, brightness, onBrightness, sampleRate }: Props) {
+/**
+ * The wall, and the one analyser feeding it.
+ *
+ * Everything here is deliberately *not* per-layer. Reverse and mirror describe
+ * how the strip is physically mounted — two layers disagreeing about which end
+ * is which is not an effect anyone wants — and there is one analyser, so decay
+ * and frame hop would need one per layer to be per-layer. Master brightness is
+ * a dimmer on the finished composite.
+ */
+export function MasterPanel({ master, onChange, brightness, onBrightness, sampleRate }: Props) {
   const rate = sampleRate || 48_000;
 
   return (
@@ -24,51 +32,29 @@ export function SettingsPanel({ config, onChange, brightness, onBrightness, samp
 
         <Field
           label="Decay"
-          value={config.decay.toFixed(2)}
+          value={master.decay.toFixed(2)}
           hint="How much of the previous frame a band keeps. Higher falls away more slowly."
         >
           <Slider
             min={0}
             max={0.99}
             step={0.01}
-            value={config.decay}
-            onChange={(decay) => onChange({ ...config, decay })}
+            value={master.decay}
+            onChange={(decay) => onChange({ ...master, decay })}
             label={(v) => v.toFixed(2)}
           />
         </Field>
 
         <Field
           label="Frame hop"
-          value={`${((config.sampleLength / rate) * 1000).toFixed(1)} ms`}
+          value={`${((master.sampleLength / rate) * 1000).toFixed(1)} ms`}
           hint="New samples between analysis frames. Shorter reacts faster and costs more CPU. The FFT window is picked per band, so there is no single length to set."
         >
           <Select
             data={SAMPLE_LENGTHS.map((n) => ({ value: String(n), label: `${n} samples` }))}
-            value={String(config.sampleLength)}
+            value={String(master.sampleLength)}
             onChange={(value) =>
-              onChange({ ...config, sampleLength: Number(value) || config.sampleLength })
-            }
-            allowDeselect={false}
-            comboboxProps={{ withinPortal: true }}
-          />
-        </Field>
-
-        <Field
-          label="Intensity curve"
-          hint={
-            config.curve.type === "bezier"
-              ? "Drag the two handles in the curve box on the right."
-              : "Fixed shape — switch to Bézier for handles."
-          }
-        >
-          <Select
-            data={CURVE_OPTIONS}
-            value={config.curve.type}
-            onChange={(value) =>
-              onChange({
-                ...config,
-                curve: { ...config.curve, type: (value as CurveType) ?? config.curve.type },
-              })
+              onChange({ ...master, sampleLength: Number(value) || master.sampleLength })
             }
             allowDeselect={false}
             comboboxProps={{ withinPortal: true }}
@@ -78,23 +64,8 @@ export function SettingsPanel({ config, onChange, brightness, onBrightness, samp
         <Divider />
 
         <Text size="xs" c="dimmed" fw={700} tt="uppercase" lts="0.08em">
-          Output
+          Wall
         </Text>
-
-        <Field
-          label="Blend radius"
-          value={config.blend.toFixed(2)}
-          hint="Reach of each colour keyframe. Smaller is crisper, larger blurs neighbours together."
-        >
-          <Slider
-            min={0.05}
-            max={0.6}
-            step={0.01}
-            value={config.blend}
-            onChange={(blend) => onChange({ ...config, blend })}
-            label={(v) => v.toFixed(2)}
-          />
-        </Field>
 
         <Field label="Master brightness" value={`${Math.round(brightness * 100)}%`}>
           <Slider
@@ -110,16 +81,17 @@ export function SettingsPanel({ config, onChange, brightness, onBrightness, samp
         <Stack gap="xs">
           <Checkbox
             label="Reverse"
-            checked={config.reverse}
-            onChange={(e) => onChange({ ...config, reverse: e.currentTarget.checked })}
+            checked={master.reverse}
+            onChange={(e) => onChange({ ...master, reverse: e.currentTarget.checked })}
           />
           <Checkbox
             label="Mirror"
-            checked={config.mirror}
-            onChange={(e) => onChange({ ...config, mirror: e.currentTarget.checked })}
+            checked={master.mirror}
+            onChange={(e) => onChange({ ...master, mirror: e.currentTarget.checked })}
           />
           <Text size="xs" c="dimmed" lh={1.35}>
-            {describeLayout(config.mirror, config.reverse)}
+            {describeLayout(master.mirror, master.reverse)} Applied to the finished
+            composite, so no layer can see it.
           </Text>
         </Stack>
       </Stack>

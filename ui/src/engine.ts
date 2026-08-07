@@ -11,7 +11,7 @@
 import type { SurfaceConfig } from "./color/surface";
 import type { CurveConfig } from "./config/curve";
 import type { EqBand } from "./config/eq";
-import type { LedKeyframe } from "./config/editor";
+import type { LedKeyframe } from "./config/layers";
 
 export const DEFAULT_URL = "ws://127.0.0.1:9001";
 

@@ -25,9 +25,10 @@ import {
   nextId,
   toSurface,
   type ColorKeyframe,
-  type EditorConfig,
+  type GizmoFlags,
   type LedKeyframe,
-} from "../config/editor";
+  type SpectrumState,
+} from "../config/layers";
 import {
   EQ_Q_MAX,
   EQ_Q_MIN,
@@ -37,7 +38,17 @@ import {
   type EqBand,
   type EqType,
 } from "../config/eq";
-import { DB_MAX, DB_MIN, clamp, formatHz, hzToNorm, snapHz } from "../config/scales";
+import {
+  DB_MAX,
+  DB_MIN,
+  clamp,
+  dbToNorm,
+  formatHz,
+  formatNote,
+  hzToNorm,
+  hzToNote,
+  snapHz,
+} from "../config/scales";
 import { SpectrumCanvas } from "./SpectrumCanvas";
 import { GizmoLayer, type GizmoTarget } from "./GizmoLayer";
 import {
@@ -62,8 +73,10 @@ const MIN_COLOR_KEYFRAMES = 2;
 const MIN_LED_KEYFRAMES = 2;
 
 interface Props {
-  config: EditorConfig;
-  onChange: (config: EditorConfig) => void;
+  state: SpectrumState;
+  onChange: (state: SpectrumState) => void;
+  /** View-only, and passed apart from the state so it is never animated. */
+  gizmos: GizmoFlags;
   frame: SpectrumFrame;
   ledCount: number;
   sampleRate: number;
@@ -76,7 +89,14 @@ interface Grab {
   dy: number;
 }
 
-export function SpectrumEditor({ config, onChange, frame, ledCount, sampleRate }: Props) {
+export function SpectrumEditor({
+  state,
+  onChange,
+  gizmos,
+  frame,
+  ledCount,
+  sampleRate,
+}: Props) {
   const theme = useMantineTheme();
   const palette = theme.other.plot;
 
@@ -88,7 +108,7 @@ export function SpectrumEditor({ config, onChange, frame, ledCount, sampleRate }
   const [grab, setGrab] = useState<Grab | null>(null);
 
   const layout = useMemo(() => computeLayout(sized.width || 900, PLOT_HEIGHT), [sized.width]);
-  const surface = useMemo(() => toSurface(config), [config]);
+  const surface = useMemo(() => toSurface(state), [state]);
   const clearSelection = useCallback(() => setSelected(null), []);
 
   const localPoint = useCallback((event: { clientX: number; clientY: number }) => {
@@ -103,38 +123,38 @@ export function SpectrumEditor({ config, onChange, frame, ledCount, sampleRate }
       if (event.button !== 0) return;
       event.stopPropagation();
       const p = localPoint(event);
-      setGrab({ target, ...grabOffset(target, config, layout, p) });
+      setGrab({ target, ...grabOffset(target, state, layout, p) });
       const selectable = target.kind === "color" || target.kind === "led" || target.kind === "eq";
       setSelected(selectable ? target : null);
     },
-    [config, layout, localPoint],
+    [state,layout, localPoint],
   );
 
   useWindowEvent("pointermove", (event: PointerEvent) => {
     if (!grab) return;
     const p = localPoint(event);
-    onChange(applyDrag(config, layout, grab, p.x, p.y));
+    onChange(applyDrag(state, layout, grab, p.x, p.y));
   });
 
   useWindowEvent("pointerup", () => setGrab(null));
 
   const removeSelected = useCallback(() => {
     if (!selected) return;
-    if (selected.kind === "color" && config.colorKeyframes.length > MIN_COLOR_KEYFRAMES) {
+    if (selected.kind === "color" && state.colorKeyframes.length > MIN_COLOR_KEYFRAMES) {
       onChange({
-        ...config,
-        colorKeyframes: config.colorKeyframes.filter((k) => k.id !== selected.id),
+        ...state,
+        colorKeyframes: state.colorKeyframes.filter((k) => k.id !== selected.id),
       });
       setSelected(null);
-    } else if (selected.kind === "led" && config.ledKeyframes.length > MIN_LED_KEYFRAMES) {
-      onChange({ ...config, ledKeyframes: config.ledKeyframes.filter((k) => k.id !== selected.id) });
+    } else if (selected.kind === "led" && state.ledKeyframes.length > MIN_LED_KEYFRAMES) {
+      onChange({ ...state,ledKeyframes: state.ledKeyframes.filter((k) => k.id !== selected.id) });
       setSelected(null);
     } else if (selected.kind === "eq") {
       // No minimum: an EQ with no bands is flat, which is a valid state.
-      onChange({ ...config, eq: config.eq.filter((b) => b.id !== selected.id) });
+      onChange({ ...state, eq:state.eq.filter((b) => b.id !== selected.id) });
       setSelected(null);
     }
-  }, [config, onChange, selected]);
+  }, [state,onChange, selected]);
 
   useHotkeys([
     ["Delete", removeSelected],
@@ -150,17 +170,17 @@ export function SpectrumEditor({ config, onChange, frame, ledCount, sampleRate }
       const db = Math.round(dbOfY(layout, p.y));
       // Seeded with the colour already showing there, so dropping a keyframe
       // never makes the field jump before it has been given a colour.
-      const sampled = new ColorSurface(toSurface(config)).sample(hzToNorm(hz), dbToLevel(db));
+      const sampled = new ColorSurface(toSurface(state)).sample(hzToNorm(hz), dbToLevel(db));
       const keyframe: ColorKeyframe = {
         id: nextId("ck"),
         hz,
         db,
         color: oklabToHex(sampled),
       };
-      onChange({ ...config, colorKeyframes: [...config.colorKeyframes, keyframe] });
+      onChange({ ...state,colorKeyframes: [...state.colorKeyframes, keyframe] });
       setSelected({ kind: "color", id: keyframe.id });
     },
-    [config, layout, localPoint, onChange],
+    [state,layout, localPoint, onChange],
   );
 
   const addLed = useCallback(
@@ -171,12 +191,12 @@ export function SpectrumEditor({ config, onChange, frame, ledCount, sampleRate }
       const keyframe: LedKeyframe = {
         id: nextId("led"),
         hz,
-        led: suggestLed(config.ledKeyframes, hz, ledCount),
+        led: suggestLed(state.ledKeyframes, hz, ledCount),
       };
-      onChange({ ...config, ledKeyframes: sortByHz([...config.ledKeyframes, keyframe]) });
+      onChange({ ...state,ledKeyframes: sortByHz([...state.ledKeyframes, keyframe]) });
       setSelected({ kind: "led", id: keyframe.id });
     },
-    [config, layout, ledCount, localPoint, onChange],
+    [state,layout, ledCount, localPoint, onChange],
   );
 
   const addEq = useCallback(
@@ -192,27 +212,27 @@ export function SpectrumEditor({ config, onChange, frame, ledCount, sampleRate }
         gain: Math.round(gainOfY(layout, p.y) * 2) / 2,
         q: 1,
       };
-      onChange({ ...config, eq: sortByHz([...config.eq, band]) });
+      onChange({ ...state, eq:sortByHz([...state.eq, band]) });
       setSelected({ kind: "eq", id: band.id });
     },
-    [config, layout, localPoint, onChange],
+    [state,layout, localPoint, onChange],
   );
 
   const updateEq = useCallback(
     (id: string, patch: Partial<EqBand>) => {
-      onChange({ ...config, eq: config.eq.map((b) => (b.id === id ? { ...b, ...patch } : b)) });
+      onChange({ ...state, eq:state.eq.map((b) => (b.id === id ? { ...b, ...patch } : b)) });
     },
-    [config, onChange],
+    [state,onChange],
   );
 
   const selectedColor =
     selected?.kind === "color"
-      ? config.colorKeyframes.find((k) => k.id === selected.id)
+      ? state.colorKeyframes.find((k) => k.id === selected.id)
       : undefined;
   const selectedLed =
-    selected?.kind === "led" ? config.ledKeyframes.find((k) => k.id === selected.id) : undefined;
+    selected?.kind === "led" ? state.ledKeyframes.find((k) => k.id === selected.id) : undefined;
   const selectedEq =
-    selected?.kind === "eq" ? config.eq.find((b) => b.id === selected.id) : undefined;
+    selected?.kind === "eq" ? state.eq.find((b) => b.id === selected.id) : undefined;
 
   const anchor = selectedColor
     ? { x: xOfHz(layout, selectedColor.hz), y: yOfDb(layout, selectedColor.db) }
@@ -233,7 +253,8 @@ export function SpectrumEditor({ config, onChange, frame, ledCount, sampleRate }
       <SpectrumCanvas layout={layout} surface={surface} frame={frame} />
       <GizmoLayer
         layout={layout}
-        config={config}
+        state={state}
+        gizmos={gizmos}
         palette={palette}
         sampleRate={sampleRate}
         selected={selected}
@@ -270,14 +291,18 @@ export function SpectrumEditor({ config, onChange, frame, ledCount, sampleRate }
                 <Group gap={6}>
                   <ColorSwatch color={selectedColor.color} size={16} />
                   <Text size="xs" ff="monospace">
-                    {formatHz(selectedColor.hz)} Hz · {selectedColor.db.toFixed(0)} dB
+                    {state.source === "midi"
+                      ? `${formatNote(hzToNote(selectedColor.hz))} · vel ${Math.round(
+                          dbToNorm(selectedColor.db) * 127,
+                        )}`
+                      : `${formatHz(selectedColor.hz)} Hz · ${selectedColor.db.toFixed(0)} dB`}
                   </Text>
                 </Group>
                 <Tooltip label="Delete (Del)">
                   <ActionIcon
                     color="red"
                     aria-label="Delete keyframe"
-                    disabled={config.colorKeyframes.length <= MIN_COLOR_KEYFRAMES}
+                    disabled={state.colorKeyframes.length <= MIN_COLOR_KEYFRAMES}
                     onClick={removeSelected}
                   >
                     <TrashIcon />
@@ -289,8 +314,8 @@ export function SpectrumEditor({ config, onChange, frame, ledCount, sampleRate }
                 value={selectedColor.color}
                 onChange={(color) =>
                   onChange({
-                    ...config,
-                    colorKeyframes: config.colorKeyframes.map((k) =>
+                    ...state,
+                    colorKeyframes: state.colorKeyframes.map((k) =>
                       k.id === selectedColor.id ? { ...k, color } : k,
                     ),
                   })
@@ -312,7 +337,7 @@ export function SpectrumEditor({ config, onChange, frame, ledCount, sampleRate }
                   <ActionIcon
                     color="red"
                     aria-label="Delete LED keyframe"
-                    disabled={config.ledKeyframes.length <= MIN_LED_KEYFRAMES}
+                    disabled={state.ledKeyframes.length <= MIN_LED_KEYFRAMES}
                     onClick={removeSelected}
                   >
                     <TrashIcon />
@@ -326,8 +351,8 @@ export function SpectrumEditor({ config, onChange, frame, ledCount, sampleRate }
                 value={selectedLed.led}
                 onChange={(value) =>
                   onChange({
-                    ...config,
-                    ledKeyframes: config.ledKeyframes.map((k) =>
+                    ...state,
+                    ledKeyframes: state.ledKeyframes.map((k) =>
                       k.id === selectedLed.id
                         ? { ...k, led: clamp(Number(value) || 0, 0, ledCount - 1) }
                         : k,
@@ -343,9 +368,9 @@ export function SpectrumEditor({ config, onChange, frame, ledCount, sampleRate }
                 value={Math.round(selectedLed.hz)}
                 onChange={(value) =>
                   onChange({
-                    ...config,
+                    ...state,
                     ledKeyframes: sortByHz(
-                      config.ledKeyframes.map((k) =>
+                      state.ledKeyframes.map((k) =>
                         k.id === selectedLed.id
                           ? { ...k, hz: clamp(Number(value) || 20, 20, 20_000) }
                           : k,
@@ -429,21 +454,21 @@ const SWATCHES = [
 
 function grabOffset(
   target: GizmoTarget,
-  config: EditorConfig,
+  state: SpectrumState,
   layout: PlotLayout,
   p: { x: number; y: number },
 ): { dx: number; dy: number } {
   // Only the point-like gizmos need an offset; the rails snap to the pointer.
   if (target.kind === "color") {
-    const k = config.colorKeyframes.find((c) => c.id === target.id);
+    const k = state.colorKeyframes.find((c) => c.id === target.id);
     if (k) return { dx: xOfHz(layout, k.hz) - p.x, dy: yOfDb(layout, k.db) - p.y };
   }
   if (target.kind === "led") {
-    const k = config.ledKeyframes.find((c) => c.id === target.id);
+    const k = state.ledKeyframes.find((c) => c.id === target.id);
     if (k) return { dx: xOfHz(layout, k.hz) - p.x, dy: 0 };
   }
   if (target.kind === "eq") {
-    const b = config.eq.find((c) => c.id === target.id);
+    const b = state.eq.find((c) => c.id === target.id);
     if (b) {
       return {
         dx: xOfHz(layout, b.hz) - p.x,
@@ -455,12 +480,12 @@ function grabOffset(
 }
 
 function applyDrag(
-  config: EditorConfig,
+  state: SpectrumState,
   layout: PlotLayout,
   grab: Grab,
   px: number,
   py: number,
-): EditorConfig {
+): SpectrumState {
   const x = px + grab.dx;
   const y = py + grab.dy;
 
@@ -470,17 +495,17 @@ function applyDrag(
       const hz = snapHz(hzOfX(layout, x));
       const db = Math.round(dbOfY(layout, y) * 2) / 2;
       return {
-        ...config,
-        colorKeyframes: config.colorKeyframes.map((k) => (k.id === id ? { ...k, hz, db } : k)),
+        ...state,
+        colorKeyframes: state.colorKeyframes.map((k) => (k.id === id ? { ...k, hz, db } : k)),
       };
     }
     case "led": {
       const id = grab.target.id;
       const hz = snapHz(hzOfX(layout, x));
       return {
-        ...config,
+        ...state,
         ledKeyframes: sortByHz(
-          config.ledKeyframes.map((k) => (k.id === id ? { ...k, hz } : k)),
+          state.ledKeyframes.map((k) => (k.id === id ? { ...k, hz } : k)),
         ),
       };
     }
@@ -488,9 +513,9 @@ function applyDrag(
       const id = grab.target.id;
       const hz = snapHz(hzOfX(layout, x));
       return {
-        ...config,
+        ...state,
         eq: sortByHz(
-          config.eq.map((b) => {
+          state.eq.map((b) => {
             if (b.id !== id) return b;
             // A pass filter has no gain to drag, so vertical movement is
             // discarded rather than silently stored and never used.
@@ -502,23 +527,23 @@ function applyDrag(
     }
     case "threshold":
       return {
-        ...config,
-        threshold: clamp(round1(dbOfY(layout, y)), DB_MIN, config.clamp - MIN_WINDOW_DB),
+        ...state,
+        threshold: clamp(round1(dbOfY(layout, y)), DB_MIN, state.clamp - MIN_WINDOW_DB),
       };
     case "clamp":
       return {
-        ...config,
-        clamp: clamp(round1(dbOfY(layout, y)), config.threshold + MIN_WINDOW_DB, DB_MAX),
+        ...state,
+        clamp: clamp(round1(dbOfY(layout, y)), state.threshold + MIN_WINDOW_DB, DB_MAX),
       };
     case "curve": {
-      const box = curveBox(layout, config.clamp, config.threshold);
-      if (box.h <= 0 || box.w <= 0) return config;
+      const box = curveBox(layout, state.clamp, state.threshold);
+      if (box.h <= 0 || box.w <= 0) return state;
       const point = {
         x: clamp(1 - (y - box.y) / box.h, 0, 1),
         y: clamp((x - box.x) / box.w, 0, 1),
       };
       const key = grab.target.point === 1 ? "p1" : "p2";
-      return { ...config, curve: { ...config.curve, [key]: point } };
+      return { ...state,curve: { ...state.curve, [key]: point } };
     }
   }
 }

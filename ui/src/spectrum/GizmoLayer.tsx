@@ -1,7 +1,15 @@
 import { memo, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 
-import type { EditorConfig } from "../config/editor";
-import { DB_TICKS, FREQ_TICKS, formatHz } from "../config/scales";
+import type { GizmoFlags, SpectrumState } from "../config/layers";
+import {
+  DB_TICKS,
+  FREQ_TICKS,
+  NOTE_TICKS,
+  dbToNorm,
+  formatHz,
+  formatNote,
+  noteToHz,
+} from "../config/scales";
 import type { PlotPalette } from "../theme";
 import { CurveGizmo } from "./CurveGizmo";
 import { EqGizmo } from "./EqGizmo";
@@ -32,7 +40,8 @@ export function targetId(target: GizmoTarget | null, kind: "color" | "led" | "eq
 
 interface Props {
   layout: PlotLayout;
-  config: EditorConfig;
+  state: SpectrumState;
+  gizmos: GizmoFlags;
   palette: PlotPalette;
   sampleRate: number;
   selected: GizmoTarget | null;
@@ -61,7 +70,8 @@ const MONO = "var(--mantine-font-family-monospace)";
  */
 export const GizmoLayer = memo(function GizmoLayer({
   layout,
-  config,
+  state,
+  gizmos,
   palette,
   sampleRate,
   selected,
@@ -73,11 +83,14 @@ export const GizmoLayer = memo(function GizmoLayer({
   onClearSelection,
 }: Props) {
   const { plot, gutter, axis, track } = layout;
-  const { gizmos } = config;
 
-  const thresholdY = yOfDb(layout, config.threshold);
-  const clampY = yOfDb(layout, config.clamp);
+  const thresholdY = yOfDb(layout, state.threshold);
+  const clampY = yOfDb(layout, state.clamp);
   const laneX = railLaneX(layout);
+
+  // The axis is the same axis either way — a note number is log frequency
+  // relabelled — so only the ruler changes, never the geometry beneath it.
+  const midi = state.source === "midi";
 
   return (
     <svg
@@ -114,7 +127,7 @@ export const GizmoLayer = memo(function GizmoLayer({
       )}
 
       {gizmos.ledKeyframes &&
-        config.ledKeyframes.map((k) => {
+        state.ledKeyframes.map((k) => {
           const x = xOfHz(layout, k.hz);
           return (
             <line
@@ -135,7 +148,7 @@ export const GizmoLayer = memo(function GizmoLayer({
       {gizmos.eq && (
         <EqGizmo
           layout={layout}
-          bands={config.eq}
+          bands={state.eq}
           sampleRate={sampleRate}
           palette={palette}
           selectedId={targetId(selected, "eq")}
@@ -151,7 +164,7 @@ export const GizmoLayer = memo(function GizmoLayer({
             layout={layout}
             palette={palette}
             label="CLAMP"
-            db={config.clamp}
+            db={state.clamp}
             active={sameTarget(active, { kind: "clamp" })}
           />
           <LevelLine
@@ -159,7 +172,7 @@ export const GizmoLayer = memo(function GizmoLayer({
             layout={layout}
             palette={palette}
             label="THRESHOLD"
-            db={config.threshold}
+            db={state.threshold}
             active={sameTarget(active, { kind: "threshold" })}
           />
         </>
@@ -167,8 +180,8 @@ export const GizmoLayer = memo(function GizmoLayer({
 
       {gizmos.curve && (
         <CurveGizmo
-          box={curveBox(layout, config.clamp, config.threshold)}
-          curve={config.curve}
+          box={curveBox(layout, state.clamp, state.threshold)}
+          curve={state.curve}
           palette={palette}
           activePoint={active?.kind === "curve" ? active.point : null}
           onGrab={(point, e) => onGrab({ kind: "curve", point }, e)}
@@ -197,7 +210,7 @@ export const GizmoLayer = memo(function GizmoLayer({
       )}
 
       {gizmos.colorKeyframes &&
-        config.colorKeyframes.map((k) => {
+        state.colorKeyframes.map((k) => {
           const target: GizmoTarget = { kind: "color", id: k.id };
           const on = sameTarget(selected, target) || sameTarget(active, target);
           return (
@@ -242,7 +255,7 @@ export const GizmoLayer = memo(function GizmoLayer({
         end of either axis would spend its life underneath one.
       */}
       <text x={gutter.w - 9} y={plot.y - 5} textAnchor="end" fontSize={9} fill={palette.tick} fontFamily={MONO}>
-        dB
+        {midi ? "vel" : "dB"}
       </text>
       {DB_TICKS.map((db) => (
         <text
@@ -254,7 +267,10 @@ export const GizmoLayer = memo(function GizmoLayer({
           fill={palette.tick}
           fontFamily={MONO}
         >
-          {db}
+          {/* Not a second scale either: velocity is the same normalised height
+              the dB axis already draws, so the ticks stay exactly where they
+              were and only the number printed against them changes. */}
+          {midi ? Math.round(dbToNorm(db) * 127) : db}
         </text>
       ))}
 
@@ -266,21 +282,35 @@ export const GizmoLayer = memo(function GizmoLayer({
         fill={palette.tick}
         fontFamily={MONO}
       >
-        Hz
+        {midi ? "note" : "Hz"}
       </text>
-      {FREQ_TICKS.map((hz) => (
-        <text
-          key={hz}
-          x={xOfHz(layout, hz)}
-          y={axis.y + 18}
-          textAnchor="middle"
-          fontSize={10}
-          fill={palette.tick}
-          fontFamily={MONO}
-        >
-          {formatHz(hz)}
-        </text>
-      ))}
+      {midi
+        ? NOTE_TICKS.map((note) => (
+            <text
+              key={note}
+              x={xOfHz(layout, noteToHz(note))}
+              y={axis.y + 18}
+              textAnchor="middle"
+              fontSize={10}
+              fill={palette.tick}
+              fontFamily={MONO}
+            >
+              {formatNote(note)}
+            </text>
+          ))
+        : FREQ_TICKS.map((hz) => (
+            <text
+              key={hz}
+              x={xOfHz(layout, hz)}
+              y={axis.y + 18}
+              textAnchor="middle"
+              fontSize={10}
+              fill={palette.tick}
+              fontFamily={MONO}
+            >
+              {formatHz(hz)}
+            </text>
+          ))}
 
       {/* LED sector track. */}
       <rect
@@ -296,7 +326,7 @@ export const GizmoLayer = memo(function GizmoLayer({
         onPointerDown={onClearSelection}
       />
       {gizmos.ledKeyframes &&
-        config.ledKeyframes.map((k) => {
+        state.ledKeyframes.map((k) => {
           const target: GizmoTarget = { kind: "led", id: k.id };
           const on = sameTarget(selected, target) || sameTarget(active, target);
           const x = xOfHz(layout, k.hz);
