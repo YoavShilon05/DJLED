@@ -8,25 +8,53 @@
  *
  * Everything drawn on screen goes through here, so a keyframe's swatch, the
  * field under it and the strip preview all agree.
+ *
+ * Opacity gets two treatments, and which one is right depends on what is behind
+ * the pixel:
+ *
+ *   - {@link oklabToDisplay} composites onto black, because the strip preview is
+ *     a picture of LEDs and the thing behind an LED is an unlit LED.
+ *   - {@link oklabToDisplayRgba} keeps opacity as opacity, because the colour
+ *     field is drawn over the plot and a faded region should read as faded
+ *     rather than as a dark patch that happens to look similar.
  */
 
-import { linearToSrgb, oklabToLinearRgb, type Oklab } from "./oklab";
+import { BLACK, clampedRgb, linearToSrgb, oklabToLinearRgb, over, type Oklab } from "./oklab";
 
 export type Rgb = [number, number, number];
+export type Rgba = [number, number, number, number];
 
 const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
 
+const srgbByte = (v: number) => Math.round(clamp01(linearToSrgb(clamp01(v))) * 255);
+
 /**
- * Oklab to sRGB bytes for the screen.
+ * Oklab to opaque sRGB bytes for the screen, composited onto black.
  *
  * `gain` scales linear light before the encode, which is where a brightness
  * multiplier belongs — halving the byte of an sRGB value does not halve the
  * light, and the LED is driven in linear terms anyway.
  */
 export function oklabToDisplay(c: Oklab, gain = 1): Rgb {
-  const rgb = oklabToLinearRgb(c);
-  const byte = (v: number) => Math.round(clamp01(linearToSrgb(clamp01(v * gain))) * 255);
-  return [byte(rgb.r), byte(rgb.g), byte(rgb.b)];
+  const rgb = over(clampedRgb(oklabToLinearRgb(c)), BLACK);
+  return [srgbByte(rgb.r * gain), srgbByte(rgb.g * gain), srgbByte(rgb.b * gain)];
+}
+
+/**
+ * Oklab to sRGB bytes plus an alpha byte, for drawing over something.
+ *
+ * Colour and alpha stay separate — canvas `ImageData` is un-premultiplied, which
+ * is the same convention the colour pipeline uses, so the two line up with no
+ * conversion. `gain` scales the light, not the coverage.
+ */
+export function oklabToDisplayRgba(c: Oklab, gain = 1): Rgba {
+  const rgb = clampedRgb(oklabToLinearRgb(c));
+  return [
+    srgbByte(rgb.r * gain),
+    srgbByte(rgb.g * gain),
+    srgbByte(rgb.b * gain),
+    Math.round(clamp01(rgb.alpha) * 255),
+  ];
 }
 
 /** Bytes as sent to the strip (linear) to bytes for a canvas (sRGB). */

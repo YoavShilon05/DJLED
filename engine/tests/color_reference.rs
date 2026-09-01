@@ -12,74 +12,88 @@
 //! cargo run --example color_reference > ../ui/src/color/reference.json
 //! ```
 
+use djled_engine::color::oklab::LinearRgb;
 use djled_engine::color::{ColorSurface, Keyframe, SurfaceConfig};
 
 const REFERENCE: &str = include_str!("../../ui/src/color/reference.json");
 
+fn document() -> serde_json::Value {
+    serde_json::from_str(REFERENCE).expect("reference.json is not valid JSON")
+}
+
 #[test]
 fn committed_reference_matches_this_implementation() {
-    let doc: serde_json::Value =
-        serde_json::from_str(REFERENCE).expect("reference.json is not valid JSON");
+    let doc = document();
+    let cases = doc["cases"].as_array().expect("reference.json has no cases array");
+    assert!(!cases.is_empty(), "reference.json contains no cases");
 
-    let keyframes: Vec<Keyframe> = doc["keyframes"]
-        .as_array()
-        .expect("reference.json has no keyframes array")
-        .iter()
-        .map(|k| {
-            Keyframe::new(
-                k["x"].as_f64().unwrap() as f32,
-                k["y"].as_f64().unwrap() as f32,
-                k["color"].as_str().unwrap(),
-            )
-        })
-        .collect();
+    for case in cases {
+        let name = case["name"].as_str().unwrap_or("?");
 
-    let cfg = SurfaceConfig { keyframes, sigma: doc["sigma"].as_f64().unwrap() as f32 };
-    let surface = ColorSurface::new(&cfg).expect("reference config must be valid");
-
-    let samples = doc["samples"].as_array().expect("reference.json has no samples array");
-    assert!(!samples.is_empty(), "reference.json contains no samples");
-
-    for s in samples {
-        let (x, y) = (s["x"].as_f64().unwrap() as f32, s["y"].as_f64().unwrap() as f32);
-        let got = surface.sample(x, y);
-
-        for (name, actual, expected) in [
-            ("l", got.l, s["l"].as_f64().unwrap() as f32),
-            ("a", got.a, s["a"].as_f64().unwrap() as f32),
-            ("b", got.b, s["b"].as_f64().unwrap() as f32),
-        ] {
-            assert!(
-                (actual - expected).abs() < 1e-6,
-                "{name} at ({x}, {y}): got {actual}, reference says {expected}. \
-                 Regenerate the fixture if this change was intended."
-            );
-        }
-
-        let rgb = got.to_linear_rgb().clamped();
-        let led = [
-            (rgb.r * 255.0).round() as u8,
-            (rgb.g * 255.0).round() as u8,
-            (rgb.b * 255.0).round() as u8,
-        ];
-        let expected: Vec<u8> = s["led"]
+        let keyframes: Vec<Keyframe> = case["keyframes"]
             .as_array()
-            .unwrap()
+            .unwrap_or_else(|| panic!("case '{name}' has no keyframes array"))
             .iter()
-            .map(|v| v.as_u64().unwrap() as u8)
+            .map(|k| {
+                Keyframe::new(
+                    k["x"].as_f64().unwrap() as f32,
+                    k["y"].as_f64().unwrap() as f32,
+                    k["color"].as_str().unwrap(),
+                )
+            })
             .collect();
-        assert_eq!(led.to_vec(), expected, "LED bytes at ({x}, {y})");
+
+        let cfg = SurfaceConfig { keyframes, sigma: case["sigma"].as_f64().unwrap() as f32 };
+        let surface = ColorSurface::new(&cfg).expect("reference config must be valid");
+
+        let samples = case["samples"].as_array().expect("case has no samples array");
+        assert!(!samples.is_empty(), "case '{name}' contains no samples");
+
+        for s in samples {
+            let (x, y) = (s["x"].as_f64().unwrap() as f32, s["y"].as_f64().unwrap() as f32);
+            let got = surface.sample(x, y);
+
+            for (channel, actual, expected) in [
+                ("l", got.l, s["l"].as_f64().unwrap() as f32),
+                ("a", got.a, s["a"].as_f64().unwrap() as f32),
+                ("b", got.b, s["b"].as_f64().unwrap() as f32),
+                ("alpha", got.alpha, s["alpha"].as_f64().unwrap() as f32),
+            ] {
+                assert!(
+                    (actual - expected).abs() < 1e-6,
+                    "{channel} at ({x}, {y}) in '{name}': got {actual}, reference says {expected}. \
+                     Regenerate the fixture if this change was intended."
+                );
+            }
+
+            let rgb = got.to_linear_rgb().clamped().over(LinearRgb::BLACK);
+            let led = [
+                (rgb.r * 255.0).round() as u8,
+                (rgb.g * 255.0).round() as u8,
+                (rgb.b * 255.0).round() as u8,
+            ];
+            let expected: Vec<u8> = s["led"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u8)
+                .collect();
+            assert_eq!(led.to_vec(), expected, "LED bytes at ({x}, {y}) in '{name}'");
+        }
     }
 }
 
-/// The fixture must describe the *default* palette, or the UI and engine start
-/// from different colours before anything is edited.
+/// The first case must describe the *default* palette, or the UI and engine
+/// start from different colours before anything is edited.
 #[test]
 fn reference_tracks_the_default_surface() {
-    let doc: serde_json::Value = serde_json::from_str(REFERENCE).unwrap();
+    let doc = document();
+    let case = &doc["cases"][0];
     let default = SurfaceConfig::default();
 
-    let keyframes = doc["keyframes"].as_array().unwrap();
+    assert_eq!(case["name"].as_str().unwrap(), "default");
+
+    let keyframes = case["keyframes"].as_array().unwrap();
     assert_eq!(
         keyframes.len(),
         default.keyframes.len(),
@@ -91,5 +105,27 @@ fn reference_tracks_the_default_surface() {
         assert!((recorded["x"].as_f64().unwrap() as f32 - current.x).abs() < 1e-6);
         assert!((recorded["y"].as_f64().unwrap() as f32 - current.y).abs() < 1e-6);
     }
-    assert!((doc["sigma"].as_f64().unwrap() as f32 - default.sigma).abs() < 1e-6);
+    assert!((case["sigma"].as_f64().unwrap() as f32 - default.sigma).abs() < 1e-6);
+}
+
+/// The fixture is only worth having for opacity if something in it is actually
+/// translucent. An all-opaque reference would let both implementations get
+/// opacity-weighted blending wrong and still agree.
+#[test]
+fn reference_exercises_opacity() {
+    let doc = document();
+    let cases = doc["cases"].as_array().unwrap();
+
+    let alphas: Vec<f64> = cases
+        .iter()
+        .flat_map(|c| c["samples"].as_array().unwrap())
+        .map(|s| s["alpha"].as_f64().unwrap())
+        .collect();
+
+    assert!(alphas.iter().any(|&a| a > 0.99), "no sample is opaque");
+    assert!(alphas.iter().any(|&a| a < 0.1), "no sample is near-transparent");
+    assert!(
+        alphas.iter().any(|&a| (0.3..0.7).contains(&a)),
+        "no sample is partially covered, which is where the blending maths shows"
+    );
 }

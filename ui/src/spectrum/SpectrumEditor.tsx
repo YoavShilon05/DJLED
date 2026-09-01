@@ -19,7 +19,7 @@ import { useElementSize, useHotkeys, useMergedRef, useWindowEvent } from "@manti
 
 import { Field } from "../components/Field";
 
-import { oklabToHex } from "../color/oklab";
+import { hexToLinearRgb, oklabToHex } from "../color/oklab";
 import { ColorSurface } from "../color/surface";
 import {
   nextId,
@@ -271,6 +271,10 @@ export function SpectrumEditor({ config, onChange, frame, ledCount, sampleRate }
                   <ColorSwatch color={selectedColor.color} size={16} />
                   <Text size="xs" ff="monospace">
                     {formatHz(selectedColor.hz)} Hz · {selectedColor.db.toFixed(0)} dB
+                    {/* Only when it is not fully opaque, so the common case
+                        stays uncluttered and a faded keyframe stands out. */}
+                    {opacityOf(selectedColor.color) < 1 &&
+                      ` · ${Math.round(opacityOf(selectedColor.color) * 100)}%`}
                   </Text>
                 </Group>
                 <Tooltip label="Delete (Del)">
@@ -285,7 +289,15 @@ export function SpectrumEditor({ config, onChange, frame, ledCount, sampleRate }
                 </Tooltip>
               </Group>
               <Divider />
+              {/*
+                `hexa` rather than `hex`: it adds the opacity slider and emits
+                `#rrggbbaa`, which is exactly what the surface parses. Opacity
+                only dims against the unlit strip today, so the swatch above and
+                the field below are the honest preview of it.
+              */}
               <ColorPicker
+                format="hexa"
+                alphaLabel="Opacity"
                 value={selectedColor.color}
                 onChange={(color) =>
                   onChange({
@@ -419,6 +431,11 @@ export function SpectrumEditor({ config, onChange, frame, ledCount, sampleRate }
       </Popover>
     </Box>
   );
+}
+
+/** Opacity of an authored `#rrggbb` or `#rrggbbaa`, for the readout. */
+function opacityOf(color: string): number {
+  return hexToLinearRgb(color).alpha;
 }
 
 /** A starting palette for new keyframes — saturated, because LEDs are. */

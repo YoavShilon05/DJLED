@@ -17,7 +17,14 @@ export interface ColorKeyframe {
   id: string;
   hz: number;
   db: number;
-  /** sRGB hex, e.g. `#ff2000`. */
+  /**
+   * sRGB hex, either `#ff2000` or `#ff2000cc` with an opacity byte.
+   *
+   * Opacity rides in the colour rather than in a field of its own, so it travels
+   * the wire, the presets and the colour picker as one value. Six digits means
+   * opaque, which is what keeps stored configs from before the channel existed
+   * loading unchanged.
+   */
   color: string;
 }
 

@@ -216,6 +216,13 @@ export const GizmoLayer = memo(function GizmoLayer({
                   strokeWidth={1.5}
                 />
               )}
+              {/*
+                The fill carries the authored opacity — an `#rrggbbaa` is a
+                valid CSS colour — so a faded keyframe reads as faded rather than
+                claiming a solidity it does not have. The rings keep it visible
+                and the group's `pointer-events: all` keeps it draggable even at
+                zero opacity.
+              */}
               <circle
                 cx={xOfHz(layout, k.hz)}
                 cy={yOfDb(layout, k.db)}

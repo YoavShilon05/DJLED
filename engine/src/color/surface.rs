@@ -31,10 +31,18 @@
 //! Evaluation is O(keyframes) — a handful of `exp` calls — so there is no lookup
 //! table. Rendering a full 256×128 preview costs well under a millisecond, and
 //! skipping the bake removes any chance of the cache going stale after an edit.
+//!
+//! # Opacity
+//!
+//! Keyframes carry opacity as well as colour, so the field is four channels
+//! rather than three. The two are not interpolated the same way: opacity uses
+//! the plain Gaussian weights, colour uses those weights scaled by opacity. See
+//! [`ColorSurface::sample`] for why, and [`super::oklab`] for what opacity means
+//! once it reaches the strip.
 
 use serde::{Deserialize, Serialize};
 
-use super::oklab::{srgb_hex_to_linear, Oklab};
+use super::oklab::{srgb_hex_to_linear, srgba_hex_to_linear, LinearRgb, Oklab};
 
 /// One authored control point. `color` is an sRGB hex string so saved presets
 /// stay readable and hand-editable.
@@ -44,7 +52,13 @@ pub struct Keyframe {
     pub x: f32,
     /// Band intensity, 0 = silent, 1 = full.
     pub y: f32,
-    /// sRGB hex, e.g. `"#ff2000"`.
+    /// sRGB hex, either `"#ff2000"` or `"#ff2000cc"` with an opacity byte.
+    ///
+    /// Opacity lives in the colour rather than in a field of its own, so a
+    /// preset stays one readable value per keyframe and matches what CSS,
+    /// every colour picker and the editor all already call a colour. Six digits
+    /// means fully opaque, which is what keeps presets written before opacity
+    /// existed loading unchanged.
     pub color: String,
 }
 
@@ -103,25 +117,30 @@ impl ColorSurface {
         let points = cfg
             .keyframes
             .iter()
-            .map(|k| {
-                Ok(Compiled {
-                    x: k.x,
-                    y: k.y,
-                    color: srgb_hex_to_linear(parse_hex(&k.color)?).to_oklab(),
-                })
-            })
+            .map(|k| Ok(Compiled { x: k.x, y: k.y, color: parse_color(&k.color)?.to_oklab() }))
             .collect::<Result<Vec<_>, String>>()?;
 
         let sigma = cfg.sigma.max(1e-3);
         Ok(Self { points, falloff: 1.0 / (2.0 * sigma * sigma) })
     }
 
-    /// Colour at a point in the unit square. Inputs outside 0..1 are clamped.
+    /// Colour and opacity at a point in the unit square. Inputs outside 0..1 are
+    /// clamped.
+    ///
+    /// Opacity interpolates on the same Gaussian weights as colour, so it is
+    /// smooth for the same reasons — a keyframe faded out leaves a soft hole in
+    /// the field rather than a hard-edged one.
+    ///
+    /// Colour, though, is weighted by `w · α` rather than `w`. See
+    /// [`Oklab::blend`], which this is the inlined form of: the accumulation is
+    /// spelled out here because it also has to track the nearest keyframe, and
+    /// this runs once per strip position per frame.
     pub fn sample(&self, x: f32, y: f32) -> Oklab {
         let (x, y) = (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
 
-        let mut total = 0.0f32;
-        let mut acc = Oklab::default();
+        // `weight` normalises opacity; `cover` normalises colour.
+        let (mut weight, mut cover) = (0.0f32, 0.0f32);
+        let (mut l, mut a, mut b) = (0.0f32, 0.0f32, 0.0f32);
         let mut nearest = (f32::MAX, 0usize);
 
         for (i, p) in self.points.iter().enumerate() {
@@ -132,29 +151,48 @@ impl ColorSurface {
             }
 
             let w = (-d2 * self.falloff).exp();
-            total += w;
-            acc.l += w * p.color.l;
-            acc.a += w * p.color.a;
-            acc.b += w * p.color.b;
+            let wa = w * p.color.alpha;
+            weight += w;
+            cover += wa;
+            l += wa * p.color.l;
+            a += wa * p.color.a;
+            b += wa * p.color.b;
         }
 
         // With a small sigma and a point far from every keyframe, all weights
         // can underflow to zero. Falling back to the nearest keyframe keeps the
         // surface defined everywhere instead of returning black.
-        if total <= f32::MIN_POSITIVE {
+        if weight <= f32::MIN_POSITIVE {
             return self.points[nearest.1].color;
         }
 
-        Oklab::new(acc.l / total, acc.a / total, acc.b / total)
+        let alpha = cover / weight;
+
+        // Every keyframe within reach is fully transparent, so there is no
+        // colour to average — only the absence of one.
+        if cover <= f32::MIN_POSITIVE {
+            return Oklab::with_alpha(0.0, 0.0, 0.0, alpha);
+        }
+
+        Oklab::with_alpha(l / cover, a / cover, b / cover, alpha)
     }
 }
 
-fn parse_hex(s: &str) -> Result<u32, String> {
+/// Parse `#rrggbb` or `#rrggbbaa`, with or without the hash.
+///
+/// Six digits is fully opaque. That is what lets a preset saved before opacity
+/// existed load with exactly the appearance it had.
+fn parse_color(s: &str) -> Result<LinearRgb, String> {
     let t = s.trim().trim_start_matches('#');
-    if t.len() != 6 {
-        return Err(format!("colour '{s}' must be 6 hex digits, optionally prefixed with '#'"));
+    let value =
+        |t: &str| u32::from_str_radix(t, 16).map_err(|_| format!("colour '{s}' is not valid hex"));
+    match t.len() {
+        6 => Ok(srgb_hex_to_linear(value(t)?)),
+        8 => Ok(srgba_hex_to_linear(value(t)?)),
+        _ => Err(format!(
+            "colour '{s}' must be 6 hex digits, or 8 with an opacity byte, optionally prefixed with '#'"
+        )),
     }
-    u32::from_str_radix(t, 16).map_err(|_| format!("colour '{s}' is not valid hex"))
 }
 
 #[cfg(test)]
@@ -166,12 +204,38 @@ mod tests {
         ColorSurface::new(&SurfaceConfig::default()).unwrap()
     }
 
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-6
+    }
+
     #[test]
     fn parses_hex_with_and_without_hash() {
-        assert_eq!(parse_hex("#ff2000").unwrap(), 0xFF2000);
-        assert_eq!(parse_hex("ff2000").unwrap(), 0xFF2000);
-        assert!(parse_hex("#ff20").is_err());
-        assert!(parse_hex("#gggggg").is_err());
+        let expected = srgb_hex_to_linear(0xFF2000);
+        for s in ["#ff2000", "ff2000"] {
+            let got = parse_color(s).unwrap();
+            assert!(close(got.r, expected.r) && close(got.alpha, 1.0), "{s} gave {got:?}");
+        }
+        assert!(parse_color("#ff20").is_err());
+        assert!(parse_color("#gggggg").is_err());
+    }
+
+    /// Eight digits carry opacity, six mean opaque. The second half is the
+    /// compatibility guarantee: presets predate the channel and must not shift.
+    #[test]
+    fn parses_the_opacity_byte() {
+        let opaque = parse_color("#ff2000").unwrap();
+        let full = parse_color("#ff2000ff").unwrap();
+        assert!(close(full.r, opaque.r) && close(full.alpha, 1.0));
+
+        assert!(close(parse_color("#ff200000").unwrap().alpha, 0.0));
+        assert!(close(parse_color("ff200080").unwrap().alpha, 128.0 / 255.0));
+
+        // The colour half must not depend on the opacity half.
+        let faded = parse_color("#ff200040").unwrap();
+        assert!(close(faded.r, opaque.r) && close(faded.g, opaque.g) && close(faded.b, opaque.b));
+
+        assert!(parse_color("#ff2000f").is_err());
+        assert!(parse_color("#ff2000gg").is_err());
     }
 
     /// Sampling at a keyframe should land close to that keyframe's colour. Not
@@ -183,7 +247,7 @@ mod tests {
         let surface = default_surface();
 
         for k in &cfg.keyframes {
-            let expected = srgb_hex_to_linear(parse_hex(&k.color).unwrap()).to_oklab();
+            let expected = parse_color(&k.color).unwrap().to_oklab();
             let got = surface.sample(k.x, k.y);
             let dist = ((got.l - expected.l).powi(2)
                 + (got.a - expected.a).powi(2)
@@ -288,5 +352,96 @@ mod tests {
         let surface = ColorSurface::new(&cfg).unwrap();
         let c = surface.sample(0.5, 0.5);
         assert!(c.l.is_finite() && c.a.is_finite() && c.b.is_finite(), "produced {c:?}");
+    }
+
+    /// The shipped palette predates opacity and must still be fully opaque, or
+    /// adding the channel would have quietly changed what everyone's strip does.
+    #[test]
+    fn the_default_palette_is_opaque_everywhere() {
+        let surface = default_surface();
+        for i in 0..=16 {
+            for j in 0..=16 {
+                let alpha = surface.sample(i as f32 / 16.0, j as f32 / 16.0).alpha;
+                assert!(close(alpha, 1.0), "({i}, {j}) sampled at opacity {alpha}");
+            }
+        }
+    }
+
+    /// Opacity has to be a field like colour is: smooth between keyframes, and
+    /// landing near what was authored at each of them.
+    #[test]
+    fn opacity_interpolates_across_the_field() {
+        let cfg = SurfaceConfig {
+            keyframes: vec![
+                Keyframe::new(0.0, 0.5, "#ff2000ff"),
+                Keyframe::new(1.0, 0.5, "#ff200000"),
+            ],
+            sigma: 0.25,
+        };
+        let surface = ColorSurface::new(&cfg).unwrap();
+
+        assert!(surface.sample(0.0, 0.5).alpha > 0.9, "the opaque end faded");
+        assert!(surface.sample(1.0, 0.5).alpha < 0.1, "the transparent end did not");
+
+        let mut previous = f32::INFINITY;
+        for i in 0..=20 {
+            let alpha = surface.sample(i as f32 / 20.0, 0.5).alpha;
+            assert!((0.0..=1.0).contains(&alpha), "opacity left 0..1 at x={i}: {alpha}");
+            assert!(alpha <= previous + 1e-4, "opacity rose again at x={i}");
+            previous = alpha;
+        }
+    }
+
+    /// The bug alpha-weighted blending exists to prevent: an invisible keyframe
+    /// must not tint the colours around it. A user fading a green keyframe out
+    /// expects the green to leave, not to linger as a wash over its neighbours.
+    #[test]
+    fn a_transparent_keyframe_lends_no_colour() {
+        let with_ghost = ColorSurface::new(&SurfaceConfig {
+            keyframes: vec![
+                Keyframe::new(0.0, 0.5, "#ff2000"),
+                Keyframe::new(0.4, 0.5, "#00ff0000"),
+            ],
+            sigma: 0.25,
+        })
+        .unwrap();
+        let without = ColorSurface::new(&SurfaceConfig {
+            keyframes: vec![Keyframe::new(0.0, 0.5, "#ff2000")],
+            sigma: 0.25,
+        })
+        .unwrap();
+
+        for i in 0..=10 {
+            let x = i as f32 / 10.0;
+            let (ghost, plain) = (with_ghost.sample(x, 0.5), without.sample(x, 0.5));
+            assert!(
+                close(ghost.l, plain.l) && close(ghost.a, plain.a) && close(ghost.b, plain.b),
+                "the invisible keyframe changed the colour at x={x}: {ghost:?} vs {plain:?}"
+            );
+        }
+
+        // It must still make the field *fade*, though — it is transparent, not
+        // absent, and pulling opacity down is exactly what it is there to do.
+        assert!(with_ghost.sample(0.4, 0.5).alpha < 0.6, "the field did not fade toward it");
+    }
+
+    /// A field with nothing visible in it must stay finite rather than dividing
+    /// by an opacity of zero.
+    #[test]
+    fn a_fully_transparent_field_is_harmless() {
+        let surface = ColorSurface::new(&SurfaceConfig {
+            keyframes: vec![
+                Keyframe::new(0.0, 0.0, "#ff200000"),
+                Keyframe::new(1.0, 1.0, "#40c0ff00"),
+            ],
+            sigma: 0.25,
+        })
+        .unwrap();
+
+        for i in 0..=8 {
+            let c = surface.sample(i as f32 / 8.0, 0.5);
+            assert!(c.l.is_finite() && c.a.is_finite() && c.b.is_finite(), "produced {c:?}");
+            assert!(close(c.alpha, 0.0), "opacity should be zero, got {}", c.alpha);
+        }
     }
 }

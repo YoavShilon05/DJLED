@@ -122,16 +122,31 @@ impl Renderer {
             let mut rgb = lab.to_linear_rgb().clamped();
 
             if trim {
-                rgb = LinearRgb::new(
+                rgb = LinearRgb::with_alpha(
                     rgb.r.powf(self.cfg.gamma),
                     rgb.g.powf(self.cfg.gamma),
                     rgb.b.powf(self.cfg.gamma),
+                    // Opacity is coverage, not light, so the gamma trim has no
+                    // business touching it.
+                    rgb.alpha,
                 );
             }
+
+            // Composite the surface onto the unlit strip. There is one layer
+            // today, so this is the whole stack and the backdrop is simply
+            // black — which reduces to scaling the colour by its opacity. When
+            // layers land, this is the fold that gains more terms; nothing else
+            // in this loop changes.
+            let rgb = rgb.over(LinearRgb::BLACK);
 
             // The intensity curve and the master both scale linear light, which
             // is where a brightness belongs: the LED is driven linearly, so
             // halving the byte really does halve the light.
+            //
+            // Note this is deliberately not folded into opacity. A quiet band is
+            // currently *dark*, not *transparent*, and which of those it should
+            // be over a lower layer is a question for the stacking work — over
+            // black they are indistinguishable, so nothing is decided here.
             let scale = 255.0 * master * point.gain.clamp(0.0, 1.0);
             let channels = [rgb.r * scale, rgb.g * scale, rgb.b * scale];
 
@@ -163,6 +178,7 @@ mod tests {
     use super::*;
 
     use super::super::strip::norm_to_hz;
+    use super::super::surface::Keyframe;
 
     const BANDS: usize = 48;
 
@@ -173,16 +189,33 @@ mod tests {
     }
 
     fn renderer_with(cfg: RenderConfig, intensity: IntensityConfig) -> Renderer {
+        renderer_for(cfg, intensity, &SurfaceConfig::default())
+    }
+
+    fn renderer_for(
+        cfg: RenderConfig,
+        intensity: IntensityConfig,
+        surface: &SurfaceConfig,
+    ) -> Renderer {
         let centers: Vec<f32> =
             (0..BANDS).map(|i| norm_to_hz(i as f32 / (BANDS - 1) as f32)).collect();
         Renderer::new(
             cfg,
-            &SurfaceConfig::default(),
+            surface,
             LayoutConfig::spanning(150),
             intensity,
             Geometry { centers, points: BANDS, leds: 150 },
         )
         .unwrap()
+    }
+
+    /// One colour everywhere, so a render measures the colour pipeline and
+    /// nothing about the shape of the field.
+    fn flat_surface(color: &str) -> SurfaceConfig {
+        SurfaceConfig {
+            keyframes: vec![Keyframe::new(0.0, 0.0, color), Keyframe::new(1.0, 1.0, color)],
+            sigma: 0.5,
+        }
     }
 
     #[test]
@@ -312,6 +345,74 @@ mod tests {
         assert_ne!(a, b, "reverse changed nothing");
         for (i, px) in b.iter().enumerate() {
             assert_eq!(px, &a[BANDS - 1 - i], "point {i} is not the mirror of the forward render");
+        }
+    }
+
+    /// Opacity has to survive all the way to the wire rather than being computed
+    /// and dropped. Over the unlit strip it composites down to a scaling of the
+    /// light, which is what makes it measurable end to end today — the case
+    /// where it stops being a scaling is the one layer stacking will add.
+    #[test]
+    fn opacity_reaches_the_output() {
+        let cfg = RenderConfig { dither: false, ..Default::default() };
+        let render = |color: &str| {
+            renderer_for(cfg.clone(), IntensityConfig::pass_through(), &flat_surface(color))
+                .render(&[1.0; BANDS])
+                .to_vec()
+        };
+
+        let opaque = render("#40ff60");
+        let half = render("#40ff6080");
+        let clear = render("#40ff6000");
+
+        assert!(opaque.iter().any(|px| px.iter().any(|&c| c > 128)), "the opaque case is not lit");
+
+        for (i, px) in half.iter().enumerate() {
+            for c in 0..3 {
+                let want = opaque[i][c] as f32 * (128.0 / 255.0);
+                assert!(
+                    (px[c] as f32 - want).abs() <= 1.5,
+                    "point {i} channel {c}: half opacity gave {}, expected about {want}",
+                    px[c]
+                );
+            }
+        }
+
+        assert!(
+            clear.iter().all(|px| px == &[0, 0, 0]),
+            "a fully transparent surface still lit the strip"
+        );
+    }
+
+    /// The colour a translucent keyframe carries must not depend on its opacity,
+    /// so opening one back up returns the colour that was authored rather than
+    /// something that has been dragged toward black on the way.
+    #[test]
+    fn opacity_does_not_change_the_hue_on_the_wire() {
+        let cfg = RenderConfig { dither: false, ..Default::default() };
+        let render = |color: &str| {
+            renderer_for(cfg.clone(), IntensityConfig::pass_through(), &flat_surface(color))
+                .render(&[1.0; BANDS])
+                .to_vec()
+        };
+
+        let opaque = render("#40ff60");
+        let faded = render("#40ff6040");
+
+        // Compare hue as channel ratios, which is what a scaling leaves alone.
+        for (i, px) in faded.iter().enumerate() {
+            let (a, b) = (px[1] as f32, opaque[i][1] as f32);
+            if b < 16.0 {
+                continue;
+            }
+            for c in [0usize, 2] {
+                let ratio = px[c] as f32 / a.max(1.0);
+                let want = opaque[i][c] as f32 / b;
+                assert!(
+                    (ratio - want).abs() < 0.05,
+                    "point {i} channel {c}: hue shifted from {want} to {ratio}"
+                );
+            }
         }
     }
 

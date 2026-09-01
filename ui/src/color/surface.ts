@@ -11,6 +11,9 @@
  * overshoots and goes ill-conditioned; inverse-distance weighting leaves a flat
  * plateau at every control point.
  *
+ * Keyframes carry opacity as well as colour, so the field is four channels. The
+ * two are not interpolated the same way — see {@link ColorSurface.sample}.
+ *
  * Must stay numerically identical to the Rust, or the editor previews something
  * the strip will not do.
  */
@@ -20,7 +23,7 @@ import { hexToOklab, type Oklab } from "./oklab";
 export interface Keyframe {
   x: number;
   y: number;
-  /** sRGB hex, e.g. "#ff2000". */
+  /** sRGB hex, either "#ff2000" or "#ff2000cc" with an opacity byte. */
   color: string;
 }
 
@@ -62,13 +65,24 @@ export class ColorSurface {
     this.falloff = 1 / (2 * sigma * sigma);
   }
 
+  /**
+   * Colour and opacity at a point in the unit square.
+   *
+   * Opacity interpolates on the plain Gaussian weights, so it is a smooth field
+   * for the same reasons colour is. Colour, though, is weighted by `w · α`: a
+   * fully transparent keyframe has to pull the result toward *transparent*, not
+   * toward its own invisible colour. Weighting colour by `w` alone would let an
+   * invisible green keyframe tint everything near it.
+   */
   sample(x: number, y: number): Oklab {
-    if (this.points.length === 0) return { l: 0, a: 0, b: 0 };
+    if (this.points.length === 0) return { l: 0, a: 0, b: 0, alpha: 0 };
 
     x = x < 0 ? 0 : x > 1 ? 1 : x;
     y = y < 0 ? 0 : y > 1 ? 1 : y;
 
-    let total = 0;
+    // `weight` normalises opacity; `cover` normalises colour.
+    let weight = 0;
+    let cover = 0;
     let l = 0;
     let a = 0;
     let b = 0;
@@ -86,18 +100,26 @@ export class ColorSurface {
       }
 
       const w = Math.exp(-d2 * this.falloff);
-      total += w;
-      l += w * p.color.l;
-      a += w * p.color.a;
-      b += w * p.color.b;
+      const wa = w * p.color.alpha;
+      weight += w;
+      cover += wa;
+      l += wa * p.color.l;
+      a += wa * p.color.a;
+      b += wa * p.color.b;
     }
 
     // With a small sigma and a point far from every keyframe, every weight can
     // underflow to zero. Falling back to the nearest keeps the field defined
     // everywhere rather than punching a black hole in it.
-    if (total <= Number.MIN_VALUE) return this.points[nearest].color;
+    if (weight <= Number.MIN_VALUE) return this.points[nearest].color;
 
-    return { l: l / total, a: a / total, b: b / total };
+    const alpha = cover / weight;
+
+    // Every keyframe within reach is fully transparent, so there is no colour to
+    // average — only the absence of one.
+    if (cover <= Number.MIN_VALUE) return { l: 0, a: 0, b: 0, alpha };
+
+    return { l: l / cover, a: a / cover, b: b / cover, alpha };
   }
 }
 

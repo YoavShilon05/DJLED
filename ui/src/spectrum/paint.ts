@@ -9,7 +9,7 @@
  * preview rather than a decoration.
  */
 
-import { oklabToDisplay } from "../color/display";
+import { oklabToDisplayRgba } from "../color/display";
 import { ColorSurface, type SurfaceConfig } from "../color/surface";
 import { DB_MAX, DB_MIN, DB_TICKS, FREQ_SUBTICKS, FREQ_TICKS } from "../config/scales";
 import type { PlotPalette } from "../theme";
@@ -72,12 +72,15 @@ export class ColorField {
       // Image rows run top-down; the surface's y runs bottom-up.
       const y = 1 - py / (FIELD_H - 1);
       for (let px = 0; px < FIELD_W; px++) {
-        const [r, g, b] = oklabToDisplay(compiled.sample(px / (FIELD_W - 1), y));
+        // Kept translucent rather than composited onto black: the field is drawn
+        // over the plot, so a faded region should read as the plot showing
+        // through, which is what it will do over a layer below it.
+        const [r, g, b, a] = oklabToDisplayRgba(compiled.sample(px / (FIELD_W - 1), y));
         const i = (py * FIELD_W + px) * 4;
         data[i] = r;
         data[i + 1] = g;
         data[i + 2] = b;
-        data[i + 3] = 255;
+        data[i + 3] = a;
       }
     }
 

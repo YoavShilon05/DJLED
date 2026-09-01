@@ -245,6 +245,20 @@ linear in the byte value and Oklab's lightness is already perceptual, so
 `Oklab → linear RGB → byte` is complete. The usual reason people add gamma is
 that they started from an sRGB value and drove the LED with it directly.
 
+Every colour carries opacity as a fourth channel, authored as `#rrggbbaa` (six
+digits still means opaque, so older presets load unchanged). With one layer
+composited onto an unlit strip that reads as a dimming — `#ff0000` at half
+opacity and `#800000` reach the LEDs as the same bytes — but that is a property
+of the backdrop being black, and it ends when layers stack: over a blue layer the
+first shows purple and the second still shows dark red. Two rules make that work
+rather than merely look like it does:
+
+- Colour is stored **un-premultiplied**, so a hue means the same thing at any
+  opacity and fading a keyframe out and back in returns what was authored.
+- Blending weights colour by `w · α` while weighting opacity by `w` alone.
+  Without that asymmetry an invisible keyframe would tint its neighbours with a
+  colour nobody can see.
+
 The UI reimplements this in TypeScript to preview without a round trip.
 `ui/src/color/reference.json` is generated from the Rust and asserted by tests on
 **both** sides, so a divergence fails a test rather than making the editor lie:

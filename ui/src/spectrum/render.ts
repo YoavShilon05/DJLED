@@ -141,6 +141,9 @@ export function renderStrip(
     const gain = brightnessFor(config, level) * masterBrightness;
     // The surface's y is the same normalised level the plot's dB axis shows,
     // so a band is coloured by exactly the field pixel its bar reaches.
+    //
+    // `oklabToDisplay` composites onto black, which is what an unlit LED is and
+    // so is the whole stack today. When layers land this is where the fold goes.
     out[i] = gain <= 0 ? BLACK : oklabToDisplay(surface.sample(hzToNorm(hz), level), gain);
   }
   return out;
