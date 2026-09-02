@@ -16,3 +16,4 @@ yarn-error.log*
 # UI
 /ui/node_modules
 /ui/dist
+.idea
