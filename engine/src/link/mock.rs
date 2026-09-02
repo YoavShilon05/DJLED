@@ -18,6 +18,7 @@ pub struct MockLink {
     last_frame_bytes: usize,
     frames: u64,
     scratch: Vec<u8>,
+    max_points: usize,
 }
 
 impl MockLink {
@@ -27,7 +28,20 @@ impl MockLink {
             last_frame_bytes: 0,
             frames: 0,
             scratch: Vec::new(),
+            max_points: protocol::max_bands(),
         }
+    }
+
+    /// A mock that refuses frames past `max_points`, standing in for a board
+    /// whose firmware was built with a smaller `MAX_BANDS`.
+    ///
+    /// Worth being able to model, because the real failure is invisible: the
+    /// firmware stops reading a frame longer than its buffer and has nothing to
+    /// answer with, so the strip goes dark while the spectrum, the preview and
+    /// the terminal display all stay perfectly correct. Here it is a loud error
+    /// instead.
+    pub fn with_max_points(led_count: usize, max_points: usize) -> Self {
+        Self { max_points, ..Self::new(led_count) }
     }
 
     /// The strip as the firmware would drive it.
@@ -81,9 +95,20 @@ impl Link for MockLink {
         format!("mock link — {} LEDs, nothing is driven", self.leds.len())
     }
 
+    fn max_points(&self) -> usize {
+        self.max_points
+    }
+
     fn send(&mut self, bands: &[[u8; 3]]) -> Result<bool> {
-        // Encode for real so framing limits are enforced here too; a band count
-        // the protocol cannot carry must fail with or without hardware.
+        // Both limits are enforced here, so a frame no real destination would
+        // accept fails with or without hardware attached.
+        if bands.len() > self.max_points {
+            anyhow::bail!(
+                "{} colours is past this link's {} — the frame would be dropped unread",
+                bands.len(),
+                self.max_points
+            );
+        }
         protocol::encode_band_rgb(bands, &mut self.scratch).map_err(anyhow::Error::msg)?;
         self.last_frame_bytes = self.scratch.len();
 

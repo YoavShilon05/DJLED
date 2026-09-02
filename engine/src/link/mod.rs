@@ -26,6 +26,22 @@ pub trait Link {
     /// the display is better off skipping than queueing stale data.
     fn send(&mut self, bands: &[[u8; 3]]) -> Result<bool>;
 
+    /// Most colours this destination will accept in one frame.
+    ///
+    /// Deliberately asked rather than assumed. The protocol's length byte
+    /// allows 85 colours, but the firmware sizes its payload buffer from its
+    /// own `MAX_BANDS` and drops anything longer — and it drops it *silently*,
+    /// because a frame it never finished reading is one it cannot answer. The
+    /// symptom is a dark strip with a correct spectrum, a correct preview and a
+    /// correct terminal display, since none of those cross the wire.
+    ///
+    /// So the handshake carries the real limit and this is how it reaches the
+    /// geometry. The default is the protocol ceiling, for links that have no
+    /// firmware to be constrained by.
+    fn max_points(&self) -> usize {
+        protocol::max_bands()
+    }
+
     /// Display a diagnostic pattern. Not all links support every pattern.
     fn send_test(&mut self, _pattern: TestPattern) -> Result<()> {
         Ok(())

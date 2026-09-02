@@ -7,9 +7,10 @@
  */
 
 import { DEFAULT_SURFACE, type SurfaceConfig } from "../color/surface";
-import type { ShowConfig } from "../engine";
+import type { MidiConfig, ShowConfig } from "../engine";
 import type { CurveConfig } from "./curve";
 import type { EqBand } from "./eq";
+import { DEFAULT_HIGH_NOTE, DEFAULT_LOW_NOTE, noteRange } from "./notes";
 import { DB_MAX, DB_MIN, dbToNorm, hzToNorm, normToDb, normToHz } from "./scales";
 
 /** A colour authored at a point on the spectrum plot. */
@@ -65,6 +66,10 @@ export interface EditorConfig {
   decay: number;
   /** Samples captured before each transform. */
   sampleLength: number;
+  /** How MIDI notes land on the axis. Held here rather than beside the source
+   *  selection because it is authored, not discovered — it belongs to the look
+   *  and survives switching to audio and back. */
+  midi: MidiConfig;
   /** Reach of each colour keyframe's influence — the surface's sigma. */
   blend: number;
   gizmos: GizmoFlags;
@@ -113,6 +118,9 @@ export const DEFAULT_CONFIG: EditorConfig = {
   // immediately push a change and rebuild the analyser.
   decay: 0.82,
   sampleLength: 256,
+  // An 88-key piano, stretched across the whole strip, with a semitone of glow
+  // either side of each note. Matches the engine's own defaults.
+  midi: { lowNote: DEFAULT_LOW_NOTE, highNote: DEFAULT_HIGH_NOTE, spread: 1, sustain: true },
   blend: DEFAULT_SURFACE.sigma,
   gizmos: { thresholds: true, colorKeyframes: true, ledKeyframes: true, curve: true, eq: true },
 };
@@ -145,6 +153,7 @@ export function toEngineConfig(config: EditorConfig): ShowConfig {
     curve: config.curve,
     decay: config.decay,
     sampleLength: config.sampleLength,
+    midi: config.midi,
   };
 }
 
@@ -170,6 +179,7 @@ export function fromEngineConfig(config: EditorConfig, show: ShowConfig): Editor
     curve: show.curve,
     decay: show.decay,
     sampleLength: show.sampleLength,
+    midi: { ...DEFAULT_CONFIG.midi, ...show.midi },
   };
 }
 
@@ -198,6 +208,7 @@ export function loadConfig(): EditorConfig {
       gizmos: { ...DEFAULT_CONFIG.gizmos, ...parsed.gizmos },
       threshold: clampDb(parsed.threshold, DEFAULT_CONFIG.threshold),
       clamp: clampDb(parsed.clamp, DEFAULT_CONFIG.clamp),
+      midi: sanitiseMidi(parsed.midi),
     };
   } catch {
     return DEFAULT_CONFIG;
@@ -218,6 +229,21 @@ export function clearConfig(): void {
 
 export function hasStoredConfig(): boolean {
   return localStorage.getItem(STORAGE_KEY) !== null;
+}
+
+/**
+ * A stored MIDI section, made safe to draw with.
+ *
+ * The range goes through the same clamp the engine applies, so the editor never
+ * draws an axis the strip is not using — an inverted or one-note range would
+ * otherwise render as a divide by zero rather than as the octave the engine
+ * quietly widened it to.
+ */
+function sanitiseMidi(stored: Partial<MidiConfig> | undefined): MidiConfig {
+  const merged = { ...DEFAULT_CONFIG.midi, ...stored };
+  const [lowNote, highNote] = noteRange(merged.lowNote, merged.highNote);
+  const spread = Number.isFinite(merged.spread) ? Math.min(12, Math.max(0, merged.spread)) : 1;
+  return { lowNote, highNote, spread, sustain: merged.sustain !== false };
 }
 
 function clampDb(value: unknown, fallback: number): number {

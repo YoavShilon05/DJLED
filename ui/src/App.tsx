@@ -27,6 +27,7 @@ import {
 } from "./config/editor";
 import { DEFAULT_SAMPLE_RATE, EqCurve } from "./config/eq";
 import { GizmoPanel } from "./components/GizmoPanel";
+import { MidiPanel } from "./components/MidiPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { SourcePanel } from "./components/SourcePanel";
 import { StripPreview } from "./components/StripPreview";
@@ -34,11 +35,13 @@ import {
   DEFAULT_URL,
   EngineClient,
   decodeStrip,
-  type AudioSource,
-  type AudioState,
   type Frame,
+  type InputSource,
+  type InputState,
+  type SourceKind,
   type Status,
 } from "./engine";
+import { FREQUENCY_AXIS, noteAxis } from "./spectrum/axis";
 import { SpectrumEditor } from "./spectrum/SpectrumEditor";
 import type { SpectrumFrame } from "./spectrum/paint";
 import { applyEq, renderStrip } from "./spectrum/render";
@@ -56,7 +59,7 @@ export default function App() {
   const [brightness, setBrightness] = useState(1);
   const [ledCount, setLedCount] = useState(150);
   const [dbSpan, setDbSpan] = useState(DEFAULT_DB_SPAN);
-  const [audio, setAudio] = useState<AudioState | null>(null);
+  const [input, setInput] = useState<InputState | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const clientRef = useRef<EngineClient | null>(null);
@@ -65,9 +68,9 @@ export default function App() {
     const client = new EngineClient(DEFAULT_URL, {
       onStatus: (next) => {
         setStatus(next);
-        // Nothing is being captured while the engine is away, and leaving the
-        // last device on screen would invite selecting one into the void.
-        if (next !== "connected") setAudio(null);
+        // Nothing is being listened to while the engine is away, and leaving
+        // the last device on screen would invite selecting one into the void.
+        if (next !== "connected") setInput(null);
       },
       onFrame: setFrame,
       onError: setError,
@@ -77,7 +80,7 @@ export default function App() {
         setDbSpan(Math.max(1, state.dbCeil - state.dbFloor));
         // Unlike the rest of the state, this is not an echo of something
         // authored here: it is the engine reporting what it managed to open.
-        setAudio(state.audio);
+        setInput(state.input);
         // The engine's config is authoritative on first connect, but only if
         // nothing has been authored here — otherwise a reconnect would throw
         // away unsaved edits.
@@ -109,7 +112,7 @@ export default function App() {
   // Deliberately not optimistic: whether a device opens is the engine's to
   // answer, and showing a selection that failed would be a lie the size of a
   // silent strip. The panel updates when the engine says it switched.
-  const applySource = useCallback((source: AudioSource) => {
+  const applySource = useCallback((source: InputSource) => {
     clientRef.current?.setSource(source);
   }, []);
 
@@ -123,6 +126,15 @@ export default function App() {
   const captured = live ?? demo;
 
   const sampleRate = frame?.sampleRate || DEFAULT_SAMPLE_RATE;
+
+  // MIDI stretches a note range across the same axis, so the marks stay where
+  // they are and only their names change. Frequencies while offline: with
+  // nothing connected there is no note range in force to label against.
+  const midi = input?.kind === "midi";
+  const axis = useMemo(
+    () => (midi ? noteAxis(config.midi.lowNote, config.midi.highNote) : FREQUENCY_AXIS),
+    [midi, config.midi.lowNote, config.midi.highNote],
+  );
 
   // Live levels arrive with the EQ already in them — the engine applies it
   // between the AGC and the range map. Applying it again here would double it,
@@ -154,7 +166,12 @@ export default function App() {
             <Title order={1} size="h4" tt="uppercase" lts="0.12em">
               DJLED
             </Title>
-            <StatusBadge status={status} frame={frame} ledCount={ledCount} />
+            <StatusBadge
+            status={status}
+            frame={frame}
+            ledCount={ledCount}
+            kind={input?.kind ?? null}
+          />
           </Group>
           <Button
             variant="default"
@@ -175,7 +192,12 @@ export default function App() {
 
         <Flex gap="md" align="flex-start" direction={{ base: "column", md: "row" }}>
           <Stack gap="md" w={{ base: "100%", md: 280 }} style={{ flexShrink: 0 }}>
-            <SourcePanel audio={audio} onSource={applySource} onRefresh={refreshSources} />
+            <SourcePanel
+              input={input}
+              outOfRange={live ? (frame?.notesOutOfRange ?? 0) : 0}
+              onSource={applySource}
+              onRefresh={refreshSources}
+            />
             <SettingsPanel
               config={config}
               onChange={applyConfig}
@@ -183,6 +205,7 @@ export default function App() {
               onBrightness={applyBrightness}
               sampleRate={frame?.sampleRate ?? 0}
             />
+            <MidiPanel config={config} onChange={applyConfig} live={midi} />
             <GizmoPanel config={config} onChange={applyConfig} />
           </Stack>
 
@@ -192,6 +215,7 @@ export default function App() {
                 config={config}
                 onChange={applyConfig}
                 frame={spectrum}
+                axis={axis}
                 ledCount={ledCount}
                 sampleRate={sampleRate}
               />
@@ -235,13 +259,22 @@ function StatusBadge({
   status,
   frame,
   ledCount,
+  kind,
 }: {
   status: Status;
   frame: Frame | null;
   ledCount: number;
+  kind: SourceKind | null;
 }) {
   if (status === "connected") {
-    const rate = frame?.sampleRate ? `${(frame.sampleRate / 1000).toFixed(1)} kHz` : "live";
+    // MIDI has no sample rate, so the badge names the source instead of
+    // showing the "0.0 kHz" the field would otherwise read as.
+    const rate =
+      kind === "midi"
+        ? "MIDI"
+        : frame?.sampleRate
+          ? `${(frame.sampleRate / 1000).toFixed(1)} kHz`
+          : "live";
     return <Badge color="teal">{`${rate} · ${ledCount} LEDs`}</Badge>;
   }
   if (status === "connecting") return <Badge color="gray">connecting…</Badge>;

@@ -11,8 +11,9 @@
 
 import { oklabToDisplayRgba } from "../color/display";
 import { ColorSurface, type SurfaceConfig } from "../color/surface";
-import { DB_MAX, DB_MIN, DB_TICKS, FREQ_SUBTICKS, FREQ_TICKS } from "../config/scales";
+import { DB_MAX, DB_MIN, DB_TICKS } from "../config/scales";
 import type { PlotPalette } from "../theme";
+import type { AxisScale } from "./axis";
 import { bandEdges, xOfHz, yOfDb, type PlotLayout } from "./layout";
 
 /** The field is smooth by construction, so it is sampled coarse and upscaled. */
@@ -95,6 +96,7 @@ export function paintPlot(
   field: HTMLCanvasElement,
   frame: SpectrumFrame,
   palette: PlotPalette,
+  axis: AxisScale,
 ): void {
   const { plot } = l;
   ctx.clearRect(0, 0, l.width, l.height);
@@ -119,7 +121,7 @@ export function paintPlot(
     ctx.fill(bars.caps);
   }
 
-  paintGrid(ctx, l, palette);
+  paintGrid(ctx, l, palette, axis);
   ctx.restore();
 
   ctx.strokeStyle = palette.frame;
@@ -155,13 +157,18 @@ function spectrumPath(l: PlotLayout, frame: SpectrumFrame): Bars | null {
   return { area, caps };
 }
 
-function paintGrid(ctx: CanvasRenderingContext2D, l: PlotLayout, palette: PlotPalette): void {
+function paintGrid(
+  ctx: CanvasRenderingContext2D,
+  l: PlotLayout,
+  palette: PlotPalette,
+  axis: AxisScale,
+): void {
   const { plot } = l;
   ctx.lineWidth = 1;
 
   ctx.strokeStyle = palette.grid;
   ctx.beginPath();
-  for (const hz of FREQ_SUBTICKS) {
+  for (const hz of axis.subticks) {
     const x = Math.round(xOfHz(l, hz)) + 0.5;
     ctx.moveTo(x, plot.y);
     ctx.lineTo(x, plot.y + plot.h);
@@ -170,7 +177,7 @@ function paintGrid(ctx: CanvasRenderingContext2D, l: PlotLayout, palette: PlotPa
 
   ctx.strokeStyle = palette.gridStrong;
   ctx.beginPath();
-  for (const hz of FREQ_TICKS) {
+  for (const { hz } of axis.ticks) {
     const x = Math.round(xOfHz(l, hz)) + 0.5;
     ctx.moveTo(x, plot.y);
     ctx.lineTo(x, plot.y + plot.h);

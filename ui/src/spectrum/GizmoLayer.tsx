@@ -1,8 +1,9 @@
 import { memo, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 
 import type { EditorConfig } from "../config/editor";
-import { DB_TICKS, FREQ_TICKS, formatHz } from "../config/scales";
+import { DB_TICKS } from "../config/scales";
 import type { PlotPalette } from "../theme";
+import type { AxisScale } from "./axis";
 import { CurveGizmo } from "./CurveGizmo";
 import { EqGizmo } from "./EqGizmo";
 import { curveBox, railLaneX, xOfHz, yOfDb, type PlotLayout } from "./layout";
@@ -34,6 +35,9 @@ interface Props {
   layout: PlotLayout;
   config: EditorConfig;
   palette: PlotPalette;
+  /** What the horizontal marks are called — frequencies, or notes when MIDI is
+   *  driving the strip. The positions are the same either way. */
+  axis: AxisScale;
   sampleRate: number;
   selected: GizmoTarget | null;
   active: GizmoTarget | null;
@@ -63,6 +67,7 @@ export const GizmoLayer = memo(function GizmoLayer({
   layout,
   config,
   palette,
+  axis,
   sampleRate,
   selected,
   active,
@@ -72,7 +77,9 @@ export const GizmoLayer = memo(function GizmoLayer({
   onAddEq,
   onClearSelection,
 }: Props) {
-  const { plot, gutter, axis, track } = layout;
+  // Renamed on the way out of the layout: `axis` is the scale prop, and the
+  // two would shadow each other.
+  const { plot, gutter, axis: axisRect, track } = layout;
   const { gizmos } = config;
 
   const thresholdY = yOfDb(layout, config.threshold);
@@ -267,25 +274,25 @@ export const GizmoLayer = memo(function GizmoLayer({
 
       <text
         x={gutter.w - 9}
-        y={axis.y + 18}
+        y={axisRect.y + 18}
         textAnchor="end"
         fontSize={9}
         fill={palette.tick}
         fontFamily={MONO}
       >
-        Hz
+        {axis.unit}
       </text>
-      {FREQ_TICKS.map((hz) => (
+      {axis.ticks.map((tick) => (
         <text
-          key={hz}
-          x={xOfHz(layout, hz)}
-          y={axis.y + 18}
+          key={tick.label}
+          x={xOfHz(layout, tick.hz)}
+          y={axisRect.y + 18}
           textAnchor="middle"
           fontSize={10}
           fill={palette.tick}
           fontFamily={MONO}
         >
-          {formatHz(hz)}
+          {tick.label}
         </text>
       ))}
 

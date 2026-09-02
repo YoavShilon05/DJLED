@@ -276,7 +276,11 @@ impl PostProcessor {
 
 /// Release-time multiplier for a per-frame retention, relative to the tuned
 /// default. 1.0 at [`REFERENCE_DECAY`] by construction.
-fn decay_scale(decay: f32) -> f32 {
+/// The editor's decay control as a multiplier on a release time.
+///
+/// Shared with the MIDI note release, so that one slider means one thing in
+/// both modes rather than two things that happen to look alike.
+pub(crate) fn decay_scale(decay: f32) -> f32 {
     // tau = -dt/ln(d); dt cancels in the ratio, leaving the log ratio alone.
     let tau_of = |d: f32| -1.0 / d.clamp(1e-4, 0.9999).ln();
     (tau_of(decay) / tau_of(REFERENCE_DECAY)).clamp(0.0, 20.0)

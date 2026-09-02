@@ -37,8 +37,9 @@ import {
   type EqBand,
   type EqType,
 } from "../config/eq";
-import { DB_MAX, DB_MIN, clamp, formatHz, hzToNorm, snapHz } from "../config/scales";
+import { DB_MAX, DB_MIN, clamp, hzToNorm, snapHz } from "../config/scales";
 import { SpectrumCanvas } from "./SpectrumCanvas";
+import type { AxisScale } from "./axis";
 import { GizmoLayer, type GizmoTarget } from "./GizmoLayer";
 import {
   computeLayout,
@@ -65,6 +66,9 @@ interface Props {
   config: EditorConfig;
   onChange: (config: EditorConfig) => void;
   frame: SpectrumFrame;
+  /** What the horizontal marks are called. The axis and every gizmo on it stay
+   *  in Hz; only the labels change when MIDI is driving the strip. */
+  axis: AxisScale;
   ledCount: number;
   sampleRate: number;
 }
@@ -76,7 +80,14 @@ interface Grab {
   dy: number;
 }
 
-export function SpectrumEditor({ config, onChange, frame, ledCount, sampleRate }: Props) {
+export function SpectrumEditor({
+  config,
+  onChange,
+  frame,
+  axis,
+  ledCount,
+  sampleRate,
+}: Props) {
   const theme = useMantineTheme();
   const palette = theme.other.plot;
 
@@ -230,11 +241,12 @@ export function SpectrumEditor({ config, onChange, frame, ledCount, sampleRate }
       ref={containerRef}
       style={{ position: "relative", width: "100%", height: layout.height }}
     >
-      <SpectrumCanvas layout={layout} surface={surface} frame={frame} />
+      <SpectrumCanvas layout={layout} surface={surface} frame={frame} axis={axis} />
       <GizmoLayer
         layout={layout}
         config={config}
         palette={palette}
+        axis={axis}
         sampleRate={sampleRate}
         selected={selected}
         active={grab?.target ?? null}
@@ -270,7 +282,7 @@ export function SpectrumEditor({ config, onChange, frame, ledCount, sampleRate }
                 <Group gap={6}>
                   <ColorSwatch color={selectedColor.color} size={16} />
                   <Text size="xs" ff="monospace">
-                    {formatHz(selectedColor.hz)} Hz · {selectedColor.db.toFixed(0)} dB
+                    {axis.format(selectedColor.hz)} · {selectedColor.db.toFixed(0)} dB
                     {/* Only when it is not fully opaque, so the common case
                         stays uncluttered and a faded keyframe stands out. */}
                     {opacityOf(selectedColor.color) < 1 &&

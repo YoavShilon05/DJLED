@@ -9,13 +9,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 
-use djled_engine::capture::{self, Capture, Source};
 use djled_engine::color::{Geometry, RenderConfig, Renderer};
 use djled_engine::link::protocol::TestPattern;
 use djled_engine::link::serial::DEFAULT_BAUD;
 use djled_engine::link::{expand_bands_to_leds, Link, MockLink, SerialLink};
-use djled_engine::ui::{encode_strip, AudioState, Command, State, UiServer};
-use djled_engine::{Engine, EngineConfig, ShowConfig};
+use djled_engine::source::{self, LiveSource, Source, SourceKind};
+use djled_engine::ui::{encode_strip, Command, InputState, State, UiServer};
+use djled_engine::{EngineConfig, ShowConfig};
 
 const BAR_HEIGHT: usize = 20;
 const TARGET_FPS: u64 = 60;
@@ -26,7 +26,7 @@ const TARGET_FPS: u64 = 60;
 const CAPTURE_BUFFER_SECS: f32 = 0.25;
 
 #[derive(Parser, Debug)]
-#[command(about = "Audio-reactive LED wall engine", version)]
+#[command(about = "Audio- and MIDI-reactive LED wall engine", version)]
 struct Args {
     /// Serial port to drive, e.g. COM3. Omit to run without hardware.
     #[arg(long)]
@@ -39,7 +39,8 @@ struct Args {
     #[arg(long, default_value_t = 150)]
     leds: usize,
 
-    /// Frequency bands, and therefore colours sent per frame.
+    /// Frequency bands, and therefore colours sent per frame. Audio only — a
+    /// MIDI source has one point per semitone.
     #[arg(long, default_value_t = 48)]
     bands: usize,
 
@@ -47,12 +48,12 @@ struct Args {
     #[arg(long)]
     list_ports: bool,
 
-    /// List audio devices and exit.
+    /// List audio devices and MIDI ports, then exit.
     #[arg(long)]
     list_devices: bool,
 
-    /// What to listen to: a device id from --list-devices, or any unique part of
-    /// a device name. Omit for whatever the PC is playing.
+    /// What to listen to: an id from --list-devices, or any unique part of a
+    /// device name. Omit for whatever the PC is playing.
     #[arg(long, value_name = "DEVICE")]
     source: Option<String>,
 
@@ -62,12 +63,17 @@ struct Args {
     #[arg(long)]
     input: bool,
 
-    /// Analyse a single channel, counting from 1. Omit to mix them all — worth
-    /// setting for an instrument in one input of a stereo interface.
+    /// Listen to MIDI. On its own, the first MIDI input there is; with --source,
+    /// the port whose name matches.
+    #[arg(long)]
+    midi: bool,
+
+    /// Analyse a single channel, counting from 1 — one input of an interface,
+    /// or one MIDI channel. Omit to take them all.
     #[arg(long, value_name = "N")]
     channel: Option<usize>,
 
-    /// Capture for N seconds, report what arrived, and exit.
+    /// Listen for N seconds, report what arrived, and exit.
     #[arg(long, value_name = "SECONDS")]
     probe: Option<f64>,
 
@@ -149,36 +155,24 @@ fn main() -> Result<()> {
         }
     }
 
-    let mut capture = Capture::open(&select_source(&args)?, CAPTURE_BUFFER_SECS)?;
-    let mut cfg = EngineConfig {
+    let base = EngineConfig {
         scale: djled_engine::dsp::bands::BandScaleConfig {
             band_count: args.bands,
             ..Default::default()
         },
         ..Default::default()
     };
-    let mut engine = Engine::new(&cfg, capture.sample_rate());
-
     let show = ShowConfig::spanning(led_count);
-    let mut renderer = Renderer::new(
-        RenderConfig { brightness: args.brightness, ..Default::default() },
-        &show.surface,
-        show.layout(),
-        show.intensity(),
-        Geometry {
-            centers: engine.centers().to_vec(),
-            // One colour per band keeps the wire format exactly as it was; see
-            // `color::strip` for why these are strip positions, not bands.
-            points: engine.band_count(),
-            leds: led_count,
-        },
-    )
-    .map_err(anyhow::Error::msg)?;
+    // What the board says it will take, not what the protocol allows. A frame
+    // over the firmware's own limit is dropped at the MCU without a word.
+    let point_cap = link.max_points();
+    let mut live = LiveSource::open(&select_source(&args)?, &base, &show, CAPTURE_BUFFER_SECS)?;
+    let mut renderer = build_renderer(args.brightness, &show, &live, led_count, point_cap)?;
 
-    print_header(&capture, &engine, link.as_ref(), led_count);
+    print_header(&live, link.as_ref(), led_count, point_cap);
 
     if let Some(secs) = args.probe {
-        return probe(&mut capture, &mut engine, secs);
+        return probe(&mut live, secs);
     }
 
     // The UI is optional by design: the engine is a headless service and
@@ -190,16 +184,16 @@ fn main() -> Result<()> {
             config: show.clone(),
             brightness: args.brightness,
             led_count,
-            band_count: engine.band_count(),
-            db_floor: cfg.post.db_floor,
-            db_ceil: cfg.post.db_ceil,
-            audio: AudioState {
-                devices: capture::devices(),
-                source: capture.source().clone(),
-                device_name: capture.device_name().to_string(),
-                kind: capture.kind(),
-                channels: capture.channels(),
-                sample_rate: capture.sample_rate(),
+            band_count: live.points().min(point_cap),
+            db_floor: base.post.db_floor,
+            db_ceil: base.post.db_ceil,
+            input: InputState {
+                devices: source::devices(),
+                source: live.source().clone(),
+                device_name: live.device_name().to_string(),
+                kind: live.kind(),
+                channels: live.channels(),
+                sample_rate: live.sample_rate(),
                 error: None,
             },
         };
@@ -215,52 +209,86 @@ fn main() -> Result<()> {
         }
     };
 
-    run(
-        &mut capture,
-        &mut engine,
-        &mut cfg,
-        show,
-        &mut renderer,
-        link.as_mut(),
-        led_count,
-        server.as_ref(),
-    )
+    run(&mut live, &base, show, &mut renderer, link.as_mut(), led_count, point_cap, server.as_ref())
 }
 
 /// The source the flags ask for. Named devices are looked up now rather than at
 /// open time so a typo fails with the list of what was meant, not a stream error.
 fn select_source(args: &Args) -> Result<Source> {
-    let mut source = match &args.source {
-        Some(spec) => Source::find(spec, args.input.then_some(capture::SourceKind::Input))?,
-        None if args.input => Source::default_input(),
-        None => Source::default_output(),
+    let kind = if args.midi {
+        Some(SourceKind::Midi)
+    } else if args.input {
+        Some(SourceKind::Input)
+    } else {
+        None
+    };
+
+    let mut source = match (&args.source, kind) {
+        (Some(spec), _) => Source::find(spec, kind)?,
+        (None, Some(SourceKind::Midi)) => Source::default_midi(),
+        (None, Some(SourceKind::Input)) => Source::default_input(),
+        (None, _) => Source::default_output(),
     };
     // 1-based on the command line, 0-based everywhere else: nobody calls the
-    // left input of an interface "channel 0".
+    // left input of an interface "channel 0", and MIDI channels are 1–16 in
+    // every DAW there is.
     source.channel = args.channel.map(|n| n.max(1) - 1);
     Ok(source)
 }
 
+/// Build the renderer for whatever `live` currently produces.
+///
+/// Separated out because a source switch can change the *shape* of what it
+/// produces — 48 bands become 88 semitones — and the renderer is built around
+/// that shape.
+fn build_renderer(
+    brightness: f32,
+    show: &ShowConfig,
+    live: &LiveSource,
+    led_count: usize,
+    point_cap: usize,
+) -> Result<Renderer> {
+    Renderer::new(
+        RenderConfig { brightness, ..Default::default() },
+        &show.surface,
+        show.layout(),
+        show.intensity(),
+        Geometry {
+            centers: live.centers().to_vec(),
+            // See `color::strip` for why these are strip positions rather
+            // than bands. Narrowed to what the link will actually carry: the
+            // renderer resamples across the axis, so fewer points costs a
+            // little spatial resolution, where too many costs every frame.
+            points: live.points().min(point_cap),
+            leds: led_count,
+        },
+    )
+    .map_err(anyhow::Error::msg)
+}
+
 fn list_devices() {
-    let devices = capture::devices();
+    let devices = source::devices();
     if devices.is_empty() {
-        println!("no audio devices found");
+        println!("no audio devices or MIDI ports found");
         return;
     }
 
-    println!("audio devices  (* = system default)\n");
+    println!("sources  (* = system default)\n");
+    let has_midi = devices.iter().any(|d| d.kind == SourceKind::Midi);
     let mut kind = None;
     for device in devices {
         if kind != Some(device.kind) {
             println!("  {}", match device.kind {
-                capture::SourceKind::Loopback => "loopback — what the PC is playing",
-                capture::SourceKind::Input => "input — microphones, line in, interface inputs",
+                SourceKind::Loopback => "loopback — what the PC is playing",
+                SourceKind::Input => "input — microphones, line in, interface inputs",
+                SourceKind::Midi => "midi — keyboards, and virtual cables from a DAW",
             });
             kind = Some(device.kind);
         }
 
-        let format = match (device.channels, device.sample_rate) {
-            (Some(c), Some(r)) => format!("{c} ch @ {r:.0} Hz"),
+        let format = match (device.kind, device.channels, device.sample_rate) {
+            (SourceKind::Midi, _, _) => "16 channels".into(),
+            (_, Some(c), Some(r)) => format!("{c} ch @ {r:.0} Hz"),
             // Nearly always an endpoint something else already holds, which is
             // information rather than a reason to hide it.
             _ => "unavailable — in use by another application?".into(),
@@ -270,7 +298,21 @@ fn list_devices() {
     }
 
     println!("\n  A DAW driving an interface over ASIO owns it outright, so its loopback goes");
-    println!("  silent. Select that interface's input to hear what is plugged into it.");
+    println!("  silent. Select that interface's input to hear what is plugged into it, or");
+    println!("  send it notes instead — see --midi.");
+
+    if !has_midi {
+        // Not a failure — nothing is plugged in and nothing has been set up.
+        // This is where most people meet MIDI here, so it is worth the space.
+        println!("\n  No MIDI inputs. A keyboard appears here as soon as it is plugged in.");
+        println!("  To capture FL Studio's MIDI Out plugin there is one setup step, because");
+        println!("  Windows cannot join a MIDI output to a MIDI input on its own:");
+        println!("    1. install loopMIDI and create a port in it");
+        println!("    2. in FL: Options -> MIDI settings -> Output, enable that port and note");
+        println!("       the port number it is given");
+        println!("    3. set the MIDI Out plugin's Port to that number");
+        println!("  The loopMIDI port then appears above like any other input.");
+    }
 }
 
 fn available_ports_hint(requested: &str) -> String {
@@ -284,16 +326,15 @@ fn available_ports_hint(requested: &str) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn run(
-    capture: &mut Capture,
-    engine: &mut Engine,
-    engine_cfg: &mut EngineConfig,
+    live: &mut LiveSource,
+    base: &EngineConfig,
     mut show: ShowConfig,
     renderer: &mut Renderer,
     link: &mut dyn Link,
     led_count: usize,
+    point_cap: usize,
     server: Option<&UiServer>,
 ) -> Result<()> {
-    let mut buf = vec![0.0f32; 8192];
     let mut leds = vec![[0u8; 3]; led_count];
     let mut last_draw = Instant::now();
     let frame = Duration::from_millis(1000 / TARGET_FPS);
@@ -301,19 +342,17 @@ fn run(
     let mut dropped = 0u64;
     let mut status = String::new();
 
-    let centers: Vec<f32> = engine.centers().to_vec();
-
     // The initial config is applied through the same path an edit takes, so
     // startup cannot diverge from what the editor would produce.
-    apply_show(engine, engine_cfg, renderer, &show, &show, true, capture.sample_rate());
+    live.apply(&show, &show, true);
 
     loop {
         // Before the idle check, not after: a stream that has died delivers
         // nothing at all, so anything gated on samples arriving would never
         // report it. Without this the only symptom is bars that quietly stop.
-        if let Some(fault) = capture.take_fault() {
-            status = format!("audio: {fault}");
-            announce_audio(server, capture, Some(fault));
+        if let Some(fault) = live.take_fault() {
+            status = format!("source: {fault}");
+            announce_input(server, live, Some(fault));
         }
 
         // Drained before the audio, not after, and so on every pass rather than
@@ -334,18 +373,27 @@ fn run(
                         let next = *config;
                         match renderer.set_surface(&next.surface) {
                             Ok(()) => {
-                                apply_show(
-                                    engine,
-                                    engine_cfg,
-                                    renderer,
-                                    &next,
-                                    &show,
-                                    false,
-                                    capture.sample_rate(),
-                                );
+                                // A config edit can move the note grid, which
+                                // is the one case where an edit changes the
+                                // shape the renderer was built around.
+                                if live.apply(&next, &show, false) {
+                                    match build_renderer(
+                                        renderer.config().brightness,
+                                        &next,
+                                        live,
+                                        led_count,
+                                        point_cap,
+                                    ) {
+                                        Ok(r) => *renderer = r,
+                                        Err(e) => status = format!("config rejected: {e}"),
+                                    }
+                                }
                                 show = next.clone();
                                 status.clear();
-                                server.update_state(|s| s.config = next);
+                                server.update_state(|s| {
+                                    s.band_count = live.points().min(point_cap);
+                                    s.config = next;
+                                });
                             }
                             // Reported through the status line rather than
                             // stdout: printing here would tear the display.
@@ -361,35 +409,38 @@ fn run(
                         server.update_state(|s| s.brightness = value.clamp(0.0, 1.0));
                     }
                     Command::SetSource { source } => {
-                        match switch_source(capture, engine, engine_cfg, renderer, &show, &source) {
+                        match switch_source(
+                            live, renderer, base, &show, &source, led_count, point_cap,
+                        ) {
                             Ok(()) => {
                                 status.clear();
-                                announce_audio(Some(server), capture, None);
+                                server.update_state(|s| s.band_count = live.points().min(point_cap));
+                                announce_input(Some(server), live, None);
                             }
-                            // The old capture is still running — opening the new
+                            // The old source is still running — opening the new
                             // one is what failed, and the alternative to keeping
                             // it is silence plus a message.
                             Err(e) => {
                                 let message = format!("{e:#}");
-                                status = format!("audio: {message}");
-                                announce_audio(Some(server), capture, Some(message));
+                                status = format!("source: {message}");
+                                announce_input(Some(server), live, Some(message));
                             }
                         }
                     }
                     Command::ListSources => {
-                        // Costs a mix-format query per endpoint, so it happens
-                        // when asked and not on a timer. The ring is a quarter
-                        // second deep; this fits inside it comfortably.
-                        let devices = capture::devices();
-                        server.announce_state(|s| s.audio.devices = devices);
+                        // Costs a mix-format query per audio endpoint, so it
+                        // happens when asked and not on a timer. The capture
+                        // ring is a quarter second deep; this fits inside it
+                        // comfortably.
+                        let devices = source::devices();
+                        server.announce_state(|s| s.input.devices = devices);
                     }
                     Command::RequestState => {}
                 }
             }
         }
 
-        let n = capture.read(&mut buf);
-        if n == 0 {
+        if !live.poll() {
             // A source is genuinely idle when nothing is playing through it, and
             // loopback in particular delivers nothing at all rather than
             // silence. Not an error, so the loop just comes back around — with
@@ -398,11 +449,7 @@ fn run(
             continue;
         }
 
-        if !engine.push(&buf[..n]) {
-            continue;
-        }
-
-        let pixels = renderer.render(engine.levels());
+        let pixels = renderer.render(live.levels());
         if !link.send(pixels)? {
             dropped += 1;
         }
@@ -414,154 +461,127 @@ fn run(
 
             if let Some(server) = server {
                 let strip = encode_strip(&leds);
-                let levels = engine.levels().to_vec();
-                let sample_rate = capture.sample_rate();
+                let levels = live.levels().to_vec();
+                let centers = live.centers().to_vec();
+                let sample_rate = live.sample_rate();
+                let out_of_range = live.out_of_range().unwrap_or(0);
                 server.publish(|snap| {
                     snap.levels = levels;
                     snap.strip = strip;
                     snap.dropped_frames = dropped;
+                    snap.notes_out_of_range = out_of_range;
                     snap.sample_rate = sample_rate;
                     snap.connected = true;
-                    if snap.centers.len() != centers.len() {
-                        snap.centers = centers.clone();
+                    // Compared rather than assigned: the axis only moves on a
+                    // source switch or a note-range edit, and a Vec assignment
+                    // per frame would allocate for nothing.
+                    if snap.centers != centers {
+                        snap.centers = centers;
                     }
                 });
             }
 
-            draw(engine.levels(), &leds, dropped, &status, first);
+            draw(live.levels(), &leds, dropped, &status, first);
             last_draw = Instant::now();
             first = false;
         }
     }
 }
 
-/// Move capture to a different endpoint, live.
+/// Move to a different source, live.
 ///
-/// The new stream is opened *before* the old one is dropped, so a source that
-/// cannot be opened leaves the running one untouched rather than trading a
-/// working strip for an error message.
+/// The new one is opened *before* the old is dropped, so a source that cannot be
+/// opened leaves the running one untouched rather than trading a working strip
+/// for an error message.
 ///
-/// A rate change is the interesting case: the whole analyser is built around the
-/// sample rate, so it is rebuilt. The renderer is not, and does not need to be —
-/// band edges come from the scale config alone (see `dsp::bands`), so only the
-/// FFT tier each band draws from moves, never the centre frequencies the strip
-/// is mapped against.
+/// The renderer is rebuilt unconditionally rather than only when the grid
+/// changes shape. A switch already costs an open and a reset, the centres move
+/// on nearly every one of them, and the alternative is a comparison that is
+/// wrong once and dark forever.
 fn switch_source(
-    capture: &mut Capture,
-    engine: &mut Engine,
-    engine_cfg: &mut EngineConfig,
+    live: &mut LiveSource,
     renderer: &mut Renderer,
+    base: &EngineConfig,
     show: &ShowConfig,
     source: &Source,
+    led_count: usize,
+    point_cap: usize,
 ) -> Result<()> {
-    let next = Capture::open(source, CAPTURE_BUFFER_SECS)?;
-    let rate_changed = next.sample_rate() != capture.sample_rate();
-    *capture = next;
-
-    if rate_changed {
-        apply_show(engine, engine_cfg, renderer, show, show, true, capture.sample_rate());
-    } else {
-        // A new source is a new signal: carrying the old floor tracker and
-        // ballistics across would spend the first second unwinding a level that
-        // no longer exists.
-        engine.reset();
+    // A request that resolves to what is already open is answered in place. For
+    // MIDI that is not a shortcut but a requirement — see `LiveSource::retune`.
+    if live.retune(source) {
+        return Ok(());
     }
-    renderer.reset();
+
+    let mut next = LiveSource::open(source, base, show, CAPTURE_BUFFER_SECS)?;
+    next.apply(show, show, true);
+    let rebuilt = build_renderer(renderer.config().brightness, show, &next, led_count, point_cap)?;
+
+    *live = next;
+    *renderer = rebuilt;
     Ok(())
 }
 
-/// Tell the editor what is actually being captured.
+/// Tell the editor what is actually being listened to.
 ///
 /// The device list is deliberately left alone — it is refreshed only when asked
 /// for, and a switch does not change what exists.
-fn announce_audio(server: Option<&UiServer>, capture: &Capture, error: Option<String>) {
+fn announce_input(server: Option<&UiServer>, live: &LiveSource, error: Option<String>) {
     let Some(server) = server else { return };
     server.announce_state(|s| {
-        s.audio.source = capture.source().clone();
-        s.audio.device_name = capture.device_name().to_string();
-        s.audio.kind = capture.kind();
-        s.audio.channels = capture.channels();
-        s.audio.sample_rate = capture.sample_rate();
-        s.audio.error = error;
+        s.input.source = live.source().clone();
+        s.input.device_name = live.device_name().to_string();
+        s.input.kind = live.kind();
+        s.input.channels = live.channels();
+        s.input.sample_rate = live.sample_rate();
+        s.input.error = error;
     });
 }
 
-/// Push a configuration into the stages it touches.
+/// Listen for a fixed duration and report what arrived, then exit.
 ///
-/// Everything is compared against what is already in force, because the two
-/// expensive cases must not fire on every keyframe drag: resampling the EQ walks
-/// every band, and a hop change rebuilds the analyser outright — which resets
-/// the floor tracker and the ballistics, so it is worth a visible hiccup only
-/// when the user actually asked for it.
-fn apply_show(
-    engine: &mut Engine,
-    engine_cfg: &mut EngineConfig,
-    renderer: &mut Renderer,
-    next: &ShowConfig,
-    current: &ShowConfig,
-    force: bool,
-    sample_rate: f64,
-) {
-    if force || next.hop() != current.hop() {
-        engine_cfg.hop = next.hop();
-        *engine = Engine::new(engine_cfg, sample_rate);
-        // A rebuilt analyser has no EQ or ballistics, so both are reinstalled
-        // below regardless of whether they were what changed.
-        engine.set_eq(&next.eq);
-        engine.set_decay(next.decay());
-    } else {
-        if !eq_matches(&next.eq, &current.eq) {
-            engine.set_eq(&next.eq);
-        }
-        if next.decay() != current.decay() {
-            engine.set_decay(next.decay());
-        }
+/// Separates the three states worth distinguishing during bring-up: the source
+/// failed to open, it opened but nothing is coming through, or something is.
+/// Loopback legitimately delivers nothing while the endpoint is idle, and so
+/// does a MIDI port with nobody playing, so silence is not by itself a fault.
+fn probe(live: &mut LiveSource, secs: f64) -> Result<()> {
+    match live {
+        LiveSource::Midi(_) => probe_midi(live, secs),
+        LiveSource::Audio(_) => probe_audio(live, secs),
     }
-
-    renderer.set_layout(next.layout());
-    renderer.set_intensity(next.intensity());
 }
 
-/// Structural comparison; `EqBand` is not `PartialEq` because it holds floats
-/// and an exact-equality derive on those would be a trap elsewhere.
-fn eq_matches(a: &[djled_engine::dsp::eq::EqBand], b: &[djled_engine::dsp::eq::EqBand]) -> bool {
-    a.len() == b.len()
-        && a.iter().zip(b).all(|(x, y)| {
-            x.kind == y.kind && x.hz == y.hz && x.gain == y.gain && x.q == y.q
-        })
-}
-
-/// Capture for a fixed duration and report what arrived, then exit.
-///
-/// Separates the three states worth distinguishing during bring-up: the stream
-/// failed to open, the stream opened but nothing is playing, or audio is
-/// flowing. Loopback legitimately delivers nothing while the endpoint is idle,
-/// so silence is not by itself a fault.
-fn probe(capture: &mut Capture, engine: &mut Engine, secs: f64) -> Result<()> {
+fn probe_audio(live: &mut LiveSource, secs: f64) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs_f64(secs);
-    let mut buf = vec![0.0f32; 8192];
     let (mut samples, mut frames) = (0usize, 0usize);
     let mut peak = 0.0f32;
-    let mut hottest = vec![0.0f32; engine.band_count()];
+    let mut hottest = vec![0.0f32; live.levels().len()];
 
     while Instant::now() < deadline {
-        let n = capture.read(&mut buf);
-        if n == 0 {
+        // Both questions are asked every pass, and separately: the device
+        // delivering samples and the analyser completing a frame are different
+        // failures with different causes, and a probe that conflated them would
+        // point at the wrong one.
+        let framed = live.poll();
+        let block = live.last_block();
+        if block.is_empty() {
             std::thread::sleep(Duration::from_millis(2));
             continue;
         }
-        samples += n;
-        peak = buf[..n].iter().fold(peak, |a, &s| a.max(s.abs()));
+        samples += block.len();
+        peak = block.iter().fold(peak, |a, &s| a.max(s.abs()));
 
-        if engine.push(&buf[..n]) {
+        if framed {
             frames += 1;
-            for (h, &l) in hottest.iter_mut().zip(engine.levels()) {
-                *h = h.max(l);
+            for (h, &l) in hottest.iter_mut().zip(live.levels()) {
+                if l > *h {
+                    *h = l;
+                }
             }
         }
     }
 
-    let expected = capture.sample_rate() * secs;
+    let expected = live.sample_rate() * secs;
     println!("probe: {secs:.1} s");
     println!(
         "  samples  {samples} ({:.0}% of the {expected:.0} expected)",
@@ -570,21 +590,21 @@ fn probe(capture: &mut Capture, engine: &mut Engine, secs: f64) -> Result<()> {
     println!("  frames   {frames} analysis frames");
     println!("  peak     {peak:.4} ({:.1} dBFS)", 20.0 * peak.max(1e-9).log10());
 
-    if let Some(fault) = capture.take_fault() {
+    if let Some(fault) = live.take_fault() {
         println!("\n  The stream failed while probing: {fault}");
         return Ok(());
     }
 
     if samples == 0 {
         println!();
-        match capture.kind() {
-            capture::SourceKind::Loopback => {
+        match live.kind() {
+            SourceKind::Loopback => {
                 println!("  Stream opened but delivered nothing. WASAPI loopback is idle when the");
                 println!("  output endpoint is idle — play some audio and probe again. If a DAW");
                 println!("  is driving this device over ASIO, nothing will ever arrive here;");
-                println!("  probe the interface's input instead.");
+                println!("  probe the interface's input instead, or send MIDI with --midi.");
             }
-            capture::SourceKind::Input => {
+            _ => {
                 println!("  Stream opened but delivered nothing, which a capture endpoint should");
                 println!("  never do — it sends silence when idle. Check Windows microphone");
                 println!("  privacy settings, and that nothing else holds the device.");
@@ -597,6 +617,7 @@ fn probe(capture: &mut Capture, engine: &mut Engine, secs: f64) -> Result<()> {
         return Ok(());
     }
 
+    let Some(engine) = live.engine() else { return Ok(()) };
     let plan = engine.plan();
     let mut ranked: Vec<usize> = (0..hottest.len()).collect();
     ranked.sort_by(|&a, &b| hottest[b].partial_cmp(&hottest[a]).unwrap());
@@ -608,21 +629,93 @@ fn probe(capture: &mut Capture, engine: &mut Engine, secs: f64) -> Result<()> {
     Ok(())
 }
 
-fn print_header(capture: &Capture, engine: &Engine, link: &dyn Link, led_count: usize) {
-    println!("DJLED");
-    println!("  audio    {}", capture.describe());
-    println!("  output   {}", link.describe());
-    println!("  bands    {} across {led_count} LEDs", engine.band_count());
-    println!("  tiers");
-    for line in engine.plan().describe_tiers() {
-        println!("           {line}");
+/// The MIDI bring-up diagnostic: is anything arriving at all, on which channel,
+/// and is it inside the range being displayed.
+///
+/// This is the flag to reach for when FL Studio's MIDI Out plugin appears to do
+/// nothing, because it separates "the port is wrong" from "the notes are
+/// arriving on a channel or in an octave that is being filtered out".
+fn probe_midi(live: &mut LiveSource, secs: f64) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs_f64(secs);
+    let mut peak = 0.0f32;
+    let mut lit = 0usize;
+
+    while Instant::now() < deadline {
+        if !live.poll() {
+            std::thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+        let frame_peak = live.levels().iter().fold(0.0f32, |a, &b| a.max(b));
+        peak = peak.max(frame_peak);
+        if frame_peak > 0.0 {
+            lit += 1;
+        }
     }
 
-    let unresolved: Vec<_> = engine.plan().unresolved().map(|(i, _)| i).collect();
-    if !unresolved.is_empty() {
+    let out_of_range = live.out_of_range().unwrap_or(0);
+    println!("probe: {secs:.1} s");
+    println!("  port     {}", live.describe());
+    println!("  frames   {lit} with a note sounding");
+    println!("  peak     {peak:.2} of full velocity");
+    println!("  dropped  {out_of_range} notes outside the displayed range");
+
+    if lit == 0 && out_of_range == 0 {
+        println!("\n  The port opened but no notes arrived.");
+        println!("  · From a keyboard: check it is this port and not another one it also");
+        println!("    presents, and that nothing else has the port open.");
+        println!("  · From FL Studio: the MIDI Out plugin sends to a MIDI *output*, and this");
+        println!("    listens on a MIDI *input* — the two only meet through a virtual cable.");
+        println!("    Install loopMIDI, create a port, enable it under Options -> MIDI");
+        println!("    settings -> Output, note the port number it is given, and set the MIDI");
+        println!("    Out plugin's Port to that number.");
+        println!("  · If a channel filter is set, everything on the other fifteen is dropped");
+        println!("    before it is ever counted. Probe again without --channel.");
+    } else if lit == 0 {
+        println!("\n  Notes are arriving, but all of them are outside the range being shown.");
+        println!("  Widen the note range in the editor, or transpose what is being played.");
+    }
+    Ok(())
+}
+
+fn print_header(live: &LiveSource, link: &dyn Link, led_count: usize, point_cap: usize) {
+    println!("DJLED");
+    println!("  source   {}", live.describe());
+    println!("  output   {}", link.describe());
+
+    match live.engine() {
+        Some(engine) => {
+            println!("  bands    {} across {led_count} LEDs", engine.band_count());
+            println!("  tiers");
+            for line in engine.plan().describe_tiers() {
+                println!("           {line}");
+            }
+
+            let unresolved: Vec<_> = engine.plan().unresolved().map(|(i, _)| i).collect();
+            if !unresolved.is_empty() {
+                println!(
+                    "  WARNING  bands {unresolved:?} cannot be resolved by any available FFT size.\n\
+                     {:11}Lower --bands, or raise the bottom of the range.",
+                    ""
+                );
+            }
+        }
+        None => {
+            println!("  notes    {} semitones across {led_count} LEDs", live.centers().len());
+        }
+    }
+
+    // The failure this prevents is silent and looks like a hardware fault: the
+    // firmware drops any frame over its own limit without replying, so the
+    // spectrum, the preview and the bars above all stay correct while the strip
+    // goes dark. Points are narrowed to fit instead, and that is worth saying
+    // out loud because it is a real loss of resolution.
+    if live.points() > point_cap {
         println!(
-            "  WARNING  bands {unresolved:?} cannot be resolved by any available FFT size.\n\
-             {:11}Lower --bands, or raise the bottom of the range.",
+            "  NOTE     {} points narrowed to {point_cap} for the wire — the firmware's\n\
+             {:11}MAX_BANDS. Raise it in firmware/djled/djled.ino and reflash for\n\
+             {:11}the full resolution.",
+            live.points(),
+            "",
             ""
         );
     }

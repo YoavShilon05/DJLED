@@ -31,7 +31,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::capture::{DeviceInfo, Source, SourceKind};
+use crate::source::{DeviceInfo, Source, SourceKind};
 use crate::show::ShowConfig;
 
 pub const DEFAULT_PORT: u16 = 9001;
@@ -54,6 +54,10 @@ pub struct Snapshot {
     pub sample_rate: f64,
     pub connected: bool,
     pub dropped_frames: u64,
+    /// Notes seen outside the configured range. Live telemetry rather than
+    /// state: it is the answer to "why is the strip dark", and it changes
+    /// while someone is playing, not when they change a setting.
+    pub notes_out_of_range: u32,
 }
 
 /// What the UI can change.
@@ -94,14 +98,15 @@ pub struct State {
     /// needs them to preview a gain at the right size.
     pub db_floor: f32,
     pub db_ceil: f32,
-    pub audio: AudioState,
+    pub input: InputState,
 }
 
 /// What is being listened to, and what else could be.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AudioState {
-    /// Everything selectable, as of the last scan.
+pub struct InputState {
+    /// Everything selectable, as of the last scan — audio endpoints and MIDI
+    /// ports in one list, because they are one choice.
     pub devices: Vec<DeviceInfo>,
     /// The live selection, as resolved rather than as requested.
     pub source: Source,
@@ -110,8 +115,10 @@ pub struct AudioState {
     /// the user still wants to see which one they got.
     pub device_name: String,
     pub kind: SourceKind,
-    /// Channels the endpoint delivers, which is what bounds `source.channel`.
+    /// Channels the source offers, which is what bounds `source.channel`: the
+    /// inputs of an interface, or MIDI's sixteen.
     pub channels: usize,
+    /// Zero for MIDI, which has no sample rate.
     pub sample_rate: f64,
     /// Why the last switch failed, or how the running stream died. Cleared by
     /// the next success.
@@ -400,6 +407,19 @@ mod tests {
         match serde_json::from_str::<Command>(json).unwrap() {
             Command::SetSource { source } => {
                 assert_eq!(source, Source::default_input());
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+
+        // A MIDI port travels the same message, with `channel` meaning the MIDI
+        // channel to accept rather than the one to analyse.
+        let json =
+            r#"{"type":"setSource","source":{"id":"midi:loopMIDI Port","kind":"midi","channel":9}}"#;
+        match serde_json::from_str::<Command>(json).unwrap() {
+            Command::SetSource { source } => {
+                assert_eq!(source.kind, SourceKind::Midi);
+                assert_eq!(source.id.as_deref(), Some("midi:loopMIDI Port"));
+                assert_eq!(source.channel, Some(9));
             }
             other => panic!("parsed as {other:?}"),
         }

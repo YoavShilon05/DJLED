@@ -44,133 +44,18 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample};
 use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
-use serde::{Deserialize, Serialize};
 
-/// Which side of an endpoint is being listened to.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum SourceKind {
-    /// A render endpoint captured in loopback: the mix Windows is already
-    /// sending to the speakers.
-    #[default]
-    Loopback,
-    /// A capture endpoint: microphone, line input, interface inputs.
-    Input,
-}
+use crate::source::{is_midi_id, DeviceInfo, Source, SourceKind};
 
-impl SourceKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            SourceKind::Loopback => "loopback",
-            SourceKind::Input => "input",
-        }
-    }
-}
-
-/// What the analyser should listen to.
-///
-/// Every field defaults, so an editor that predates one still produces a valid
-/// selection rather than a parse error that would drop the whole command.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct Source {
-    /// cpal device id, stable across runs and reboots. `None` follows whatever
-    /// Windows currently calls the default for `kind` — which is what most
-    /// people want for PC audio: change the default output and capture follows,
-    /// with no reason to come back here.
-    pub id: Option<String>,
-    /// Which default to follow when `id` is `None`. Ignored otherwise, because a
-    /// named endpoint already determines how it has to be opened.
-    pub kind: SourceKind,
-    /// Channel to analyse, 0-based. `None` averages them all.
-    ///
-    /// Worth having for instruments: a guitar in input 1 of a stereo interface
-    /// exists on one channel only, and averaging it with a silent neighbour
-    /// costs 6 dB and mixes in that neighbour's noise floor.
-    pub channel: Option<usize>,
-}
-
-impl Source {
-    /// The system default output, captured in loopback — the historical
-    /// behaviour, and the default at startup.
-    pub fn default_output() -> Self {
-        Self { id: None, kind: SourceKind::Loopback, channel: None }
-    }
-
-    /// The system default recording device.
-    pub fn default_input() -> Self {
-        Self { id: None, kind: SourceKind::Input, channel: None }
-    }
-
-    /// Look a source up the way a human would name it on the command line: a
-    /// full device id, or any case-insensitive fragment of a device name,
-    /// optionally narrowed to one direction.
-    ///
-    /// Ambiguity is an error listing the candidates rather than a guess — and it
-    /// is not a corner case. An interface presents its playback and capture
-    /// halves under one name, so "UR22" genuinely means two different things,
-    /// which is exactly the distinction the caller is here to make.
-    pub fn find(spec: &str, kind: Option<SourceKind>) -> Result<Self> {
-        let available: Vec<DeviceInfo> =
-            devices().into_iter().filter(|d| kind.is_none_or(|k| d.kind == k)).collect();
-
-        if let Some(exact) = available.iter().find(|d| d.id == spec) {
-            return Ok(Self { id: Some(exact.id.clone()), kind: exact.kind, channel: None });
-        }
-
-        let needle = spec.to_lowercase();
-        let matches: Vec<&DeviceInfo> =
-            available.iter().filter(|d| d.name.to_lowercase().contains(&needle)).collect();
-
-        match matches.as_slice() {
-            [one] => Ok(Self { id: Some(one.id.clone()), kind: one.kind, channel: None }),
-            [] => {
-                let scope = match kind {
-                    Some(k) => format!(" {} device", k.label()),
-                    None => " audio device".into(),
-                };
-                anyhow::bail!(
-                    "no{scope} matches '{spec}'. Run with --list-devices to see them all"
-                )
-            }
-            many => {
-                let names: Vec<String> =
-                    many.iter().map(|d| format!("{} ({})", d.name, d.kind.label())).collect();
-                let hint = if many.iter().any(|d| d.kind == SourceKind::Input) {
-                    ". Add --input to mean the capture side, or pass the id from --list-devices"
-                } else {
-                    ". Pass the id from --list-devices to be exact"
-                };
-                anyhow::bail!("'{spec}' matches {}: {}{hint}", many.len(), names.join(", "))
-            }
-        }
-    }
-}
-
-/// One selectable endpoint, as the editor's dropdown sees it.
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeviceInfo {
-    pub id: String,
-    pub name: String,
-    pub kind: SourceKind,
-    /// True for the endpoint Windows currently defaults to for this kind.
-    pub is_default: bool,
-    /// From the endpoint's mix format. `None` when the endpoint refused to be
-    /// opened for a look — typically because something else holds it. That is
-    /// worth showing rather than hiding the device, since the reason is usually
-    /// exactly what the user is trying to work around.
-    pub sample_rate: Option<f64>,
-    pub channels: Option<usize>,
-}
-
-/// Everything that can be captured right now.
+/// Audio endpoints only. MIDI ports are enumerated by [`crate::midi::ports`],
+/// and [`crate::source::devices`] is what joins the two lists into the one the
+/// editor's dropdown shows.
 ///
 /// Ordered the way the editor lists it: loopback before input, the system
 /// default first within each group, then by name. Enumeration costs one mix
-/// format query per endpoint, so this is for startup and explicit refreshes, not
-/// for the frame loop.
-pub fn devices() -> Vec<DeviceInfo> {
+/// format query per endpoint, so this is for startup and explicit refreshes,
+/// not for the frame loop.
+pub fn endpoints() -> Vec<DeviceInfo> {
     let host = cpal::default_host();
     let default_output = host.default_output_device().and_then(|d| d.id().ok());
     let default_input = host.default_input_device().and_then(|d| d.id().ok());
@@ -185,6 +70,8 @@ pub fn devices() -> Vec<DeviceInfo> {
             let default = match kind {
                 SourceKind::Loopback => &default_output,
                 SourceKind::Input => &default_input,
+                // Unreachable: `direction` only ever names an audio endpoint.
+                SourceKind::Midi => &None,
             };
 
             Some(DeviceInfo {
@@ -354,7 +241,10 @@ fn default_config(
 ) -> Result<cpal::SupportedStreamConfig, cpal::Error> {
     match kind {
         SourceKind::Loopback => device.default_output_config(),
-        SourceKind::Input => device.default_input_config(),
+        // A MIDI selection never reaches here — `Capture::open` rejects it
+        // first — and asking cpal for an input config is the harmless answer
+        // if that ever stops being true.
+        SourceKind::Input | SourceKind::Midi => device.default_input_config(),
     }
 }
 
@@ -366,13 +256,20 @@ fn describe(device: &cpal::Device) -> String {
 }
 
 fn resolve(host: &cpal::Host, source: &Source) -> Result<(cpal::Device, SourceKind)> {
+    // The one selection this module cannot serve. Caught here rather than left
+    // to cpal, which would report an unparseable device id and send whoever
+    // reads it looking in the wrong place entirely.
+    if source.kind == SourceKind::Midi || source.id.as_deref().is_some_and(is_midi_id) {
+        anyhow::bail!("'{}' is a MIDI port, not an audio device", source.id.as_deref().unwrap_or("midi"));
+    }
+
     let Some(id) = &source.id else {
         return match source.kind {
             SourceKind::Loopback => host
                 .default_output_device()
                 .map(|d| (d, SourceKind::Loopback))
                 .context("no default output device — is anything configured for playback?"),
-            SourceKind::Input => host
+            _ => host
                 .default_input_device()
                 .map(|d| (d, SourceKind::Input))
                 .context("no default recording device — is anything configured for input?"),
@@ -399,7 +296,8 @@ fn open_hint(name: &str, kind: SourceKind) -> String {
              ASIO it owns the device outright and there is no render mix to tap — pick the \
              interface's *input* instead"
         ),
-        SourceKind::Input => format!(
+        // MIDI never reaches here; `resolve` refuses it by name first.
+        _ => format!(
             "failed to open '{name}' for input. Another application may hold it exclusively, \
              or microphone access may be blocked in Windows privacy settings"
         ),
@@ -467,98 +365,27 @@ where
 mod tests {
     use super::*;
 
-    /// The wire format the editor sends. Every field is optional, and an empty
-    /// object has to mean the historical behaviour — default output, mixed down
-    /// — or a rolled-back editor would silently change what is captured.
-    #[test]
-    fn a_source_parses_from_the_ui_wire_format() {
-        let s: Source = serde_json::from_str("{}").unwrap();
-        assert_eq!(s, Source::default_output());
-
-        let s: Source = serde_json::from_str(r#"{"kind":"input"}"#).unwrap();
-        assert_eq!(s, Source::default_input());
-
-        let s: Source =
-            serde_json::from_str(r#"{"id":"wasapi:{0.0.1.00000000}","kind":"input","channel":0}"#)
-                .unwrap();
-        assert_eq!(s.id.as_deref(), Some("wasapi:{0.0.1.00000000}"));
-        assert_eq!(s.kind, SourceKind::Input);
-        assert_eq!(s.channel, Some(0));
-    }
-
-    #[test]
-    fn a_source_survives_a_round_trip() {
-        let original =
-            Source { id: Some("wasapi:x".into()), kind: SourceKind::Input, channel: Some(1) };
-        let back: Source = serde_json::from_str(&serde_json::to_string(&original).unwrap()).unwrap();
-        assert_eq!(back, original);
-    }
-
-    /// Device ids contain braces, dots and colons; they travel as opaque strings
-    /// and must come back byte-identical or the lookup fails.
-    #[test]
-    fn device_ids_survive_json() {
-        let id = "wasapi:{0.0.0.00000000}.{a1b2c3d4-0000-0000-0000-000000000000}";
-        let s = Source { id: Some(id.into()), ..Source::default_output() };
-        let back: Source = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
-        assert_eq!(back.id.as_deref(), Some(id));
-    }
-
     /// Enumeration runs against whatever hardware the machine has, so it can
-    /// only assert invariants — but "every entry is selectable" is the one that
-    /// matters, since the editor sends these ids straight back.
+    /// only assert invariants — but "every endpoint faces one way" is the one
+    /// that matters here, since the direction is what decides how it is opened.
+    /// The wider checks live in [`crate::source`], with the types.
     #[test]
-    fn enumerated_devices_are_well_formed() {
-        for device in devices() {
+    fn every_endpoint_is_audio_and_faces_one_way() {
+        for device in endpoints() {
+            assert!(device.kind.is_audio(), "'{}' is not an audio endpoint", device.name);
             assert!(!device.id.is_empty(), "'{}' has no id to select it by", device.name);
-            assert!(
-                cpal::DeviceId::from_str(&device.id).is_ok(),
-                "id '{}' cannot be parsed back",
-                device.id
-            );
-            assert!(device.sample_rate.is_none_or(|r| r > 0.0));
-            assert!(device.channels.is_none_or(|c| c > 0));
         }
     }
 
-    /// At most one default per direction, or the editor's dropdown would show
-    /// two entries both claiming to be the one in use.
+    /// A MIDI selection must be turned away with a message that names the real
+    /// problem, not left to fail as an unparseable device id.
     #[test]
-    fn at_most_one_default_per_direction() {
-        for kind in [SourceKind::Loopback, SourceKind::Input] {
-            let defaults = devices().iter().filter(|d| d.kind == kind && d.is_default).count();
-            assert!(defaults <= 1, "{} devices claim to be the default {kind:?}", defaults);
-        }
-    }
-
-    #[test]
-    fn an_unknown_name_is_an_error_not_a_guess() {
-        let err = Source::find("no such device anywhere", None).unwrap_err().to_string();
-        assert!(err.contains("--list-devices"), "unhelpful error: {err}");
-    }
-
-    /// The interesting lookup: an interface names its playback and capture
-    /// halves identically, so the fragment that matches both must resolve once
-    /// the direction is given. Skipped where the machine has no such pair.
-    #[test]
-    fn a_direction_resolves_a_name_shared_by_both_halves() {
-        let all = devices();
-        let Some(shared) = all
-            .iter()
-            .find(|d| d.kind == SourceKind::Loopback)
-            .filter(|d| all.iter().any(|o| o.kind == SourceKind::Input && o.name == d.name))
-        else {
-            return;
+    fn a_midi_selection_is_refused_by_name() {
+        let source = Source { id: Some("midi:x".into()), kind: SourceKind::Midi, channel: None };
+        let err = match Capture::open(&source, 0.25) {
+            Ok(_) => panic!("a MIDI port must not open as an audio device"),
+            Err(e) => e.to_string(),
         };
-
-        assert!(
-            Source::find(&shared.name, None).is_err(),
-            "'{}' names two endpoints and should not resolve without a direction",
-            shared.name
-        );
-
-        let found = Source::find(&shared.name, Some(SourceKind::Input)).unwrap();
-        assert_eq!(found.kind, SourceKind::Input);
-        assert!(all.iter().any(|d| Some(&d.id) == found.id.as_ref() && d.kind == SourceKind::Input));
+        assert!(err.contains("MIDI"), "unhelpful error: {err}");
     }
 }

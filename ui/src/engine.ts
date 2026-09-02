@@ -33,48 +33,71 @@ export interface ShowConfig {
   curve: CurveConfig;
   decay: number;
   sampleLength: number;
+  midi: MidiConfig;
 }
 
 /**
- * Which side of an endpoint is being listened to.
+ * The engine's `midi::MidiConfig`, verbatim.
  *
- * A WASAPI endpoint is one or the other, never both — an interface appears as a
- * separate playback endpoint and capture endpoint, usually under the same name.
- * So the direction is a property of the device, not something the user picks
- * alongside it; it only matters on its own when no device is named.
+ * Part of the show rather than of the source selection: the note range and
+ * spread are as much a part of a look as the colours are, so they are saved
+ * with it and survive switching to audio and back.
  */
-export type SourceKind = "loopback" | "input";
+export interface MidiConfig {
+  /** Note at the left end of the axis. */
+  lowNote: number;
+  /** Note at the right end. */
+  highNote: number;
+  /** How far a note bleeds into its neighbours, in semitones. */
+  spread: number;
+  /** Honour the sustain pedal (CC64). */
+  sustain: boolean;
+}
 
-/** The engine's `capture::Source`, verbatim. */
-export interface AudioSource {
-  /** Device id, or null to follow whatever Windows calls the default. */
+/**
+ * Which kind of endpoint is being listened to.
+ *
+ * A WASAPI endpoint is one direction or the other, never both — an interface
+ * appears as a separate playback endpoint and capture endpoint, usually under
+ * the same name. So the direction is a property of the device, not something
+ * the user picks alongside it; it only matters on its own when no device is
+ * named. MIDI ports are a third kind, listed alongside them because choosing
+ * what drives the strip is one choice, not two.
+ */
+export type SourceKind = "loopback" | "input" | "midi";
+
+/** The engine's `source::Source`, verbatim. */
+export interface InputSource {
+  /** Device or port id, or null to follow the default for this kind. */
   id: string | null;
   kind: SourceKind;
-  /** Channel to analyse, 0-based. Null mixes them all. */
+  /** Channel to listen to, 0-based. Null takes them all — mixed down for
+   *  audio, merged for MIDI. */
   channel: number | null;
 }
 
-export interface AudioDevice {
+export interface InputDevice {
   id: string;
   name: string;
   kind: SourceKind;
   isDefault: boolean;
-  /** Null when the endpoint would not open to be asked — usually because
-   *  something else already holds it. */
+  /** Null for MIDI, which has no sample rate, and for an audio endpoint that
+   *  would not open to be asked — usually because something else holds it. */
   sampleRate: number | null;
   channels: number | null;
 }
 
-export interface AudioState {
-  devices: AudioDevice[];
+export interface InputState {
+  devices: InputDevice[];
   /** The live selection, as resolved rather than as requested. */
-  source: AudioSource;
+  source: InputSource;
   /** The endpoint the selection currently resolves to. Not redundant with
    *  `source`: "the default output" names no device, and you still want to see
    *  which one you got. */
   deviceName: string;
   kind: SourceKind;
   channels: number;
+  /** Zero for MIDI, which has no sample rate. */
   sampleRate: number;
   error: string | null;
 }
@@ -88,6 +111,10 @@ export interface Frame {
   sampleRate: number;
   connected: boolean;
   droppedFrames: number;
+  /** Notes seen outside the configured range. Live rather than state: it is
+   *  the answer to "why is the strip dark", and it changes while someone is
+   *  playing rather than when they change a setting. */
+  notesOutOfRange: number;
 }
 
 export interface EngineState {
@@ -98,7 +125,7 @@ export interface EngineState {
   /** Analyser dB window. The EQ is authored in these terms, not the plot's. */
   dbFloor: number;
   dbCeil: number;
-  audio: AudioState;
+  input: InputState;
 }
 
 export type Status = "connecting" | "connected" | "offline";
@@ -218,7 +245,7 @@ export class EngineClient {
    * that cannot be opened leaves capture running and comes back as an error in
    * the next `state` message rather than as silence.
    */
-  setSource(source: AudioSource): void {
+  setSource(source: InputSource): void {
     this.send({ type: "setSource", source });
   }
 

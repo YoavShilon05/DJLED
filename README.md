@@ -1,20 +1,26 @@
 # DJLED
 
 An audio-reactive LED wall. The PC captures what it is playing — or what an
-instrument is playing into it — analyses the spectrum, maps each frequency band
-to a colour, and streams the result to an Arduino driving a WS2812B strip.
+instrument is playing into it, or the notes a DAW is sending it — maps that onto
+a frequency axis, turns each position into a colour, and streams the result to
+an Arduino driving a WS2812B strip.
 
 ```
-loopback / input ─► analysis ─► colour surface ─► serial ─► Arduino ─► strip
-                       │                                      (expands bands
-                       └──────► WebSocket ─► editor UI         across LEDs)
+loopback / input ─┐
+                  ├─► levels over the axis ─► colour surface ─► serial ─► Arduino ─► strip
+MIDI port ────────┘            │                                          (expands points
+                               └──────► WebSocket ─► editor UI             across LEDs)
 ```
+
+Audio arrives as frequency bands and MIDI as notes, but both come out as *levels
+over the editor's frequency axis*, and nothing downstream of that asks which one
+produced them.
 
 ## Layout
 
 | Path | What it is |
 |---|---|
-| `engine/` | Rust. Capture, DSP, colour, wire protocol, UI bridge. |
+| `engine/` | Rust. Capture, MIDI, DSP, colour, wire protocol, UI bridge. |
 | `ui/` | React + TypeScript + Mantine. The spectrum editor. |
 | `firmware/djled/` | Arduino sketch. |
 | `docs/wiring.md` | **Read before powering anything.** |
@@ -45,7 +51,8 @@ Useful flags:
 --list-devices        find an audio source
 --source UR22         listen to a named device instead of the default output
 --input               capture an input rather than what the PC is playing
---channel 1           analyse one channel instead of mixing them
+--midi                listen to MIDI notes instead of audio
+--channel 1           one input channel, or one MIDI channel, instead of all
 --probe 3             capture for 3s and report what arrived
 --test rgb|chase|white   wiring diagnostics, see docs/wiring.md
 --bands 48            frequency bands, and colours sent per frame
@@ -55,8 +62,9 @@ Useful flags:
 
 ## Where the audio comes from
 
-Two ways in, picked from the **Source** dropdown in the editor or the flags
-above, and switchable while running:
+Three ways in, picked from the **Source** dropdown in the editor or the flags
+above, and switchable while running. Two of them are audio; MIDI is the third,
+and has a section of its own below.
 
 **Loopback** taps a playback endpoint — the mix Windows is already sending to
 the speakers. No cable, no Stereo Mix, no microphone: cpal sets
@@ -90,6 +98,88 @@ Switching rebuilds the analyser only when the sample rate actually changes. Band
 edges come from the scale config alone, so a rate change moves which FFT tier
 each band draws from, never the centre frequencies the strip is mapped against —
 which is why the renderer survives untouched.
+
+## MIDI
+
+A MIDI port is a third kind of source, picked from the same dropdown and
+switchable while running. Notes land on the x axis and velocity on the y, which
+is the same pair of axes audio uses — so the colour surface, the LED sectors,
+reverse, mirror, the EQ and the intensity curve all work on notes without
+knowing anything has changed.
+
+### Getting FL Studio into it
+
+A keyboard needs no setup: plug it in, hit rescan, pick it. FL Studio needs one
+step, and it is the step everyone gets stuck on:
+
+**The MIDI Out plugin sends to a MIDI *output*. This listens on a MIDI *input*.
+Windows has nothing that joins the two.** No amount of clicking in either
+application will connect them, and the engine cannot fix it from its side —
+creating a virtual MIDI port on Windows means a signed kernel driver, which a
+user-space process cannot conjure.
+
+So, once:
+
+1. Install [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html) and
+   create a port in it.
+2. In FL: Options → MIDI settings → **Output**, enable that port and note the
+   port number it is given.
+3. Set the MIDI Out plugin's **Port** knob to that number.
+
+The loopMIDI port then shows up here like any other input. No MIDI hardware is
+involved at any point. `--midi --probe 3` is the flag to reach for when nothing
+appears to arrive: it separates "the port is wrong" from "the notes are landing
+on a channel or in an octave that is being filtered out".
+
+### The note range is stretched, not placed
+
+The obvious mapping is to put a note at its real pitch. The axis is logarithmic,
+so semitones would come out evenly spaced for free — and it wastes most of the
+wall, because an 88-key piano tops out at 4186 Hz and the last quarter of the
+strip would never light.
+
+So the configured note range is stretched across the whole axis instead: the
+lowest note at 20 Hz, the highest at 20 kHz, semitones evenly spaced between.
+Narrowing the range therefore **magnifies rather than crops** — two octaves
+across a wall is a legitimate and very different look.
+
+The consequence worth being explicit about: in MIDI mode the axis is *positions*,
+not pitches. A colour keyframe at "250 Hz" means a fifth of the way along. The
+editor relabels the axis with note names so it is not quietly lying about it.
+
+| Control | What it does |
+|---|---|
+| Note range | which notes fill the strip. Notes outside it are dropped, and counted — the editor says how many rather than leaving a dark strip unexplained |
+| Note glow | how far a note bleeds into its neighbours, in semitones. 0 is one hard bar per note |
+| Sustain pedal | whether CC64 holds released notes lit, as it holds them sounding |
+| Decay | the release time after a note is let go — the same control, and the same mapping, as the audio ballistics |
+
+The grid is one point per semitone, which is finer than any audio band plan and
+is what keeps adjacent notes readable as separate bars. The *wire* carries fewer:
+the protocol allows 85 colours per frame and the stock sketch is built with
+`MAX_BANDS 64`, so a full 88-key range is resampled by frequency on the way out.
+That costs a little spatial resolution on the strip and nothing else — and the
+engine says so at startup when it happens.
+
+**The limit comes from the board, not from the protocol.** The firmware sizes
+its receive buffer from its own `MAX_BANDS` and stops reading anything longer,
+with nothing to reply on, so an over-long frame is dropped in silence — and every
+display on the PC keeps working, because none of them cross the wire. That
+failure looks exactly like broken hardware. The handshake carries the real limit
+and the geometry is built from it. Raising `MAX_BANDS` in
+`firmware/djled/djled.ino` and reflashing gets the resolution back; at 150 LEDs
+there is room for the full 85.
+
+### What it does with the messages
+
+Note-on sets the level to velocity and holds it there — a held chord does not
+fade under your fingers. Note-off starts the release. Note-on at velocity 0 is
+treated as note-off, which every sequencer including FL's relies on. CC64 latches
+notes like a piano; CC120 and CC123 release everything. Pitch bend, aftertouch
+and program change are ignored.
+
+Two notes a semitone apart take the loudest rather than summing, so they read as
+two notes instead of one twice as bright.
 
 ## Why the DSP looks the way it does
 
@@ -196,7 +286,8 @@ The editor's controls land in three different places, and which one matters:
 
 | Control | Stage | Why there |
 |---|---|---|
-| Source, channel | `capture.rs` | it is the signal itself; a rate change rebuilds the analyser |
+| Source, channel | `source.rs` | it is the signal itself; a rate change rebuilds the analyser, a kind change rebuilds the renderer |
+| Note range, glow, sustain | `midi/notes.rs` | they define the grid the levels sit on |
 | EQ | `dsp/post.rs`, after AGC, before the range map | see below |
 | Decay | release ballistics in `dsp/post.rs` | it *is* the release time |
 | Frame hop | rebuilds the analyser | changes how often transforms run |
@@ -283,7 +374,7 @@ next during the blackout.
 ## Tests
 
 ```bash
-cargo test --manifest-path engine/Cargo.toml   # 159
+cargo test --manifest-path engine/Cargo.toml   # 207
 cd ui && npm test && npm run typecheck
 ```
 
@@ -291,6 +382,11 @@ The ones worth knowing about live in `engine/tests/artifacts.rs`: they assert th
 reported bug stays fixed, and one of them independently computes what a naive
 analyser would produce, so the suppression tests are not merely asserting that
 nothing ever happens.
+
+`engine/tests/midi_pipeline.rs` makes the same end-to-end claim for notes, and
+is the only coverage of the MIDI path that runs without a port attached — the
+note engine is deliberately separable from the driver, so notes can be delivered
+as bytes rather than by playing a keyboard at the test runner.
 
 `engine/tests/pipeline.rs` covers the other failure mode: a control that is
 computed correctly and then dropped on the way to the wire. Every editor control

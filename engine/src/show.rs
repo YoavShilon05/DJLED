@@ -18,6 +18,7 @@ use crate::color::SurfaceConfig;
 use crate::dsp::eq::EqBand;
 use crate::dsp::mrstft::DEFAULT_HOP;
 use crate::dsp::post::REFERENCE_DECAY;
+use crate::midi::MidiConfig;
 
 /// Hop sizes the editor offers. Anything else is clamped into this range —
 /// a hop below 64 buries the machine in transforms and one above 8192 is
@@ -41,6 +42,12 @@ pub struct ShowConfig {
     pub decay: f32,
     /// New samples between analysis frames.
     pub sample_length: usize,
+    /// How MIDI notes land on the axis. Carried in the show rather than beside
+    /// the source selection because it is authored, not discovered — the note
+    /// range and spread are as much a part of a look as the colours are, and
+    /// they should travel with a saved show and survive switching to audio and
+    /// back.
+    pub midi: MidiConfig,
 }
 
 impl Default for ShowConfig {
@@ -56,6 +63,7 @@ impl Default for ShowConfig {
             curve: IntensityCurve { kind: CurveKind::Linear, ..Default::default() },
             decay: REFERENCE_DECAY,
             sample_length: DEFAULT_HOP,
+            midi: MidiConfig::default(),
         }
     }
 }
@@ -107,7 +115,8 @@ mod tests {
             "clamp": -12,
             "curve": { "type": "easeIn", "p1": {"x":0.25,"y":0.1}, "p2": {"x":0.25,"y":1} },
             "decay": 0.9,
-            "sampleLength": 1024
+            "sampleLength": 1024,
+            "midi": { "lowNote": 36, "highNote": 96, "spread": 0.5, "sustain": false }
         }"##;
         let cfg: ShowConfig = serde_json::from_str(json).unwrap();
 
@@ -118,6 +127,8 @@ mod tests {
         assert_eq!(cfg.curve.kind, CurveKind::EaseIn);
         assert_eq!(cfg.hop(), 1024);
         assert_eq!(cfg.layout().led_keyframes[1].led, 149);
+        assert_eq!(cfg.midi.range(), (36, 96));
+        assert!(!cfg.midi.sustain);
     }
 
     /// An editor that predates a field must not fail the whole message.
@@ -128,6 +139,7 @@ mod tests {
         assert_eq!(cfg.decay(), REFERENCE_DECAY);
         assert_eq!(cfg.hop(), DEFAULT_HOP);
         assert!(cfg.eq.is_empty());
+        assert_eq!(cfg.midi, MidiConfig::default());
 
         let cfg: ShowConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(cfg.threshold, -62.0);

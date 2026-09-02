@@ -181,6 +181,19 @@ impl Link for SerialLink {
         )
     }
 
+    /// What the board said it can take, in the handshake it has already
+    /// completed by the time this can be called.
+    ///
+    /// A zero is treated as "did not say" rather than as "none": the sketch has
+    /// always reported this, but reading a broken value as a limit of nothing
+    /// would blank the strip on the strength of one bad byte.
+    fn max_points(&self) -> usize {
+        match self.hello.max_bands as usize {
+            0 => protocol::max_bands(),
+            n => n.min(protocol::max_bands()),
+        }
+    }
+
     fn send(&mut self, bands: &[[u8; 3]]) -> Result<bool> {
         if !self.await_ready(READY_TIMEOUT)? {
             return Ok(false);

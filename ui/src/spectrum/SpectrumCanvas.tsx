@@ -2,6 +2,7 @@ import { useLayoutEffect, useMemo, useRef } from "react";
 import { useMantineTheme } from "@mantine/core";
 
 import type { SurfaceConfig } from "../color/surface";
+import type { AxisScale } from "./axis";
 import type { PlotLayout } from "./layout";
 import { ColorField, paintPlot, type SpectrumFrame } from "./paint";
 
@@ -9,6 +10,7 @@ interface Props {
   layout: PlotLayout;
   surface: SurfaceConfig;
   frame: SpectrumFrame;
+  axis: AxisScale;
 }
 
 /**
@@ -16,7 +18,7 @@ interface Props {
  * coordinate space and never handles a pointer event — hit testing belongs to
  * the layer that already knows where the handles are.
  */
-export function SpectrumCanvas({ layout, surface, frame }: Props) {
+export function SpectrumCanvas({ layout, surface, frame, axis }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const theme = useMantineTheme();
   const field = useMemo(() => new ColorField(), []);
@@ -35,8 +37,8 @@ export function SpectrumCanvas({ layout, surface, frame }: Props) {
     }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    paintPlot(ctx, layout, field.render(surface), frame, theme.other.plot);
-  }, [layout, surface, frame, field, theme]);
+    paintPlot(ctx, layout, field.render(surface), frame, theme.other.plot, axis);
+  }, [layout, surface, frame, field, theme, axis]);
 
   return (
     <canvas
