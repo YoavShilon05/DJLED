@@ -5,11 +5,18 @@ instrument is playing into it, or the notes a DAW is sending it — maps that on
 a frequency axis, turns each position into a colour, and streams the result to
 an Arduino driving a WS2812B strip.
 
+A show is a **stack of layers**. Each one has its own source, its own colours and
+its own everything else, and they composite like a Photoshop stack: the top one
+paints over the rest, opacity blends with what is underneath, and black covers
+it.
+
 ```
-loopback / input ─┐
-                  ├─► levels over the axis ─► colour surface ─► serial ─► Arduino ─► strip
-MIDI port ────────┘            │                                          (expands points
-                               └──────► WebSocket ─► editor UI             across LEDs)
+loopback / input ─┐   ┌─ layer 3 ─┐
+                  ├──►├─ layer 2 ─┤─► composite ─► serial ─► Arduino ─► strip
+MIDI port ────────┘   └─ layer 1 ─┘       │                  (expands points
+   (one open handle           each: levels │ over the axis    across LEDs)
+    per device,                → colour surface → intensity)
+    shared by layers)                      └──► WebSocket ─► editor UI
 ```
 
 Audio arrives as frequency bands and MIDI as notes, but both come out as *levels
@@ -20,8 +27,8 @@ produced them.
 
 | Path | What it is |
 |---|---|
-| `engine/` | Rust. Capture, MIDI, DSP, colour, wire protocol, UI bridge. |
-| `ui/` | React + TypeScript + Mantine. The spectrum editor. |
+| `engine/` | Rust. Capture, MIDI, DSP, colour, compositing, wire protocol, UI bridge. |
+| `ui/` | React + TypeScript + Mantine. The layer stack and the spectrum editor. |
 | `firmware/djled/` | Arduino sketch. |
 | `docs/wiring.md` | **Read before powering anything.** |
 
@@ -66,6 +73,12 @@ Three ways in, picked from the **Source** dropdown in the editor or the flags
 above, and switchable while running. Two of them are audio; MIDI is the third,
 and has a section of its own below.
 
+The choice is made **per layer**, so a show can be listening to all three at
+once. Layers naming the same device share one open handle — see
+[Layers](#layers) — so this costs a capture per distinct device, not per layer.
+The flags select the source for the one layer the engine starts with; the stack
+is grown in the editor, because a stack is authored rather than typed.
+
 **Loopback** taps a playback endpoint — the mix Windows is already sending to
 the speakers. No cable, no Stereo Mix, no microphone: cpal sets
 `AUDCLNT_STREAMFLAGS_LOOPBACK` for any device whose data flow is `eRender`, so
@@ -106,6 +119,11 @@ switchable while running. Notes land on the x axis and velocity on the y, which
 is the same pair of axes audio uses — so the colour surface, the LED sectors,
 reverse, mirror, the EQ and the intensity curve all work on notes without
 knowing anything has changed.
+
+Two layers can take two *channels* of one port, which is the natural way to
+drive a wall from a DAW: one part per layer, each with its own colours and its
+own decay. The port is opened once and the channel filter applied per layer,
+because Windows would refuse the second open.
 
 ### Getting FL Studio into it
 
@@ -215,12 +233,105 @@ confirmed (`dsp/fastpath.rs`).
 Latency lands around 32 ms for treble. Bass steady-state is slower by physics,
 but the transient path puts its *perceived* response near 25 ms.
 
+## Layers
+
+A show is a **stack of layers**, bottom first, composited in order. Everything
+that shapes a look belongs to a layer: its own source, its own colour keyframes,
+its own EQ, decay, hop, sectors, reverse, mirror, thresholds, curve and note
+range. Two layers can be watching two different devices — a slow red bass wash
+from the PC output under hard white snare flashes from a MIDI channel — and
+neither knows about the other until they meet in strip space.
+
+Drag a row to reorder. The list is drawn **top first**, the reverse of how the
+config stores it, because a stack is read top-down: the top row is the one
+painting over everything else.
+
+Only master brightness stays outside a layer. It is the power budget for the
+whole strip, and a layer that dimmed the ones below it would be a blend mode
+rather than a brightness.
+
+### Black blocks, opacity blends
+
+Two layers meet with plain `source-over` in linear light, and the interesting
+half is what that means for the two ways a layer can be dark:
+
+- **Black is a colour, and it covers.** A band the threshold has closed is
+  painted with its field's colour at zero intensity — black, in the stock
+  palette — at whatever opacity that keyframe carries. So an opaque quiet band
+  hides what is under it, exactly as an opaque bright one does. The intensity
+  curve scales *light*, never coverage, which is what makes this true.
+- **Opacity is the absence of a colour, and it reveals.** A layer that should
+  show the one below in its quiet regions says so by authoring opacity at the
+  bottom of its field, and the layer below shows through there.
+
+That is why colour is stored un-premultiplied and authored as `#rrggbbaa`. Over
+an unlit strip the two are indistinguishable — `#ff0000` at half opacity and
+`#800000` reach the LEDs as the same bytes — and it is precisely stacking that
+tells them apart.
+
+There is a third case that is neither: **an LED no sector reaches is not painted
+at all.** Sectors are how a layer is confined to part of the wall, and a layer
+covering the first fifty LEDs must not blank the other hundred. "Outside my
+sectors" is not a colour.
+
+A new layer is seeded to make this immediate: transparent at the bottom of its
+field and coloured at the top, so it lights where there is signal and shows what
+is underneath where there is not.
+
+### One device, many layers
+
+Layers naming the same device **share one open handle**. Four layers on the PC
+output cost one capture and four analysers, which is the right shape — the
+capture is the scarce half:
+
+- A WASAPI endpoint opened twice is two captures of the same audio for twice the
+  cost.
+- A MIDI input opened twice is an outright failure. Windows hands a port to one
+  application at a time, and that application is already this one. So the MIDI
+  *channel* is a filter applied per layer by the note engine rather than a
+  property of the port — which is what lets two layers take two channels of one
+  keyboard.
+
+Audio is the other way round: which channel of an interface is analysed is
+chosen when the stream is built, so two channels genuinely are two streams.
+
+A feed is polled once per pass and every analyser bound to it sees the *same*
+block. Anything else would have two layers racing for one ring buffer and each
+getting half the audio.
+
+**One dead device costs one dark layer.** A layer whose endpoint will not open
+keeps its place in the stack, sits at silence, and carries the reason; every
+other layer runs and the strip stays lit. The editor says which row is dark and
+why. Rescanning retries them, because plugging the missing interface back in is
+exactly when someone presses it.
+
+### What the stack costs
+
+The wire does not change. Still one colour per control point, still 149 bytes,
+however many layers went into computing them — the whole fold happens on the PC,
+which is the same reason LED sectors needed no firmware change. The stack is
+rendered at the widest grid any layer has, so a 48-band audio layer under 88
+semitones of MIDI is not resampled down to 48.
+
+What it does cost is an analyser per layer, which is why a hidden layer is
+skipped outright rather than composited at zero: muting one is a real saving.
+
+The engine reads a config that predates all of this — flat fields, no `layers` —
+as the one-layer show it always was, and a one-layer stack is byte-identical to
+what the renderer produced before layers existed. Both are pinned by tests.
+
 ## The editor
 
 One plot does everything. The x axis is log frequency, the y axis is dB, and the
 background is the colour surface — so a bar is not drawn in some arbitrary
 accent colour, it is drawn by *revealing* the field it reaches into. The pixel
 under the tip of a bar is the colour that band will send to the strip.
+
+The plot shows **one layer at a time**, the one selected in the stack. Every
+gizmo on it belongs to a single layer — its keyframes, its sectors, its EQ, its
+two rail handles — and six sets of them on one graph would be unreadable and
+unclickable. The composited result of the whole stack is the strip preview
+underneath, which is the honest place to judge it.
 
 Everything else hangs off those two axes:
 
@@ -272,9 +383,11 @@ in the engine compares against what it already holds, so applying it is a few
 float comparisons — and one message means the two sides cannot end up
 disagreeing about which half of an edit landed.
 
-The two strips at the bottom are the check on that: `Preview` is the config
-applied locally in the browser, `Engine` is what the wall is actually doing.
-They should agree.
+The two strips at the bottom are the check on that: `Preview` is the whole stack
+composited locally in the browser, `Engine` is what the wall is actually doing.
+They should agree — and with layers they are the only view that shows the result
+rather than one contributor to it. `ui/scripts/stack-smoke.mjs` (`npm run smoke`)
+drives that seam over the real socket against a running engine.
 
 Styling is Mantine with a theme and no per-component overrides — `src/theme.ts`
 holds every colour decision, including the palette the canvas and SVG layers
@@ -282,17 +395,20 @@ paint with, and `src/styles.css` is two rules long.
 
 ## Where each control acts
 
-The editor's controls land in three different places, and which one matters:
+Everything in this table is **per layer**; only master brightness is not. The
+controls land in three different places, and which one matters:
 
 | Control | Stage | Why there |
 |---|---|---|
-| Source, channel | `source.rs` | it is the signal itself; a rate change rebuilds the analyser, a kind change rebuilds the renderer |
+| Layer order, opacity, enable | `color/render.rs` | the fold itself, applied after every layer has been sampled |
+| Source, channel | `stack.rs`, then `source.rs` | it is the signal itself; the stack decides which layers share a device, and a kind change rebuilds that layer's renderer |
 | Note range, glow, sustain | `midi/notes.rs` | they define the grid the levels sit on |
 | EQ | `dsp/post.rs`, after AGC, before the range map | see below |
 | Decay | release ballistics in `dsp/post.rs` | it *is* the release time |
 | Frame hop | rebuilds the analyser | changes how often transforms run |
 | Threshold, clamp, curve | `color/intensity.rs` | output shaping, not analysis |
-| LED sectors, reverse, mirror | `color/strip.rs` | spatial, applied last |
+| LED sectors, reverse, mirror | `color/strip.rs` | spatial, applied last — and per layer, so sectors also confine a layer to part of the wall |
+| Master brightness | `color/render.rs`, after the fold | the power budget for the whole strip, which is why it is the one control not on a layer |
 
 **The EQ sits after the AGC and before the range map**, and both ends are load-
 bearing. Before the AGC, an authored boost looks like drift and gets unwound
@@ -340,9 +456,10 @@ Every colour carries opacity as a fourth channel, authored as `#rrggbbaa` (six
 digits still means opaque, so older presets load unchanged). With one layer
 composited onto an unlit strip that reads as a dimming — `#ff0000` at half
 opacity and `#800000` reach the LEDs as the same bytes — but that is a property
-of the backdrop being black, and it ends when layers stack: over a blue layer the
-first shows purple and the second still shows dark red. Two rules make that work
-rather than merely look like it does:
+of the backdrop being black, and it ends the moment layers stack: over a blue
+layer the first shows purple and the second still shows dark red. That
+distinction is what [Layers](#layers) is built on. Two rules make it work rather
+than merely look like it does:
 
 - Colour is stored **un-premultiplied**, so a hue means the same thing at any
   opacity and fading a keyframe out and back in returns what was authored.
@@ -374,8 +491,8 @@ next during the blackout.
 ## Tests
 
 ```bash
-cargo test --manifest-path engine/Cargo.toml   # 207
-cd ui && npm test && npm run typecheck
+cargo test --manifest-path engine/Cargo.toml   # 240
+cd ui && npm test && npm run typecheck         # 59
 ```
 
 The ones worth knowing about live in `engine/tests/artifacts.rs`: they assert the
@@ -392,8 +509,17 @@ as bytes rather than by playing a keyboard at the test runner.
 computed correctly and then dropped on the way to the wire. Every editor control
 has an end-to-end test that its effect reaches the LED bytes — mirroring lights
 both ends, a sector confines a tone to its own LEDs, a 24 dB cut halves the
-output — because the unit tests for each stage all pass whether or not anything
-is plugged into them.
+output, red under green comes out green — because the unit tests for each stage
+all pass whether or not anything is plugged into them.
+
+The layer tests are in three places, because there are three ways a stack can be
+wrong. `color/render.rs` pins the fold itself, including that a one-layer stack
+is byte-identical to what came before it. `stack.rs` pins the pooling against
+whatever devices the machine really has — that a second layer on one endpoint
+shares the handle rather than opening it twice is not something a mock can
+demonstrate. `ui/src/spectrum/stack.test.ts` makes the same claims about the
+browser's copy of the fold, so the Preview strip cannot quietly disagree with the
+wall.
 
 The EQ is asserted against closed-form properties on **both** sides — a bell is
 exactly its gain at centre, a pass filter is −3.01 dB at cutoff when `Q = 1/√2`,

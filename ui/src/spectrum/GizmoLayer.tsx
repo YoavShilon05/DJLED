@@ -1,6 +1,6 @@
 import { memo, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 
-import type { EditorConfig } from "../config/editor";
+import type { EditorLayer, GizmoFlags } from "../config/editor";
 import { DB_TICKS } from "../config/scales";
 import type { PlotPalette } from "../theme";
 import type { AxisScale } from "./axis";
@@ -33,7 +33,13 @@ export function targetId(target: GizmoTarget | null, kind: "color" | "led" | "eq
 
 interface Props {
   layout: PlotLayout;
-  config: EditorConfig;
+  /** The layer being edited. Every gizmo on the plot belongs to one layer —
+   *  its keyframes, its sectors, its EQ, its thresholds. */
+  layer: EditorLayer;
+  /** Which overlays are drawn. Visibility only, and about reading the plot
+   *  rather than about the strip, so it belongs to the editor rather than to
+   *  any one layer. */
+  gizmos: GizmoFlags;
   palette: PlotPalette;
   /** What the horizontal marks are called — frequencies, or notes when MIDI is
    *  driving the strip. The positions are the same either way. */
@@ -65,7 +71,8 @@ const MONO = "var(--mantine-font-family-monospace)";
  */
 export const GizmoLayer = memo(function GizmoLayer({
   layout,
-  config,
+  layer,
+  gizmos,
   palette,
   axis,
   sampleRate,
@@ -80,10 +87,9 @@ export const GizmoLayer = memo(function GizmoLayer({
   // Renamed on the way out of the layout: `axis` is the scale prop, and the
   // two would shadow each other.
   const { plot, gutter, axis: axisRect, track } = layout;
-  const { gizmos } = config;
 
-  const thresholdY = yOfDb(layout, config.threshold);
-  const clampY = yOfDb(layout, config.clamp);
+  const thresholdY = yOfDb(layout, layer.threshold);
+  const clampY = yOfDb(layout, layer.clamp);
   const laneX = railLaneX(layout);
 
   return (
@@ -121,7 +127,7 @@ export const GizmoLayer = memo(function GizmoLayer({
       )}
 
       {gizmos.ledKeyframes &&
-        config.ledKeyframes.map((k) => {
+        layer.ledKeyframes.map((k) => {
           const x = xOfHz(layout, k.hz);
           return (
             <line
@@ -142,7 +148,7 @@ export const GizmoLayer = memo(function GizmoLayer({
       {gizmos.eq && (
         <EqGizmo
           layout={layout}
-          bands={config.eq}
+          bands={layer.eq}
           sampleRate={sampleRate}
           palette={palette}
           selectedId={targetId(selected, "eq")}
@@ -158,7 +164,7 @@ export const GizmoLayer = memo(function GizmoLayer({
             layout={layout}
             palette={palette}
             label="CLAMP"
-            db={config.clamp}
+            db={layer.clamp}
             active={sameTarget(active, { kind: "clamp" })}
           />
           <LevelLine
@@ -166,7 +172,7 @@ export const GizmoLayer = memo(function GizmoLayer({
             layout={layout}
             palette={palette}
             label="THRESHOLD"
-            db={config.threshold}
+            db={layer.threshold}
             active={sameTarget(active, { kind: "threshold" })}
           />
         </>
@@ -174,8 +180,8 @@ export const GizmoLayer = memo(function GizmoLayer({
 
       {gizmos.curve && (
         <CurveGizmo
-          box={curveBox(layout, config.clamp, config.threshold)}
-          curve={config.curve}
+          box={curveBox(layout, layer.clamp, layer.threshold)}
+          curve={layer.curve}
           palette={palette}
           activePoint={active?.kind === "curve" ? active.point : null}
           onGrab={(point, e) => onGrab({ kind: "curve", point }, e)}
@@ -204,7 +210,7 @@ export const GizmoLayer = memo(function GizmoLayer({
       )}
 
       {gizmos.colorKeyframes &&
-        config.colorKeyframes.map((k) => {
+        layer.colorKeyframes.map((k) => {
           const target: GizmoTarget = { kind: "color", id: k.id };
           const on = sameTarget(selected, target) || sameTarget(active, target);
           return (
@@ -310,7 +316,7 @@ export const GizmoLayer = memo(function GizmoLayer({
         onPointerDown={onClearSelection}
       />
       {gizmos.ledKeyframes &&
-        config.ledKeyframes.map((k) => {
+        layer.ledKeyframes.map((k) => {
           const target: GizmoTarget = { kind: "led", id: k.id };
           const on = sameTarget(selected, target) || sameTarget(active, target);
           const x = xOfHz(layout, k.hz);

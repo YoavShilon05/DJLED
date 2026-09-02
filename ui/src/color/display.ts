@@ -19,7 +19,15 @@
  *     rather than as a dark patch that happens to look similar.
  */
 
-import { BLACK, clampedRgb, linearToSrgb, oklabToLinearRgb, over, type Oklab } from "./oklab";
+import {
+  BLACK,
+  clampedRgb,
+  linearToSrgb,
+  oklabToLinearRgb,
+  over,
+  type LinearRgb,
+  type Oklab,
+} from "./oklab";
 
 export type Rgb = [number, number, number];
 export type Rgba = [number, number, number, number];
@@ -36,7 +44,19 @@ const srgbByte = (v: number) => Math.round(clamp01(linearToSrgb(clamp01(v))) * 2
  * light, and the LED is driven in linear terms anyway.
  */
 export function oklabToDisplay(c: Oklab, gain = 1): Rgb {
-  const rgb = over(clampedRgb(oklabToLinearRgb(c)), BLACK);
+  return linearRgbToDisplay(oklabToLinearRgb(c), gain);
+}
+
+/**
+ * Linear RGB to opaque sRGB bytes for the screen, composited onto black.
+ *
+ * What {@link oklabToDisplay} is underneath, exposed separately because the
+ * layer stack composites in linear RGB and has no Oklab value left by the time
+ * it reaches the screen — the fold happens where light adds, not where colours
+ * interpolate.
+ */
+export function linearRgbToDisplay(c: LinearRgb, gain = 1): Rgb {
+  const rgb = over(clampedRgb(c), BLACK);
   return [srgbByte(rgb.r * gain), srgbByte(rgb.g * gain), srgbByte(rgb.b * gain)];
 }
 

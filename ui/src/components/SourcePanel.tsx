@@ -1,6 +1,7 @@
 import { Alert, Anchor, List, Paper, Select, Stack, Text } from "@mantine/core";
 
-import type { InputDevice, InputSource, InputState, SourceKind } from "../engine";
+import type { EditorLayer } from "../config/editor";
+import type { InputDevice, InputSource, LayerStatus, SourceKind } from "../engine";
 import { Field } from "./Field";
 
 /**
@@ -18,20 +19,33 @@ const DEFAULT_KEYS: Record<SourceKind, string> = {
 };
 
 interface Props {
-  /** Null until the engine has been heard from; the editor stays usable
-   *  offline, but there is nothing to choose between. */
-  input: InputState | null;
-  /** Notes dropped for falling outside the note range, from the live frame. */
-  outOfRange: number;
-  onSource: (source: InputSource) => void;
+  /** The layer being edited. Each layer listens to its own device. */
+  layer: EditorLayer;
+  onChange: (layer: EditorLayer) => void;
+  /** Everything selectable, as of the last scan. Empty until the engine has
+   *  been heard from; the editor stays usable offline, but there is nothing to
+   *  choose between. */
+  devices: InputDevice[];
+  /** What this layer's selection actually resolved to. Null while offline. */
+  status: LayerStatus | null;
+  connected: boolean;
   onRefresh: () => void;
 }
 
-export function SourcePanel({ input, outOfRange, onSource, onRefresh }: Props) {
-  const devices = input?.devices ?? [];
-  const selected = input ? (input.source.id ?? DEFAULT_KEYS[input.source.kind]) : null;
-  const midi = input?.kind === "midi";
-  const noMidiPorts = input !== null && !devices.some((d) => d.kind === "midi");
+/**
+ * What one layer listens to.
+ *
+ * The selection is authored here and travels with the layer, so it survives a
+ * reorder, a duplicate and a save. Whether it *opened* is the engine's answer,
+ * and that is what the hint underneath reports — showing a selection that
+ * failed would be a lie the size of a dark row.
+ */
+export function SourcePanel({ layer, onChange, devices, status, connected, onRefresh }: Props) {
+  const selected = layer.source.id ?? DEFAULT_KEYS[layer.source.kind];
+  const midi = layer.source.kind === "midi";
+  const noMidiPorts = connected && !devices.some((d) => d.kind === "midi");
+  const channels = status?.channels ?? 0;
+  const outOfRange = status?.notesOutOfRange ?? 0;
 
   const change = (key: string | null) => {
     if (!key) return;
@@ -40,35 +54,39 @@ export function SourcePanel({ input, outOfRange, onSource, onRefresh }: Props) {
     const preset = (Object.entries(DEFAULT_KEYS) as Array<[SourceKind, string]>).find(
       ([, value]) => value === key,
     );
-    if (preset) onSource({ id: null, kind: preset[0], channel: null });
-    else {
-      const kind = devices.find((d) => d.id === key)?.kind ?? "input";
-      onSource({ id: key, kind, channel: null });
-    }
+    const source: InputSource = preset
+      ? { id: null, kind: preset[0], channel: null }
+      : { id: key, kind: devices.find((d) => d.id === key)?.kind ?? "input", channel: null };
+    onChange({ ...layer, source });
   };
 
   return (
     <Paper>
       <Stack gap="md">
         <Text size="xs" c="dimmed" fw={700} tt="uppercase" lts="0.08em">
-          Source
+          Source · {layer.name}
         </Text>
 
         <Field
           label="Listening to"
           value={
-            <Anchor component="button" type="button" size="xs" onClick={onRefresh} disabled={!input}>
+            <Anchor
+              component="button"
+              type="button"
+              size="xs"
+              onClick={onRefresh}
+              disabled={!connected}
+            >
               rescan
             </Anchor>
           }
-          hint={describe(input)}
+          hint={describe(layer, status, connected)}
         >
           <Select
             data={group(devices)}
             value={selected}
             onChange={change}
-            disabled={!input}
-            placeholder={input ? "select a source" : "engine offline"}
+            placeholder="select a source"
             allowDeselect={false}
             comboboxProps={{ withinPortal: true }}
           />
@@ -76,12 +94,12 @@ export function SourcePanel({ input, outOfRange, onSource, onRefresh }: Props) {
 
         {/* Only worth showing where there is a choice to make: a mono
             microphone has nothing to pick between. */}
-        {input && input.channels > 1 && (
+        {channels > 1 && (
           <Field
             label={midi ? "MIDI channel" : "Channel"}
             hint={
               midi
-                ? "A DAW can send several parts down one cable. Pick one to light the strip from that part alone."
+                ? "A DAW can send several parts down one cable. Pick one to light this layer from that part alone — another layer can take a different one, and they share the port."
                 : "An instrument in input 1 only exists on one channel — mixing it with a silent neighbour costs 6 dB and adds that neighbour's noise."
             }
           >
@@ -89,18 +107,21 @@ export function SourcePanel({ input, outOfRange, onSource, onRefresh }: Props) {
               data={[
                 {
                   value: "mix",
-                  label: midi ? `All ${input.channels} channels` : `Mix all ${input.channels}`,
+                  label: midi ? `All ${channels} channels` : `Mix all ${channels}`,
                 },
-                ...Array.from({ length: input.channels }, (_, i) => ({
+                ...Array.from({ length: channels }, (_, i) => ({
                   value: String(i),
                   label: `Channel ${i + 1}`,
                 })),
               ]}
-              value={input.source.channel === null ? "mix" : String(input.source.channel)}
+              value={layer.source.channel === null ? "mix" : String(layer.source.channel)}
               onChange={(value) =>
-                onSource({
-                  ...input.source,
-                  channel: value === null || value === "mix" ? null : Number(value),
+                onChange({
+                  ...layer,
+                  source: {
+                    ...layer.source,
+                    channel: value === null || value === "mix" ? null : Number(value),
+                  },
                 })
               }
               allowDeselect={false}
@@ -114,18 +135,21 @@ export function SourcePanel({ input, outOfRange, onSource, onRefresh }: Props) {
         {midi && outOfRange > 0 && (
           <Alert color="yellow" variant="light" title="Notes outside the range">
             <Text size="xs" lh={1.4}>
-              {outOfRange} note{outOfRange === 1 ? "" : "s"} arrived outside the note range and
-              were dropped. Widen the range under MIDI, or transpose what is playing.
+              {outOfRange} note{outOfRange === 1 ? "" : "s"} arrived outside this layer's note
+              range and were dropped. Widen the range under MIDI, or transpose what is playing.
             </Text>
           </Alert>
         )}
 
         {noMidiPorts && <LoopMidiHint />}
 
-        {input?.error && (
+        {status?.error && (
           <Alert color="red" variant="light" title="Source">
             <Text size="xs" lh={1.4}>
-              {input.error}
+              {status.error}
+            </Text>
+            <Text size="xs" c="dimmed" lh={1.4} mt={4}>
+              Only this layer is affected — the rest of the stack is still running.
             </Text>
           </Alert>
         )}
@@ -217,36 +241,39 @@ function label(device: InputDevice, all: InputDevice[]): string {
 }
 
 /**
- * What is actually being listened to. The selection alone does not say: "the
- * system default" names no device, and the rate comes from the endpoint rather
- * than from anything that was asked for.
+ * What this layer is actually listening to. The selection alone does not say:
+ * "the system default" names no device, and the rate comes from the endpoint
+ * rather than from anything that was asked for.
  */
-function describe(input: InputState | null): string {
-  if (!input) return "Start the engine to choose what to listen to.";
+function describe(layer: EditorLayer, status: LayerStatus | null, connected: boolean): string {
+  if (!connected) {
+    return "Start the engine to see what this resolves to. The selection is saved with the layer either way.";
+  }
+  if (!status) return "Waiting for the engine to report on this layer.";
 
-  if (input.kind === "midi") {
+  if (status.kind === "midi") {
     const channel =
-      input.source.channel === null
+      layer.source.channel === null
         ? "all channels"
-        : `channel ${input.source.channel + 1} of ${input.channels}`;
-    return `${input.deviceName} · midi · ${channel}. Notes land across the strip by pitch and velocity sets brightness; the range and glow are under MIDI.`;
+        : `channel ${layer.source.channel + 1} of ${status.channels}`;
+    return `${status.deviceName} · midi · ${channel}. Notes land across the strip by pitch and velocity sets brightness; the range and glow are under MIDI. Other layers can share this port on other channels.`;
   }
 
   const parts = [
-    input.deviceName,
+    status.deviceName,
     // Second, not buried at the end: which half of a device is being read is the
     // thing most likely to be wrong, and the least visible once chosen.
-    input.kind,
-    `${(input.sampleRate / 1000).toFixed(1)} kHz`,
-    input.source.channel === null
-      ? `${input.channels} ch mixed`
-      : `channel ${input.source.channel + 1} of ${input.channels}`,
+    status.kind,
+    `${(status.sampleRate / 1000).toFixed(1)} kHz`,
+    layer.source.channel === null
+      ? `${status.channels} ch mixed`
+      : `channel ${layer.source.channel + 1} of ${status.channels}`,
   ];
 
   // The failure this whole control exists for, described by its symptom rather
   // than its cause — "Spotify shows up, my DAW doesn't" is how it is met.
   const hint =
-    input.kind === "loopback"
+    status.kind === "loopback"
       ? " Loopback hears anything Windows mixes, but never a DAW on an ASIO driver — ASIO bypasses Windows entirely. Select this interface's input for that, or send it MIDI instead."
       : "";
 

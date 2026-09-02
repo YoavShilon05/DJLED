@@ -153,6 +153,17 @@ pub struct ControlPoint {
     pub y: f32,
     /// Brightness from the intensity stage, applied in linear light.
     pub gain: f32,
+    /// Whether this layer's sectors address this position at all.
+    ///
+    /// Distinct from `gain == 0`, and the distinction only exists because of
+    /// the stack. A band that is *quiet* has been painted with the colour its
+    /// field holds at zero intensity — black, in the stock palette — and that
+    /// colour covers whatever is beneath it. A position no sector reaches has
+    /// not been painted at all, so the layer below shows through untouched.
+    ///
+    /// Over the unlit strip the two are indistinguishable, which is why a
+    /// one-layer show behaves exactly as it did before this field existed.
+    pub covered: bool,
 }
 
 /// Turns band levels into the control points the wire carries.
@@ -217,14 +228,17 @@ impl StripMap {
         for i in 0..self.points.len() {
             let u = source_position(i as f32 / last_point, self.layout.mirror, self.layout.reverse);
             let point = match led_frequency(&self.sorted, u * last_led) {
-                // Outside every sector: the LED is not addressed, so it is dark.
-                None => ControlPoint { x: u, y: 0.0, gain: 0.0 },
+                // Outside every sector: the LED is not addressed by this layer,
+                // so it is dark over an unlit strip and transparent over a
+                // layer below. See [`ControlPoint::covered`].
+                None => ControlPoint { x: u, y: 0.0, gain: 0.0, covered: false },
                 Some(hz) => {
                     let level = level_at(levels, &self.centers, hz).clamp(0.0, 1.0);
                     ControlPoint {
                         x: hz_to_norm(hz),
                         y: level,
                         gain: self.intensity.brightness(level),
+                        covered: true,
                     }
                 }
             };

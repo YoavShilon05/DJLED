@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use crate::capture::Capture;
 use crate::engine::{Engine, EngineConfig};
 use crate::midi::{self, MidiListener, Message, NoteEngine};
-use crate::show::ShowConfig;
+use crate::show::Layer;
 
 /// How often the note engine advances its envelopes. There is no sample clock
 /// in MIDI, so this is a wall-clock choice: 125 Hz is comfortably above the
@@ -204,100 +204,94 @@ pub fn devices() -> Vec<DeviceInfo> {
     out
 }
 
-/// An open source and the analyser that turns it into levels.
+/// An open device, and the buffer whatever is analysing it reads from.
 ///
-/// The variants differ in size by about half a kilobyte — the note engine
-/// carries an envelope per MIDI note — which is not worth a box. Exactly one of
-/// these exists, it is moved only when the source changes, and boxing would put
-/// a pointer chase on `levels` and `centers`, which are read every frame.
-#[allow(clippy::large_enum_variant)]
-pub enum LiveSource {
-    Audio(AudioChain),
-    Midi(MidiChain),
+/// Split out from the analysis because the two scale differently once there is
+/// a stack: a device is a scarce, exclusive resource — Windows hands a MIDI
+/// input to one application at a time, and a second WASAPI stream on the same
+/// endpoint is a second capture nobody asked for — whereas an analyser is
+/// cheap and every layer wants its own, because hop, EQ and decay are all
+/// per-layer settings that live inside one.
+///
+/// So feeds are pooled by selection and analysers are not. See
+/// [`crate::stack::LiveStack`].
+pub enum Feed {
+    Audio(AudioFeed),
+    Midi(MidiFeed),
 }
 
-pub struct AudioChain {
+pub struct AudioFeed {
     capture: Capture,
-    engine: Engine,
-    cfg: EngineConfig,
     buf: Vec<f32>,
-    /// How much of `buf` the last poll filled. Kept only so `--probe` can
-    /// report what actually arrived from the device, which is a different
-    /// question from what came out of the analyser: a stream delivering half
-    /// the samples it should still produces frames.
+    /// How much of `buf` the last poll filled.
     filled: usize,
 }
 
-pub struct MidiChain {
+pub struct MidiFeed {
     listener: MidiListener,
-    notes: NoteEngine,
-    buf: Vec<Message>,
-    last: Instant,
+    scratch: Vec<Message>,
+    /// Everything that arrived on the last poll, drained in one go so every
+    /// layer on this port sees the same messages.
+    arrived: Vec<Message>,
 }
 
-impl LiveSource {
-    /// Open a source and build its analyser.
-    ///
-    /// `base` supplies everything about the audio analyser that is not in the
-    /// show — the band count, chiefly — and is ignored for MIDI, which has no
-    /// band plan to configure.
-    pub fn open(
-        source: &Source,
-        base: &EngineConfig,
-        show: &ShowConfig,
-        buffer_secs: f32,
-    ) -> Result<Self> {
+impl Feed {
+    pub fn open(source: &Source, buffer_secs: f32) -> Result<Self> {
         if source.kind == SourceKind::Midi {
-            let listener = MidiListener::open(source)?;
-            let mut notes = NoteEngine::new(&show.midi, source.channel, show.decay());
-            notes.set_eq(&show.eq);
-            return Ok(Self::Midi(MidiChain {
-                listener,
-                notes,
-                buf: vec![Message::default(); 256],
-                last: Instant::now(),
+            return Ok(Self::Midi(MidiFeed {
+                listener: MidiListener::open(source)?,
+                scratch: vec![Message::default(); 256],
+                arrived: Vec::new(),
             }));
         }
-
-        let capture = Capture::open(source, buffer_secs)?;
-        let cfg = EngineConfig { hop: show.hop(), ..base.clone() };
-        let mut engine = Engine::new(&cfg, capture.sample_rate());
-        engine.set_eq(&show.eq);
-        engine.set_decay(show.decay());
-        Ok(Self::Audio(AudioChain { capture, engine, cfg, buf: vec![0.0; 8192], filled: 0 }))
+        Ok(Self::Audio(AudioFeed {
+            capture: Capture::open(source, buffer_secs)?,
+            buf: vec![0.0; 8192],
+            filled: 0,
+        }))
     }
 
-    /// Bar brightness, 0..1, one per point of [`Self::centers`].
-    pub fn levels(&self) -> &[f32] {
+    /// Take in whatever has arrived since the last call.
+    ///
+    /// MIDI messages are drained every pass rather than only on frame
+    /// boundaries, so a note-on is never held back behind the envelope clock.
+    pub fn poll(&mut self) {
         match self {
-            Self::Audio(a) => a.engine.levels(),
-            Self::Midi(m) => m.notes.levels(),
+            Self::Audio(a) => a.filled = a.capture.read(&mut a.buf),
+            Self::Midi(m) => {
+                m.arrived.clear();
+                loop {
+                    let n = m.listener.read(&mut m.scratch);
+                    m.arrived.extend_from_slice(&m.scratch[..n]);
+                    if n < m.scratch.len() {
+                        break;
+                    }
+                }
+            }
         }
     }
 
-    /// Where those levels sit on the editor's frequency axis.
-    ///
-    /// For audio these are band centre frequencies. For MIDI they are the
-    /// stretched positions of the notes — see [`crate::midi::notes`].
-    pub fn centers(&self) -> &[f32] {
+    /// The samples the last [`Self::poll`] took in. Always empty for MIDI,
+    /// which has no samples.
+    pub fn samples(&self) -> &[f32] {
         match self {
-            Self::Audio(a) => a.engine.centers(),
-            Self::Midi(m) => m.notes.centers(),
+            Self::Audio(a) => &a.buf[..a.filled],
+            Self::Midi(_) => &[],
         }
     }
 
-    /// Colours this source would put on the wire, before any link says how many
-    /// it will take.
-    ///
-    /// One per band for audio, one per semitone for MIDI. The caller narrows
-    /// this to what its destination accepts — see [`crate::link::Link::max_points`]
-    /// — because the renderer resamples by frequency, so sending fewer points
-    /// costs spatial resolution on the strip and nothing else, while sending
-    /// more costs the entire frame.
-    pub fn points(&self) -> usize {
+    /// The messages the last [`Self::poll`] took in. Always empty for audio.
+    pub fn messages(&self) -> &[Message] {
         match self {
-            Self::Audio(a) => a.engine.band_count(),
-            Self::Midi(m) => m.notes.centers().len(),
+            Self::Audio(_) => &[],
+            Self::Midi(m) => &m.arrived,
+        }
+    }
+
+    pub fn kind(&self) -> SourceKind {
+        match self {
+            Self::Audio(a) => a.capture.kind(),
+            Self::Midi(_) => SourceKind::Midi,
         }
     }
 
@@ -309,13 +303,6 @@ impl LiveSource {
         }
     }
 
-    pub fn kind(&self) -> SourceKind {
-        match self {
-            Self::Audio(a) => a.capture.kind(),
-            Self::Midi(_) => SourceKind::Midi,
-        }
-    }
-
     pub fn device_name(&self) -> &str {
         match self {
             Self::Audio(a) => a.capture.device_name(),
@@ -323,8 +310,7 @@ impl LiveSource {
         }
     }
 
-    /// Channels the source offers, which is what bounds
-    /// [`Source::channel`].
+    /// Channels the device offers, which is what bounds [`Source::channel`].
     pub fn channels(&self) -> usize {
         match self {
             Self::Audio(a) => a.capture.channels(),
@@ -348,15 +334,7 @@ impl LiveSource {
         }
     }
 
-    /// Notes seen outside the configured range, or `None` for an audio source.
-    pub fn out_of_range(&self) -> Option<u32> {
-        match self {
-            Self::Audio(_) => None,
-            Self::Midi(m) => Some(m.notes.out_of_range()),
-        }
-    }
-
-    /// Take the reason the source died, if it has. Reported once: a dead stream
+    /// Take the reason the device died, if it has. Reported once: a dead stream
     /// stays dead, and repeating it every frame would bury everything else.
     pub fn take_fault(&self) -> Option<String> {
         match self {
@@ -368,32 +346,150 @@ impl LiveSource {
         }
     }
 
-    /// Take in whatever has arrived and advance the analyser.
+    /// Adopt a selection that resolves to what is already open, without
+    /// reopening anything. Returns false when the request genuinely needs a new
+    /// feed.
+    ///
+    /// This is not an optimisation. Windows gives a MIDI input port to one
+    /// application at a time, and that application is this one — so reopening
+    /// the port to change which channel is being *filtered for* would be
+    /// refused by the handle this process is holding, and the user would be
+    /// told something else has the port. An audio channel is chosen when the
+    /// stream is built and genuinely does need a new one, so this only ever
+    /// applies to MIDI.
+    pub fn retune(&mut self, source: &Source) -> bool {
+        let Self::Midi(m) = self else { return false };
+        if source.kind != SourceKind::Midi {
+            return false;
+        }
+        // By name, not by id: "the first MIDI input" and that port's id are two
+        // selections that mean the same port, and moving between them must not
+        // count as a switch.
+        if midi::resolve_name(source).as_deref() != Some(m.listener.port_name()) {
+            return false;
+        }
+        m.listener.reselect(source);
+        true
+    }
+}
+
+/// The analysis half of a layer: what turns a device's output into levels over
+/// the editor's frequency axis.
+///
+/// One of these per layer, never shared, because everything it holds is a
+/// per-layer setting — the hop it runs at, the EQ it applies, the ballistics it
+/// releases with, and for MIDI the note grid and the channel filter.
+///
+/// The variants differ in size by about half a kilobyte — the note engine
+/// carries an envelope per MIDI note — which is not worth a box: `levels` and
+/// `centers` are read every frame and boxing would put a pointer chase on both.
+#[allow(clippy::large_enum_variant)]
+pub enum Analysis {
+    Audio(AudioAnalysis),
+    Midi(MidiAnalysis),
+}
+
+pub struct AudioAnalysis {
+    engine: Engine,
+    cfg: EngineConfig,
+    sample_rate: f64,
+}
+
+pub struct MidiAnalysis {
+    notes: NoteEngine,
+    last: Instant,
+}
+
+impl Analysis {
+    /// Build the analyser a layer needs.
+    ///
+    /// Takes the device kind and rate rather than the [`Feed`] itself, because
+    /// a layer whose device would not open still has to have an analyser — it
+    /// keeps its place in the stack and the renderer still asks it for an axis.
+    ///
+    /// `base` supplies everything about the audio analyser that is not in the
+    /// layer — the band count, chiefly — and is ignored for MIDI, which has no
+    /// band plan to configure.
+    pub fn new(layer: &Layer, base: &EngineConfig, kind: SourceKind, sample_rate: f64) -> Self {
+        if kind == SourceKind::Midi {
+            let mut notes = NoteEngine::new(&layer.midi, layer.source.channel, layer.decay());
+            notes.set_eq(&layer.eq);
+            return Self::Midi(MidiAnalysis { notes, last: Instant::now() });
+        }
+
+        let cfg = EngineConfig { hop: layer.hop(), ..base.clone() };
+        let mut engine = Engine::new(&cfg, sample_rate);
+        engine.set_eq(&layer.eq);
+        engine.set_decay(layer.decay());
+        Self::Audio(AudioAnalysis { engine, cfg, sample_rate })
+    }
+
+    /// Bar brightness, 0..1, one per point of [`Self::centers`].
+    pub fn levels(&self) -> &[f32] {
+        match self {
+            Self::Audio(a) => a.engine.levels(),
+            Self::Midi(m) => m.notes.levels(),
+        }
+    }
+
+    /// Where those levels sit on the editor's frequency axis.
+    ///
+    /// For audio these are band centre frequencies. For MIDI they are the
+    /// stretched positions of the notes — see [`crate::midi::notes`].
+    pub fn centers(&self) -> &[f32] {
+        match self {
+            Self::Audio(a) => a.engine.centers(),
+            Self::Midi(m) => m.notes.centers(),
+        }
+    }
+
+    /// Colours this analysis would put on the wire, before any link says how
+    /// many it will take.
+    ///
+    /// One per band for audio, one per semitone for MIDI. The caller narrows
+    /// this to what its destination accepts — see
+    /// [`crate::link::Link::max_points`] — because the renderer resamples by
+    /// frequency, so sending fewer points costs spatial resolution on the strip
+    /// and nothing else, while sending more costs the entire frame.
+    pub fn points(&self) -> usize {
+        match self {
+            Self::Audio(a) => a.engine.band_count(),
+            Self::Midi(m) => m.notes.centers().len(),
+        }
+    }
+
+    /// Notes seen outside the configured range, or `None` for audio.
+    pub fn out_of_range(&self) -> Option<u32> {
+        match self {
+            Self::Audio(_) => None,
+            Self::Midi(m) => Some(m.notes.out_of_range()),
+        }
+    }
+
+    /// The audio analyser, for the diagnostics that only apply to one.
+    pub fn engine(&self) -> Option<&Engine> {
+        match self {
+            Self::Audio(a) => Some(&a.engine),
+            Self::Midi(_) => None,
+        }
+    }
+
+    /// Advance from whatever the feed took in on this pass.
     ///
     /// Returns true when a new frame is ready and [`Self::levels`] has changed.
     /// False means there was nothing to do yet, not that anything is wrong: a
     /// loopback endpoint delivers nothing at all while it is idle, and MIDI
     /// only steps its envelopes on its own frame boundary.
-    pub fn poll(&mut self) -> bool {
+    pub fn advance(&mut self, feed: &Feed) -> bool {
         match self {
             Self::Audio(a) => {
-                a.filled = a.capture.read(&mut a.buf);
-                a.filled > 0 && a.engine.push(&a.buf[..a.filled])
+                let samples = feed.samples();
+                !samples.is_empty() && a.engine.push(samples)
             }
             Self::Midi(m) => {
-                // Messages are drained every pass, not only on frame
-                // boundaries, so a note-on is never held back behind the
-                // envelope clock.
-                loop {
-                    let n = m.listener.read(&mut m.buf);
-                    for i in 0..n {
-                        m.notes.handle(m.buf[i]);
-                    }
-                    if n < m.buf.len() {
-                        break;
-                    }
+                for &msg in feed.messages() {
+                    m.notes.handle(msg);
                 }
-
                 let elapsed = m.last.elapsed();
                 if elapsed < MIDI_FRAME {
                     return false;
@@ -405,7 +501,7 @@ impl LiveSource {
         }
     }
 
-    /// Push a configuration into the stages it touches.
+    /// Push a layer configuration into the stages it touches.
     ///
     /// Everything is compared against what is already in force, because the
     /// expensive cases must not fire on every keyframe drag: resampling the EQ
@@ -415,12 +511,12 @@ impl LiveSource {
     ///
     /// Returns true when the level grid changed shape, which is what tells the
     /// caller to rebuild its renderer.
-    pub fn apply(&mut self, next: &ShowConfig, current: &ShowConfig, force: bool) -> bool {
+    pub fn apply(&mut self, next: &Layer, current: &Layer, force: bool) -> bool {
         match self {
             Self::Audio(a) => {
                 if force || next.hop() != current.hop() {
                     a.cfg.hop = next.hop();
-                    a.engine = Engine::new(&a.cfg, a.capture.sample_rate());
+                    a.engine = Engine::new(&a.cfg, a.sample_rate);
                     // A rebuilt analyser has no EQ or ballistics, so both are
                     // reinstalled regardless of whether they were what changed.
                     a.engine.set_eq(&next.eq);
@@ -434,10 +530,13 @@ impl LiveSource {
                     }
                 }
                 // The band plan comes from the sample rate and the band count,
-                // neither of which is in the show, so the grid never moves here.
+                // neither of which is in the layer, so the grid never moves.
                 false
             }
             Self::Midi(m) => {
+                if force || next.source.channel != current.source.channel {
+                    m.notes.set_channel(next.source.channel);
+                }
                 let moved = force || next.midi != current.midi;
                 let moved = moved && m.notes.set_config(&next.midi);
                 if force || !eq_matches(&next.eq, &current.eq) || moved {
@@ -451,9 +550,9 @@ impl LiveSource {
         }
     }
 
-    /// Start again from silence. For a new source, where carrying the old
-    /// floor tracker, ballistics or held notes across would spend the first
-    /// second unwinding a level that no longer exists.
+    /// Start again from silence. For a new feed, where carrying the old floor
+    /// tracker, ballistics or held notes across would spend the first second
+    /// unwinding a level that no longer exists.
     pub fn reset(&mut self) {
         match self {
             Self::Audio(a) => a.engine.reset(),
@@ -463,51 +562,105 @@ impl LiveSource {
             }
         }
     }
+}
 
-    /// Adopt a selection that resolves to what is already open, without
-    /// reopening anything. Returns false when the request genuinely needs a new
-    /// source.
-    ///
-    /// This is not an optimisation. Windows gives a MIDI input port to one
-    /// application at a time, and that application is this one — so reopening
-    /// the port to change which channel is being *filtered for* would be
-    /// refused by the handle this process is holding, and the user would be told
-    /// something else has the port. An audio channel is chosen when the stream
-    /// is built and genuinely does need a new one, so this only ever applies to
-    /// MIDI.
-    pub fn retune(&mut self, source: &Source) -> bool {
-        let Self::Midi(m) = self else { return false };
-        if source.kind != SourceKind::Midi {
-            return false;
-        }
-        // By name, not by id: "the first MIDI input" and that port's id are two
-        // selections that mean the same port, and moving between them must not
-        // count as a switch.
-        if midi::resolve_name(source).as_deref() != Some(m.listener.port_name()) {
-            return false;
-        }
+/// One open source and the analyser that turns it into levels.
+///
+/// A [`Feed`] and an [`Analysis`] that belong to each other, which is what the
+/// diagnostics want: `--probe` opens exactly one thing and asks what arrived.
+/// The run loop wants a whole stack instead, and builds one out of the same two
+/// pieces — see [`crate::stack::LiveStack`].
+pub struct LiveSource {
+    feed: Feed,
+    analysis: Analysis,
+}
 
-        m.listener.reselect(source);
-        m.notes.set_channel(source.channel);
-        true
+impl LiveSource {
+    pub fn open(
+        source: &Source,
+        base: &EngineConfig,
+        layer: &Layer,
+        buffer_secs: f32,
+    ) -> Result<Self> {
+        let feed = Feed::open(source, buffer_secs)?;
+        let analysis = Analysis::new(layer, base, feed.kind(), feed.sample_rate());
+        Ok(Self { feed, analysis })
+    }
+
+    pub fn levels(&self) -> &[f32] {
+        self.analysis.levels()
+    }
+
+    pub fn centers(&self) -> &[f32] {
+        self.analysis.centers()
+    }
+
+    pub fn points(&self) -> usize {
+        self.analysis.points()
+    }
+
+    pub fn source(&self) -> &Source {
+        self.feed.source()
+    }
+
+    pub fn kind(&self) -> SourceKind {
+        self.feed.kind()
+    }
+
+    pub fn device_name(&self) -> &str {
+        self.feed.device_name()
+    }
+
+    pub fn channels(&self) -> usize {
+        self.feed.channels()
+    }
+
+    pub fn sample_rate(&self) -> f64 {
+        self.feed.sample_rate()
+    }
+
+    pub fn describe(&self) -> String {
+        self.feed.describe()
+    }
+
+    pub fn out_of_range(&self) -> Option<u32> {
+        self.analysis.out_of_range()
+    }
+
+    pub fn take_fault(&self) -> Option<String> {
+        self.feed.take_fault()
+    }
+
+    /// Take in whatever has arrived and advance the analyser. True when a new
+    /// frame is ready and [`Self::levels`] has changed.
+    pub fn poll(&mut self) -> bool {
+        self.feed.poll();
+        self.analysis.advance(&self.feed)
+    }
+
+    pub fn apply(&mut self, next: &Layer, current: &Layer, force: bool) -> bool {
+        self.analysis.apply(next, current, force)
+    }
+
+    pub fn reset(&mut self) {
+        self.analysis.reset();
     }
 
     /// The samples the last [`Self::poll`] took in, for the diagnostic that
     /// needs to distinguish "the device is not delivering" from "the analyser
     /// has nothing to show". Always empty for MIDI, which has no samples.
     pub fn last_block(&self) -> &[f32] {
-        match self {
-            Self::Audio(a) => &a.buf[..a.filled],
-            Self::Midi(_) => &[],
-        }
+        self.feed.samples()
     }
 
-    /// The audio analyser, for the diagnostics that only apply to one.
     pub fn engine(&self) -> Option<&Engine> {
-        match self {
-            Self::Audio(a) => Some(&a.engine),
-            Self::Midi(_) => None,
-        }
+        self.analysis.engine()
+    }
+
+    /// True for a MIDI source, which is the one case `--probe` reports on
+    /// differently — there are no samples to count, only messages.
+    pub fn is_midi(&self) -> bool {
+        matches!(self.feed, Feed::Midi(_))
     }
 }
 

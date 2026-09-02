@@ -40,8 +40,16 @@ export interface LinearRgb {
   alpha: number;
 }
 
-/** The unlit strip: what a single layer is composited onto today. */
+/** The unlit strip: what the whole stack is finally composited onto. */
 export const BLACK: LinearRgb = { r: 0, g: 0, b: 0, alpha: 1 };
+
+/**
+ * Nothing at all — the identity the layer stack accumulates from.
+ *
+ * Not the same as {@link BLACK}, and the difference is the whole point of the
+ * stack: black *covers* what is under it, transparent does not.
+ */
+export const CLEAR: LinearRgb = { r: 0, g: 0, b: 0, alpha: 0 };
 
 export function oklabToLinearRgb(c: Oklab): LinearRgb {
   const l_ = c.l + 0.3963377774 * c.a + 0.2158037573 * c.b;

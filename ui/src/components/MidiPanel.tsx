@@ -1,6 +1,6 @@
 import { Checkbox, Paper, RangeSlider, Slider, Stack, Text } from "@mantine/core";
 
-import type { EditorConfig } from "../config/editor";
+import type { EditorLayer } from "../config/editor";
 import {
   MAX_NOTE,
   MIN_NOTE,
@@ -12,11 +12,13 @@ import {
 import { Field } from "./Field";
 
 interface Props {
-  config: EditorConfig;
-  onChange: (config: EditorConfig) => void;
-  /** True when a MIDI port is what is actually driving the strip. The panel is
-   *  still editable otherwise — a look is authored, not discovered — but it
-   *  says so rather than pretending the sliders are doing something. */
+  /** The layer being edited. Every layer has its own note axis, because every
+   *  layer can be on its own port — or on the same port, on another channel. */
+  layer: EditorLayer;
+  onChange: (layer: EditorLayer) => void;
+  /** True when a MIDI port is what is actually driving *this layer*. It stays
+   *  editable otherwise — a look is authored, not discovered — but it says so
+   *  rather than pretending the sliders are doing something. */
   live: boolean;
 }
 
@@ -29,24 +31,24 @@ interface Props {
  * look from eighty-eight keys, and the hint says so, because nothing about a
  * pair of note numbers suggests it.
  */
-export function MidiPanel({ config, onChange, live }: Props) {
-  const { midi } = config;
+export function MidiPanel({ layer, onChange, live }: Props) {
+  const { midi } = layer;
   const [low, high] = noteRange(midi.lowNote, midi.highNote);
   const octaves = (high - low) / 12;
 
   const setRange = ([lowNote, highNote]: [number, number]) =>
-    onChange({ ...config, midi: { ...midi, lowNote, highNote } });
+    onChange({ ...layer, midi: { ...midi, lowNote, highNote } });
 
   return (
     <Paper>
       <Stack gap="md">
         <Text size="xs" c="dimmed" fw={700} tt="uppercase" lts="0.08em">
-          MIDI
+          MIDI · {layer.name}
         </Text>
 
         {!live && (
           <Text size="xs" c="dimmed" lh={1.35}>
-            Nothing here changes the strip until a MIDI port is the source.
+            Nothing here changes the strip until a MIDI port is this layer's source.
           </Text>
         )}
 
@@ -82,7 +84,7 @@ export function MidiPanel({ config, onChange, live }: Props) {
             max={6}
             step={0.1}
             value={midi.spread}
-            onChange={(spread) => onChange({ ...config, midi: { ...midi, spread } })}
+            onChange={(spread) => onChange({ ...layer, midi: { ...midi, spread } })}
             label={(v) => (v === 0 ? "off" : `${v.toFixed(1)} st`)}
           />
         </Field>
@@ -92,7 +94,7 @@ export function MidiPanel({ config, onChange, live }: Props) {
             label="Sustain pedal"
             checked={midi.sustain}
             onChange={(e) =>
-              onChange({ ...config, midi: { ...midi, sustain: e.currentTarget.checked } })
+              onChange({ ...layer, midi: { ...midi, sustain: e.currentTarget.checked } })
             }
           />
           <Text size="xs" c="dimmed" lh={1.35}>

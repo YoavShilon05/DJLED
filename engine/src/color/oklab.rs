@@ -138,8 +138,14 @@ impl Oklab {
 }
 
 impl LinearRgb {
-    /// The unlit strip: what a single layer is composited onto today.
+    /// The unlit strip: what the whole stack is finally composited onto.
     pub const BLACK: Self = Self::with_alpha(0.0, 0.0, 0.0, 1.0);
+
+    /// Nothing at all — the identity the layer stack accumulates from.
+    ///
+    /// Not the same as [`Self::BLACK`], and the difference is the whole point of
+    /// the stack: black *covers* what is under it, transparent does not.
+    pub const CLEAR: Self = Self::with_alpha(0.0, 0.0, 0.0, 0.0);
 
     /// A fully opaque colour.
     pub const fn new(r: f32, g: f32, b: f32) -> Self {
@@ -155,11 +161,12 @@ impl LinearRgb {
     /// In linear light, which is the only place compositing is physically
     /// meaningful — two lights add, and their gamma-encoded bytes do not.
     ///
-    /// This is the operator that gives opacity its meaning, and it is what layer
-    /// stacking will fold over a stack of layers. With
-    /// [`LinearRgb::BLACK`] as the backdrop it reduces to `colour × alpha`,
-    /// which is why a single translucent layer currently looks like nothing more
-    /// than a dimmer one.
+    /// This is the operator that gives opacity its meaning, and the fold the
+    /// layer stack is built from — see [`super::render::Renderer::render_stack`].
+    /// With [`LinearRgb::BLACK`] as the backdrop it reduces to `colour × alpha`,
+    /// which is why a *single* translucent layer looks like nothing more than a
+    /// dimmer one, and why that stops being true the moment there is something
+    /// underneath it.
     pub fn over(self, backdrop: Self) -> Self {
         let src = self.alpha.clamp(0.0, 1.0);
         let under = backdrop.alpha.clamp(0.0, 1.0) * (1.0 - src);

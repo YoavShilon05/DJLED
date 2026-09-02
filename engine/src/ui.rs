@@ -31,8 +31,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::source::{DeviceInfo, Source, SourceKind};
 use crate::show::ShowConfig;
+use crate::source::DeviceInfo;
+use crate::stack::LayerStatus;
 
 pub const DEFAULT_PORT: u16 = 9001;
 
@@ -40,45 +41,59 @@ pub const DEFAULT_PORT: u16 = 9001;
 /// display, and 30 fps is past the point of visible improvement.
 const SEND_INTERVAL: Duration = Duration::from_millis(33);
 
-/// What the UI is shown each frame.
+/// One layer's analysis, as the editor plots it.
+///
+/// Per layer rather than per frame because two layers can be listening to two
+/// different devices on two different grids — 48 audio bands under 88 semitones
+/// of MIDI — and the editor draws whichever one is selected.
 #[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Snapshot {
+pub struct LayerFrame {
+    /// Matches `Layer::id`, so a row keeps its plot across a reorder.
+    pub id: String,
     /// Bar level per band, 0..1.
     pub levels: Vec<f32>,
     /// Band centre frequencies, so the UI can label its axis without
     /// reimplementing the band scale.
     pub centers: Vec<f32>,
-    /// The strip as the firmware will drive it, hex-encoded RGB.
+}
+
+/// What the UI is shown each frame.
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Snapshot {
+    /// Bottom layer first, matching the order of the show.
+    pub layers: Vec<LayerFrame>,
+    /// The strip as the firmware will drive it — the whole stack composited,
+    /// which is the one thing no single layer can tell you.
     pub strip: String,
-    pub sample_rate: f64,
     pub connected: bool,
     pub dropped_frames: u64,
-    /// Notes seen outside the configured range. Live telemetry rather than
-    /// state: it is the answer to "why is the strip dark", and it changes
-    /// while someone is playing, not when they change a setting.
-    pub notes_out_of_range: u32,
 }
 
 /// What the UI can change.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Command {
-    /// Replace the whole show configuration.
+    /// Replace the whole show configuration, layers and all.
     ///
     /// One message rather than one per control, including on the hot path where
     /// dragging a keyframe sends one of these per pointer move. Applying it is
     /// cheap because each stage compares against what it already has, and a
     /// single message means the two sides cannot end up disagreeing about which
-    /// half of an edit landed.
+    /// half of an edit landed — which matters more with a stack than it did
+    /// without one, since a reorder and a recolour can arrive together.
     Config { config: Box<ShowConfig> },
-    /// Master brightness, 0..1.
+    /// Master brightness, 0..1. Not per layer: it is the power budget for the
+    /// whole strip, and a layer that dimmed the ones under it would be a blend
+    /// mode rather than a brightness.
     Brightness { value: f32 },
-    /// Listen to a different endpoint.
-    SetSource { source: Source },
     /// Rescan the endpoints, e.g. after plugging an interface in. Handled by the
     /// engine rather than here so every client sees one list, and so the COM
     /// enumeration stays on the thread that owns the capture.
+    ///
+    /// Also retries any layer whose device would not open, because a rescan is
+    /// exactly what someone does after plugging the missing one back in.
     ListSources,
     /// Ask for the current configuration, e.g. after a reload.
     RequestState,
@@ -93,36 +108,20 @@ pub struct State {
     pub config: ShowConfig,
     pub brightness: f32,
     pub led_count: usize,
-    pub band_count: usize,
+    /// Colours on the wire per frame, which is what the whole stack is rendered
+    /// at. Narrowed to what the board says it will take.
+    pub point_count: usize,
     /// Analyser dB window. The EQ is authored in these terms, so the editor
     /// needs them to preview a gain at the right size.
     pub db_floor: f32,
     pub db_ceil: f32,
-    pub input: InputState,
-}
-
-/// What is being listened to, and what else could be.
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InputState {
     /// Everything selectable, as of the last scan — audio endpoints and MIDI
-    /// ports in one list, because they are one choice.
+    /// ports in one list, because they are one choice. Global rather than per
+    /// layer: what exists does not depend on who is listening to it.
     pub devices: Vec<DeviceInfo>,
-    /// The live selection, as resolved rather than as requested.
-    pub source: Source,
-    /// The endpoint the selection currently resolves to. Not redundant with
-    /// `source`: "the default output" is a selection that names no device, and
-    /// the user still wants to see which one they got.
-    pub device_name: String,
-    pub kind: SourceKind,
-    /// Channels the source offers, which is what bounds `source.channel`: the
-    /// inputs of an interface, or MIDI's sixteen.
-    pub channels: usize,
-    /// Zero for MIDI, which has no sample rate.
-    pub sample_rate: f64,
-    /// Why the last switch failed, or how the running stream died. Cleared by
-    /// the next success.
-    pub error: Option<String>,
+    /// What each layer's selection actually resolved to, and what went wrong if
+    /// anything did. Bottom layer first, matching the show.
+    pub layers: Vec<LayerStatus>,
 }
 
 #[derive(Serialize)]
@@ -354,6 +353,10 @@ mod tests {
         assert_eq!(encode_strip(&leds).len(), 3600);
     }
 
+    /// The stack crosses the wire whole, sources included — which is the change
+    /// layers made to this message. There is no longer a command that moves one
+    /// device: a layer names what it listens to, and that travels with the rest
+    /// of what the layer looks like.
     #[test]
     fn commands_parse_from_the_ui_wire_format() {
         let cmd: Command = serde_json::from_str(r#"{"type":"brightness","value":0.5}"#).unwrap();
@@ -362,71 +365,84 @@ mod tests {
         let cmd: Command = serde_json::from_str(r#"{"type":"requestState"}"#).unwrap();
         assert!(matches!(cmd, Command::RequestState));
 
-        // Deeper delimiter: the hex colour contains `"#`, which would close a
-        // single-hash raw string.
-        let json = r##"{"type":"config","config":{"surface":{"keyframes":[{"x":0,"y":1,"color":"#ff0000"}],"sigma":0.25}}}"##;
-        let cmd: Command = serde_json::from_str(json).unwrap();
-        match cmd {
-            Command::Config { config } => {
-                assert_eq!(config.surface.keyframes.len(), 1);
-                assert_eq!(config.surface.keyframes[0].color, "#ff0000");
-            }
-            other => panic!("parsed as {other:?}"),
-        }
-    }
-
-    #[test]
-    fn the_full_config_command_parses() {
-        let json = r#"{"type":"config","config":{"mirror":true,"threshold":-50,"sampleLength":512}}"#;
-        let cmd: Command = serde_json::from_str(json).unwrap();
-        match cmd {
-            Command::Config { config } => {
-                assert!(config.mirror);
-                assert_eq!(config.threshold, -50.0);
-                assert_eq!(config.hop(), 512);
-            }
-            other => panic!("parsed as {other:?}"),
-        }
-    }
-
-    /// The dropdown's two messages. The device id is opaque and full of
-    /// punctuation, so this is really checking it survives the trip intact.
-    #[test]
-    fn source_commands_parse_from_the_ui_wire_format() {
-        let json = r#"{"type":"setSource","source":{"id":"wasapi:{0.0.1.00000000}.{9d}","channel":0}}"#;
-        match serde_json::from_str::<Command>(json).unwrap() {
-            Command::SetSource { source } => {
-                assert_eq!(source.id.as_deref(), Some("wasapi:{0.0.1.00000000}.{9d}"));
-                assert_eq!(source.channel, Some(0));
-            }
-            other => panic!("parsed as {other:?}"),
-        }
-
-        // No id: follow the system default for that direction.
-        let json = r#"{"type":"setSource","source":{"kind":"input"}}"#;
-        match serde_json::from_str::<Command>(json).unwrap() {
-            Command::SetSource { source } => {
-                assert_eq!(source, Source::default_input());
-            }
-            other => panic!("parsed as {other:?}"),
-        }
-
-        // A MIDI port travels the same message, with `channel` meaning the MIDI
-        // channel to accept rather than the one to analyse.
-        let json =
-            r#"{"type":"setSource","source":{"id":"midi:loopMIDI Port","kind":"midi","channel":9}}"#;
-        match serde_json::from_str::<Command>(json).unwrap() {
-            Command::SetSource { source } => {
-                assert_eq!(source.kind, SourceKind::Midi);
-                assert_eq!(source.id.as_deref(), Some("midi:loopMIDI Port"));
-                assert_eq!(source.channel, Some(9));
-            }
-            other => panic!("parsed as {other:?}"),
-        }
-
         let cmd: Command = serde_json::from_str(r#"{"type":"listSources"}"#).unwrap();
         assert!(matches!(cmd, Command::ListSources));
+
+        // Deeper delimiter: the hex colour contains `"#`, which would close a
+        // single-hash raw string.
+        let json = r##"{"type":"config","config":{"layers":[
+            {"id":"a","surface":{"keyframes":[{"x":0,"y":1,"color":"#ff0000"}],"sigma":0.25}}
+        ]}}"##;
+        let cmd: Command = serde_json::from_str(json).unwrap();
+        match cmd {
+            Command::Config { config } => {
+                assert_eq!(config.layers.len(), 1);
+                assert_eq!(config.base().surface.keyframes.len(), 1);
+                assert_eq!(config.base().surface.keyframes[0].color, "#ff0000");
+            }
+            other => panic!("parsed as {other:?}"),
+        }
     }
+
+    /// A whole stack, with a different device on each layer. The device ids are
+    /// opaque and full of punctuation, so this is also checking they survive the
+    /// trip intact — that used to be its own message and is now part of this one.
+    #[test]
+    fn a_stack_of_layers_parses_with_its_sources() {
+        let json = r#"{"type":"config","config":{"layers":[
+            {
+                "id":"bass","name":"Bass","opacity":1,
+                "source":{"id":"wasapi:{0.0.1.00000000}.{9d}","kind":"loopback","channel":0},
+                "mirror":true,"threshold":-50,"sampleLength":512
+            },
+            {
+                "id":"keys","name":"Keys","opacity":0.5,"enabled":false,
+                "source":{"id":"midi:loopMIDI Port","kind":"midi","channel":9}
+            },
+            { "id":"amb", "source":{"kind":"input"} }
+        ]}}"#;
+
+        match serde_json::from_str::<Command>(json).unwrap() {
+            Command::Config { config } => {
+                assert_eq!(config.layers.len(), 3);
+
+                let bass = &config.layers[0];
+                assert!(bass.mirror);
+                assert_eq!(bass.threshold, -50.0);
+                assert_eq!(bass.hop(), 512);
+                assert_eq!(bass.source.id.as_deref(), Some("wasapi:{0.0.1.00000000}.{9d}"));
+                assert_eq!(bass.source.channel, Some(0));
+
+                let keys = &config.layers[1];
+                assert_eq!(keys.source.kind, crate::source::SourceKind::Midi);
+                assert_eq!(keys.source.id.as_deref(), Some("midi:loopMIDI Port"));
+                assert_eq!(keys.source.channel, Some(9));
+                assert!(!keys.contributes(), "a disabled layer still claims to contribute");
+
+                // No id: follow the system default for that direction.
+                assert_eq!(config.layers[2].source, crate::source::Source::default_input());
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    /// A config written before layers existed had every field at the top level.
+    /// It has to keep arriving as the one-layer show it always was, or a saved
+    /// preset would be dropped as unparseable.
+    #[test]
+    fn a_pre_stack_config_command_still_parses() {
+        let json = r#"{"type":"config","config":{"mirror":true,"threshold":-50,"sampleLength":512}}"#;
+        match serde_json::from_str::<Command>(json).unwrap() {
+            Command::Config { config } => {
+                assert_eq!(config.layers.len(), 1);
+                assert!(config.base().mirror);
+                assert_eq!(config.base().threshold, -50.0);
+                assert_eq!(config.base().hop(), 512);
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
 
     /// A malformed command must be reported, not crash the client thread.
     #[test]

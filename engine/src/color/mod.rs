@@ -16,6 +16,6 @@ pub mod surface;
 
 pub use intensity::{IntensityConfig, IntensityCurve};
 pub use oklab::{LinearRgb, Oklab};
-pub use render::{Geometry, RenderConfig, Renderer};
-pub use strip::{LayoutConfig, LedKeyframe, StripMap};
+pub use render::{Geometry, LayerVisual, RenderConfig, Renderer};
+pub use strip::{ControlPoint, LayoutConfig, LedKeyframe, StripMap};
 pub use surface::{ColorSurface, Keyframe, SurfaceConfig};

@@ -1,22 +1,42 @@
 /**
- * What the strip would look like under the current config.
+ * What the strip would look like under the current stack.
  *
- * The engine cannot answer this yet — thresholds, LED sectors and the intensity
- * curve are not in the wire protocol — so the editor works it out locally. That
- * is the only way the new controls do anything visible without touching the
- * backend, and when the engine grows these fields this module becomes the
- * reference the two sides are checked against.
+ * A port of the fold in `engine/src/color/render.rs`, and it has to stay one:
+ * this is what the Preview strip draws, and the Engine strip beside it is what
+ * the wall is really doing. If the two disagree the editor is lying.
+ *
+ * # How a layer contributes
+ *
+ * Each layer is sampled at every LED on *its own* axis — its own sectors, its
+ * own reverse and mirror, its own thresholds, its own colour field — and the
+ * results are folded bottom to top with source-over in linear light. Two rules
+ * make that fold mean what the editor says it means:
+ *
+ * - **The intensity curve scales light, not coverage.** A band the threshold
+ *   has closed is painted with its field's colour at zero intensity — black, in
+ *   the stock palette — at whatever opacity that keyframe carries. So an opaque
+ *   quiet band blocks, exactly like an opaque bright one. Black is a colour,
+ *   not an absence; a layer that should let the one below show through in its
+ *   quiet regions says so by authoring opacity there.
+ * - **An LED no sector reaches is not painted at all**, rather than painted
+ *   black. Sectors are how a layer is confined to part of the wall, and a layer
+ *   confined to the first fifty LEDs must not blank the other hundred.
+ *
+ * With one layer both reduce to what this module did before the stack existed,
+ * because the backdrop is an unlit strip and over black the two are
+ * indistinguishable.
  */
 
-import { oklabToDisplay, type Rgb } from "../color/display";
+import { linearRgbToDisplay, type Rgb } from "../color/display";
+import { CLEAR, clampedRgb, oklabToLinearRgb, over, type LinearRgb } from "../color/oklab";
 import { ColorSurface } from "../color/surface";
 import { evalCurve } from "../config/curve";
-import { toSurface, type EditorConfig, type LedKeyframe } from "../config/editor";
+import { toSurface, type EditorConfig, type EditorLayer, type LedKeyframe } from "../config/editor";
 import type { EqCurve } from "../config/eq";
 import { DB_MAX, DB_MIN, clamp, hzToNorm, normToHz } from "../config/scales";
 import { levelToDb, type SpectrumFrame } from "./paint";
 
-const BLACK: Rgb = [0, 0, 0];
+const BLACK_RGB: Rgb = [0, 0, 0];
 
 const DB_SPAN = DB_MAX - DB_MIN;
 
@@ -76,7 +96,8 @@ export function sourceIndex(i: number, n: number, mirror: boolean, reverse: bool
  * 2 kHz" spread evenly across the first 50 LEDs rather than piling seven
  * octaves into the last few.
  *
- * `null` for an LED outside every sector: it is not addressed, so it is dark.
+ * `null` for an LED outside every sector: this layer does not address it, so it
+ * contributes nothing there and whatever is beneath shows through.
  */
 export function ledFrequency(keyframes: LedKeyframe[], led: number): number | null {
   const sorted = [...keyframes].sort((a, b) => a.led - b.led);
@@ -113,38 +134,96 @@ export function levelAt(frame: SpectrumFrame, hz: number): number {
 }
 
 /** Brightness for a level, after the threshold, the clamp and the curve. */
-export function brightnessFor(config: EditorConfig, level: number): number {
+export function brightnessFor(layer: EditorLayer, level: number): number {
   const db = levelToDb(level);
-  if (db <= config.threshold) return 0;
-  const window = config.clamp - config.threshold;
+  if (db <= layer.threshold) return 0;
+  const window = layer.clamp - layer.threshold;
   if (window <= 0) return 1;
-  return evalCurve(config.curve, clamp((db - config.threshold) / window, 0, 1));
+  return evalCurve(layer.curve, clamp((db - layer.threshold) / window, 0, 1));
 }
 
-export function renderStrip(
-  config: EditorConfig,
+/**
+ * One layer's contribution at every LED, un-premultiplied and *not* composited
+ * onto anything.
+ *
+ * Separated out because it is the honest unit: a layer on its own has an
+ * opacity per LED, and only the fold decides what that opacity reveals.
+ */
+export function layerCoverage(
+  layer: EditorLayer,
   frame: SpectrumFrame,
+  ledCount: number,
+): LinearRgb[] {
+  const surface = new ColorSurface(toSurface(layer));
+  const out: LinearRgb[] = new Array(ledCount);
+  const opacity = clamp(layer.opacity, 0, 1);
+
+  for (let i = 0; i < ledCount; i++) {
+    const led = sourceIndex(i, ledCount, layer.mirror, layer.reverse);
+    const hz = ledFrequency(layer.ledKeyframes, led);
+    if (hz === null) {
+      // Not addressed by this layer. Contributing black here would blank every
+      // layer beneath it; "outside my sectors" is not a colour.
+      out[i] = CLEAR;
+      continue;
+    }
+
+    const level = levelAt(frame, hz);
+    // The surface's y is the same normalised level the plot's dB axis shows,
+    // so a band is coloured by exactly the field pixel its bar reaches.
+    const rgb = clampedRgb(oklabToLinearRgb(surface.sample(hzToNorm(hz), level)));
+    const gain = brightnessFor(layer, level);
+
+    // The gain scales light and leaves coverage alone. That is what makes a
+    // quiet opaque band block rather than fade — it is painted black, and black
+    // covers.
+    out[i] = {
+      r: rgb.r * gain,
+      g: rgb.g * gain,
+      b: rgb.b * gain,
+      alpha: rgb.alpha * opacity,
+    };
+  }
+  return out;
+}
+
+/**
+ * How to get the spectrum for one layer.
+ *
+ * A function rather than an array because two layers can be listening to two
+ * different devices on two different grids — 48 audio bands under 88 semitones
+ * of MIDI — and each has to be read on its own axis before the two meet in
+ * strip space. The caller is the only thing that knows which live frame belongs
+ * to which layer, or what to show for a layer that has none yet.
+ */
+export type LayerFrames = (layer: EditorLayer, index: number) => SpectrumFrame;
+
+/** The whole stack, composited, as the strip would show it. */
+export function renderStack(
+  config: EditorConfig,
+  frames: LayerFrames,
   ledCount: number,
   masterBrightness = 1,
 ): Rgb[] {
-  const surface = new ColorSurface(toSurface(config));
-  const out: Rgb[] = new Array(ledCount);
+  const stack: LinearRgb[] = new Array(ledCount).fill(CLEAR);
 
-  for (let i = 0; i < ledCount; i++) {
-    const led = sourceIndex(i, ledCount, config.mirror, config.reverse);
-    const hz = ledFrequency(config.ledKeyframes, led);
-    if (hz === null) {
-      out[i] = BLACK;
-      continue;
+  config.layers.forEach((layer, index) => {
+    // A layer nobody can see is skipped rather than composited at zero, which
+    // is the same result for a good deal less work.
+    if (!layer.enabled || layer.opacity <= 0) return;
+    const contribution = layerCoverage(layer, frames(layer, index), ledCount);
+    for (let i = 0; i < ledCount; i++) {
+      if (contribution[i].alpha <= 0) continue;
+      stack[i] = over(contribution[i], stack[i]);
     }
-    const level = levelAt(frame, hz);
-    const gain = brightnessFor(config, level) * masterBrightness;
-    // The surface's y is the same normalised level the plot's dB axis shows,
-    // so a band is coloured by exactly the field pixel its bar reaches.
-    //
-    // `oklabToDisplay` composites onto black, which is what an unlit LED is and
-    // so is the whole stack today. When layers land this is where the fold goes.
-    out[i] = gain <= 0 ? BLACK : oklabToDisplay(surface.sample(hzToNorm(hz), level), gain);
+  });
+
+  // Composite the finished stack onto the unlit strip, then scale linear light
+  // by the master — which is where a brightness belongs, since the LED is
+  // driven linearly.
+  const out: Rgb[] = new Array(ledCount);
+  for (let i = 0; i < ledCount; i++) {
+    out[i] = masterBrightness <= 0 ? BLACK_RGB : linearRgbToDisplay(stack[i], masterBrightness);
   }
   return out;
 }

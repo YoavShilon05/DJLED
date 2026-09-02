@@ -17,9 +17,11 @@ pub mod link;
 pub mod midi;
 pub mod show;
 pub mod source;
+pub mod stack;
 pub mod ui;
 
 pub use engine::{Engine, EngineConfig};
 pub use midi::MidiConfig;
-pub use show::ShowConfig;
+pub use show::{Layer, ShowConfig};
 pub use source::{LiveSource, Source, SourceKind};
+pub use stack::{LayerStatus, LiveStack};

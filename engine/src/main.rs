@@ -9,12 +9,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 
-use djled_engine::color::{Geometry, RenderConfig, Renderer};
+use djled_engine::color::{RenderConfig, Renderer};
 use djled_engine::link::protocol::TestPattern;
 use djled_engine::link::serial::DEFAULT_BAUD;
 use djled_engine::link::{expand_bands_to_leds, Link, MockLink, SerialLink};
 use djled_engine::source::{self, LiveSource, Source, SourceKind};
-use djled_engine::ui::{encode_strip, Command, InputState, State, UiServer};
+use djled_engine::stack::LiveStack;
+use djled_engine::ui::{encode_strip, Command, LayerFrame, State, UiServer};
 use djled_engine::{EngineConfig, ShowConfig};
 
 const BAR_HEIGHT: usize = 20;
@@ -162,18 +163,25 @@ fn main() -> Result<()> {
         },
         ..Default::default()
     };
-    let show = ShowConfig::spanning(led_count);
+    // One layer to start with, listening to whatever the flags asked for. The
+    // editor grows the stack from there; the command line deliberately does
+    // not, because a stack is authored rather than typed.
+    let show = starting_show(led_count, select_source(&args)?);
     // What the board says it will take, not what the protocol allows. A frame
     // over the firmware's own limit is dropped at the MCU without a word.
     let point_cap = link.max_points();
-    let mut live = LiveSource::open(&select_source(&args)?, &base, &show, CAPTURE_BUFFER_SECS)?;
-    let mut renderer = build_renderer(args.brightness, &show, &live, led_count, point_cap)?;
-
-    print_header(&live, link.as_ref(), led_count, point_cap);
 
     if let Some(secs) = args.probe {
+        let mut live =
+            LiveSource::open(&show.base().source, &base, show.base(), CAPTURE_BUFFER_SECS)?;
+        println!("DJLED\n  source   {}\n", live.describe());
         return probe(&mut live, secs);
     }
+
+    let mut stack = LiveStack::open(&show, &base, CAPTURE_BUFFER_SECS);
+    let mut renderer = build_renderer(args.brightness, &stack, led_count, point_cap)?;
+
+    print_header(&stack, link.as_ref(), led_count, point_cap);
 
     // The UI is optional by design: the engine is a headless service and
     // nothing about the strip depends on a browser being attached.
@@ -184,18 +192,11 @@ fn main() -> Result<()> {
             config: show.clone(),
             brightness: args.brightness,
             led_count,
-            band_count: live.points().min(point_cap),
+            point_count: renderer.points(),
             db_floor: base.post.db_floor,
             db_ceil: base.post.db_ceil,
-            input: InputState {
-                devices: source::devices(),
-                source: live.source().clone(),
-                device_name: live.device_name().to_string(),
-                kind: live.kind(),
-                channels: live.channels(),
-                sample_rate: live.sample_rate(),
-                error: None,
-            },
+            devices: source::devices(),
+            layers: stack.status(),
         };
         match UiServer::start(args.ui_port, state) {
             Ok(s) => {
@@ -209,7 +210,15 @@ fn main() -> Result<()> {
         }
     };
 
-    run(&mut live, &base, show, &mut renderer, link.as_mut(), led_count, point_cap, server.as_ref())
+    run(&mut stack, show, &mut renderer, link.as_mut(), led_count, point_cap, server.as_ref())
+}
+
+/// The show the engine starts with: one layer, spanning the strip, listening to
+/// whatever the flags selected.
+fn starting_show(led_count: usize, source: Source) -> ShowConfig {
+    let mut show = ShowConfig::spanning(led_count);
+    show.layers[0].source = source;
+    show
 }
 
 /// The source the flags ask for. Named devices are looked up now rather than at
@@ -236,32 +245,26 @@ fn select_source(args: &Args) -> Result<Source> {
     Ok(source)
 }
 
-/// Build the renderer for whatever `live` currently produces.
+/// Build the renderer for whatever the stack currently produces.
 ///
-/// Separated out because a source switch can change the *shape* of what it
-/// produces — 48 bands become 88 semitones — and the renderer is built around
-/// that shape.
+/// Separated out because a source switch or a layer added can change the
+/// *shape* of what it produces — 48 bands become 88 semitones, one layer
+/// becomes three — and the renderer is built around that shape.
+///
+/// Points are the widest grid any layer has, narrowed to what the link will
+/// actually carry. The renderer resamples across the axis, so fewer points
+/// costs a little spatial resolution where too many costs every frame.
 fn build_renderer(
     brightness: f32,
-    show: &ShowConfig,
-    live: &LiveSource,
+    stack: &LiveStack,
     led_count: usize,
     point_cap: usize,
 ) -> Result<Renderer> {
-    Renderer::new(
+    Renderer::stacked(
         RenderConfig { brightness, ..Default::default() },
-        &show.surface,
-        show.layout(),
-        show.intensity(),
-        Geometry {
-            centers: live.centers().to_vec(),
-            // See `color::strip` for why these are strip positions rather
-            // than bands. Narrowed to what the link will actually carry: the
-            // renderer resamples across the axis, so fewer points costs a
-            // little spatial resolution, where too many costs every frame.
-            points: live.points().min(point_cap),
-            leds: led_count,
-        },
+        &stack.visuals(),
+        stack.points().min(point_cap).max(1),
+        led_count,
     )
     .map_err(anyhow::Error::msg)
 }
@@ -326,8 +329,7 @@ fn available_ports_hint(requested: &str) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn run(
-    live: &mut LiveSource,
-    base: &EngineConfig,
+    stack: &mut LiveStack,
     mut show: ShowConfig,
     renderer: &mut Renderer,
     link: &mut dyn Link,
@@ -342,17 +344,22 @@ fn run(
     let mut dropped = 0u64;
     let mut status = String::new();
 
-    // The initial config is applied through the same path an edit takes, so
-    // startup cannot diverge from what the editor would produce.
-    live.apply(&show, &show, true);
-
     loop {
         // Before the idle check, not after: a stream that has died delivers
         // nothing at all, so anything gated on samples arriving would never
-        // report it. Without this the only symptom is bars that quietly stop.
-        if let Some(fault) = live.take_fault() {
-            status = format!("source: {fault}");
-            announce_input(server, live, Some(fault));
+        // report it. Without this the only symptom is bars that quietly stop —
+        // and with a stack, bars that quietly stop on *one row*.
+        let faults = stack.take_faults();
+        if !faults.is_empty() {
+            status = faults
+                .iter()
+                .map(|(id, fault)| format!("{id}: {fault}"))
+                .collect::<Vec<_>>()
+                .join("  ");
+            let layers = stack.status();
+            if let Some(server) = server {
+                server.announce_state(|s| s.layers = layers);
+            }
         }
 
         // Drained before the audio, not after, and so on every pass rather than
@@ -361,8 +368,8 @@ fn run(
         // The order matters more than it looks: a silent source delivers no
         // samples at all, so commands gated behind audio arriving would never be
         // seen — and the one command that most needs to get through is the one
-        // that moves off a source which has gone silent. A dead loopback would
-        // otherwise be unescapable from the editor.
+        // that moves a layer off a source which has gone silent. A dead loopback
+        // would otherwise be unescapable from the editor.
         //
         // Still before rendering, so an edit takes effect on this frame rather
         // than the next.
@@ -371,34 +378,52 @@ fn run(
                 match cmd {
                     Command::Config { config } => {
                         let next = *config;
-                        match renderer.set_surface(&next.surface) {
+                        // The stack is applied first because the renderer is
+                        // built around the shape it reports — how many layers,
+                        // on what grids. Applying the colour half against a
+                        // shape that has already moved is how a stack ends up
+                        // painting one layer with another one's field.
+                        let reshaped = stack.apply(&next);
+                        let applied = if reshaped {
+                            build_renderer(
+                                renderer.config().brightness,
+                                stack,
+                                led_count,
+                                point_cap,
+                            )
+                            .map(|r| *renderer = r)
+                            .map_err(|e| e.to_string())
+                        } else {
+                            renderer.set_layers(&stack.visuals())
+                        };
+
+                        match applied {
                             Ok(()) => {
-                                // A config edit can move the note grid, which
-                                // is the one case where an edit changes the
-                                // shape the renderer was built around.
-                                if live.apply(&next, &show, false) {
-                                    match build_renderer(
-                                        renderer.config().brightness,
-                                        &next,
-                                        live,
-                                        led_count,
-                                        point_cap,
-                                    ) {
-                                        Ok(r) => *renderer = r,
-                                        Err(e) => status = format!("config rejected: {e}"),
-                                    }
-                                }
                                 show = next.clone();
                                 status.clear();
+                                let (points, layers) = (renderer.points(), stack.status());
                                 server.update_state(|s| {
-                                    s.band_count = live.points().min(point_cap);
+                                    s.point_count = points;
+                                    s.layers = layers;
                                     s.config = next;
                                 });
+                                // Pushed only when the stack changed shape, and
+                                // that condition is doing real work in both
+                                // directions. A layer just added has no device
+                                // resolved yet as far as the editor knows, and
+                                // nothing else would ever tell it — so its row
+                                // would read "offline" until a reconnect.
+                                // Announcing on every edit instead would echo a
+                                // config back at drag rate and have the editor
+                                // fighting the user's own hands.
+                                if reshaped {
+                                    server.announce_state(|_| {});
+                                }
                             }
                             // Reported through the status line rather than
-                            // stdout: printing here would tear the display.
-                            // The rest of the config is dropped with it, so a
-                            // half-applied edit is not left behind.
+                            // stdout: printing here would tear the display. The
+                            // rest of the config goes with it, so a half-applied
+                            // edit is never left behind.
                             Err(e) => status = format!("config rejected: {e}"),
                         }
                     }
@@ -408,39 +433,41 @@ fn run(
                         renderer.set_config(cfg);
                         server.update_state(|s| s.brightness = value.clamp(0.0, 1.0));
                     }
-                    Command::SetSource { source } => {
-                        match switch_source(
-                            live, renderer, base, &show, &source, led_count, point_cap,
-                        ) {
-                            Ok(()) => {
-                                status.clear();
-                                server.update_state(|s| s.band_count = live.points().min(point_cap));
-                                announce_input(Some(server), live, None);
-                            }
-                            // The old source is still running — opening the new
-                            // one is what failed, and the alternative to keeping
-                            // it is silence plus a message.
-                            Err(e) => {
-                                let message = format!("{e:#}");
-                                status = format!("source: {message}");
-                                announce_input(Some(server), live, Some(message));
-                            }
-                        }
-                    }
                     Command::ListSources => {
                         // Costs a mix-format query per audio endpoint, so it
                         // happens when asked and not on a timer. The capture
                         // ring is a quarter second deep; this fits inside it
                         // comfortably.
                         let devices = source::devices();
-                        server.announce_state(|s| s.input.devices = devices);
+                        // A rescan is what someone does after plugging the
+                        // missing interface back in, so it is also the natural
+                        // moment to retry the layers that could not open.
+                        if stack.retry_failed(&show) {
+                            match build_renderer(
+                                renderer.config().brightness,
+                                stack,
+                                led_count,
+                                point_cap,
+                            ) {
+                                Ok(r) => {
+                                    *renderer = r;
+                                    status.clear();
+                                }
+                                Err(e) => status = format!("config rejected: {e}"),
+                            }
+                        }
+                        let layers = stack.status();
+                        server.announce_state(|s| {
+                            s.devices = devices;
+                            s.layers = layers;
+                        });
                     }
                     Command::RequestState => {}
                 }
             }
         }
 
-        if !live.poll() {
+        if !stack.poll() {
             // A source is genuinely idle when nothing is playing through it, and
             // loopback in particular delivers nothing at all rather than
             // silence. Not an error, so the loop just comes back around — with
@@ -449,7 +476,7 @@ fn run(
             continue;
         }
 
-        let pixels = renderer.render(live.levels());
+        let pixels = renderer.render_stack(&stack.all_levels());
         if !link.send(pixels)? {
             dropped += 1;
         }
@@ -461,81 +488,29 @@ fn run(
 
             if let Some(server) = server {
                 let strip = encode_strip(&leds);
-                let levels = live.levels().to_vec();
-                let centers = live.centers().to_vec();
-                let sample_rate = live.sample_rate();
-                let out_of_range = live.out_of_range().unwrap_or(0);
+                let frames: Vec<LayerFrame> = show
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, layer)| LayerFrame {
+                        id: layer.id.clone(),
+                        levels: stack.levels(i).to_vec(),
+                        centers: stack.centers(i).to_vec(),
+                    })
+                    .collect();
                 server.publish(|snap| {
-                    snap.levels = levels;
+                    snap.layers = frames;
                     snap.strip = strip;
                     snap.dropped_frames = dropped;
-                    snap.notes_out_of_range = out_of_range;
-                    snap.sample_rate = sample_rate;
                     snap.connected = true;
-                    // Compared rather than assigned: the axis only moves on a
-                    // source switch or a note-range edit, and a Vec assignment
-                    // per frame would allocate for nothing.
-                    if snap.centers != centers {
-                        snap.centers = centers;
-                    }
                 });
             }
 
-            draw(live.levels(), &leds, dropped, &status, first);
+            draw(stack, &leds, dropped, &status, first);
             last_draw = Instant::now();
             first = false;
         }
     }
-}
-
-/// Move to a different source, live.
-///
-/// The new one is opened *before* the old is dropped, so a source that cannot be
-/// opened leaves the running one untouched rather than trading a working strip
-/// for an error message.
-///
-/// The renderer is rebuilt unconditionally rather than only when the grid
-/// changes shape. A switch already costs an open and a reset, the centres move
-/// on nearly every one of them, and the alternative is a comparison that is
-/// wrong once and dark forever.
-fn switch_source(
-    live: &mut LiveSource,
-    renderer: &mut Renderer,
-    base: &EngineConfig,
-    show: &ShowConfig,
-    source: &Source,
-    led_count: usize,
-    point_cap: usize,
-) -> Result<()> {
-    // A request that resolves to what is already open is answered in place. For
-    // MIDI that is not a shortcut but a requirement — see `LiveSource::retune`.
-    if live.retune(source) {
-        return Ok(());
-    }
-
-    let mut next = LiveSource::open(source, base, show, CAPTURE_BUFFER_SECS)?;
-    next.apply(show, show, true);
-    let rebuilt = build_renderer(renderer.config().brightness, show, &next, led_count, point_cap)?;
-
-    *live = next;
-    *renderer = rebuilt;
-    Ok(())
-}
-
-/// Tell the editor what is actually being listened to.
-///
-/// The device list is deliberately left alone — it is refreshed only when asked
-/// for, and a switch does not change what exists.
-fn announce_input(server: Option<&UiServer>, live: &LiveSource, error: Option<String>) {
-    let Some(server) = server else { return };
-    server.announce_state(|s| {
-        s.input.source = live.source().clone();
-        s.input.device_name = live.device_name().to_string();
-        s.input.kind = live.kind();
-        s.input.channels = live.channels();
-        s.input.sample_rate = live.sample_rate();
-        s.input.error = error;
-    });
 }
 
 /// Listen for a fixed duration and report what arrived, then exit.
@@ -545,10 +520,7 @@ fn announce_input(server: Option<&UiServer>, live: &LiveSource, error: Option<St
 /// Loopback legitimately delivers nothing while the endpoint is idle, and so
 /// does a MIDI port with nobody playing, so silence is not by itself a fault.
 fn probe(live: &mut LiveSource, secs: f64) -> Result<()> {
-    match live {
-        LiveSource::Midi(_) => probe_midi(live, secs),
-        LiveSource::Audio(_) => probe_audio(live, secs),
-    }
+    if live.is_midi() { probe_midi(live, secs) } else { probe_audio(live, secs) }
 }
 
 fn probe_audio(live: &mut LiveSource, secs: f64) -> Result<()> {
@@ -677,12 +649,12 @@ fn probe_midi(live: &mut LiveSource, secs: f64) -> Result<()> {
     Ok(())
 }
 
-fn print_header(live: &LiveSource, link: &dyn Link, led_count: usize, point_cap: usize) {
+fn print_header(stack: &LiveStack, link: &dyn Link, led_count: usize, point_cap: usize) {
     println!("DJLED");
-    println!("  source   {}", live.describe());
+    println!("  source   {}", stack.describe(0));
     println!("  output   {}", link.describe());
 
-    match live.engine() {
+    match stack.engine(0) {
         Some(engine) => {
             println!("  bands    {} across {led_count} LEDs", engine.band_count());
             println!("  tiers");
@@ -700,7 +672,7 @@ fn print_header(live: &LiveSource, link: &dyn Link, led_count: usize, point_cap:
             }
         }
         None => {
-            println!("  notes    {} semitones across {led_count} LEDs", live.centers().len());
+            println!("  notes    {} semitones across {led_count} LEDs", stack.centers(0).len());
         }
     }
 
@@ -709,12 +681,12 @@ fn print_header(live: &LiveSource, link: &dyn Link, led_count: usize, point_cap:
     // spectrum, the preview and the bars above all stay correct while the strip
     // goes dark. Points are narrowed to fit instead, and that is worth saying
     // out loud because it is a real loss of resolution.
-    if live.points() > point_cap {
+    if stack.points() > point_cap {
         println!(
-            "  NOTE     {} points narrowed to {point_cap} for the wire — the firmware's\n\
+            "  NOTE     {} points narrowed to {point_cap} for the wire, the firmware own\n\
              {:11}MAX_BANDS. Raise it in firmware/djled/djled.ino and reflash for\n\
              {:11}the full resolution.",
-            live.points(),
+            stack.points(),
             "",
             ""
         );
@@ -723,7 +695,14 @@ fn print_header(live: &LiveSource, link: &dyn Link, led_count: usize, point_cap:
     println!("\n  play something. ctrl-c to quit.\n");
 }
 
-fn draw(levels: &[f32], leds: &[[u8; 3]], dropped: u64, status: &str, first: bool) {
+/// The terminal display: the bottom layer bars over the composited strip.
+///
+/// Only the bottom layer is plotted, deliberately. The strip underneath is the
+/// whole stack, which is the thing worth watching without a browser; drawing
+/// every layer would turn a glance into a reading exercise, and the editor is
+/// where a stack is meant to be looked at.
+fn draw(stack: &LiveStack, leds: &[[u8; 3]], dropped: u64, status: &str, first: bool) {
+    let levels = stack.levels(0);
     let mut out = String::with_capacity(levels.len() * (BAR_HEIGHT + 4) + leds.len() * 24);
 
     if !first {
@@ -769,8 +748,12 @@ fn draw(levels: &[f32], leds: &[[u8; 3]], dropped: u64, status: &str, first: boo
     out.push_str("\x1b[0m\n");
 
     out.push_str(&format!(
-        "  {} LEDs   dropped frames: {dropped}   {status}\x1b[K\n",
-        leds.len()
+        "  {} LEDs   {} {} on {} {}   dropped frames: {dropped}   {status}\x1b[K\n",
+        leds.len(),
+        stack.len(),
+        if stack.len() == 1 { "layer" } else { "layers" },
+        stack.feed_count(),
+        if stack.feed_count() == 1 { "device" } else { "devices" },
     ));
 
     let mut stdout = std::io::stdout().lock();

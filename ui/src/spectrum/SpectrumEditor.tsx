@@ -25,7 +25,8 @@ import {
   nextId,
   toSurface,
   type ColorKeyframe,
-  type EditorConfig,
+  type EditorLayer,
+  type GizmoFlags,
   type LedKeyframe,
 } from "../config/editor";
 import {
@@ -63,8 +64,19 @@ const MIN_COLOR_KEYFRAMES = 2;
 const MIN_LED_KEYFRAMES = 2;
 
 interface Props {
-  config: EditorConfig;
-  onChange: (config: EditorConfig) => void;
+  /**
+   * The layer being edited.
+   *
+   * The plot shows one layer at a time, deliberately. Every gizmo on it — the
+   * keyframes, the sectors, the EQ, the two rail handles and the curve — is a
+   * property of a single layer, and six stacks of them on one graph would be
+   * unreadable and unclickable. The composited result of the whole stack is
+   * what the strip preview underneath is for.
+   */
+  layer: EditorLayer;
+  onChange: (layer: EditorLayer) => void;
+  /** Overlay visibility. Editor-wide rather than per layer. */
+  gizmos: GizmoFlags;
   frame: SpectrumFrame;
   /** What the horizontal marks are called. The axis and every gizmo on it stay
    *  in Hz; only the labels change when MIDI is driving the strip. */
@@ -81,8 +93,9 @@ interface Grab {
 }
 
 export function SpectrumEditor({
-  config,
+  layer,
   onChange,
+  gizmos,
   frame,
   axis,
   ledCount,
@@ -99,7 +112,7 @@ export function SpectrumEditor({
   const [grab, setGrab] = useState<Grab | null>(null);
 
   const layout = useMemo(() => computeLayout(sized.width || 900, PLOT_HEIGHT), [sized.width]);
-  const surface = useMemo(() => toSurface(config), [config]);
+  const surface = useMemo(() => toSurface(layer), [layer]);
   const clearSelection = useCallback(() => setSelected(null), []);
 
   const localPoint = useCallback((event: { clientX: number; clientY: number }) => {
@@ -114,38 +127,38 @@ export function SpectrumEditor({
       if (event.button !== 0) return;
       event.stopPropagation();
       const p = localPoint(event);
-      setGrab({ target, ...grabOffset(target, config, layout, p) });
+      setGrab({ target, ...grabOffset(target, layer, layout, p) });
       const selectable = target.kind === "color" || target.kind === "led" || target.kind === "eq";
       setSelected(selectable ? target : null);
     },
-    [config, layout, localPoint],
+    [layer, layout, localPoint],
   );
 
   useWindowEvent("pointermove", (event: PointerEvent) => {
     if (!grab) return;
     const p = localPoint(event);
-    onChange(applyDrag(config, layout, grab, p.x, p.y));
+    onChange(applyDrag(layer, layout, grab, p.x, p.y));
   });
 
   useWindowEvent("pointerup", () => setGrab(null));
 
   const removeSelected = useCallback(() => {
     if (!selected) return;
-    if (selected.kind === "color" && config.colorKeyframes.length > MIN_COLOR_KEYFRAMES) {
+    if (selected.kind === "color" && layer.colorKeyframes.length > MIN_COLOR_KEYFRAMES) {
       onChange({
-        ...config,
-        colorKeyframes: config.colorKeyframes.filter((k) => k.id !== selected.id),
+        ...layer,
+        colorKeyframes: layer.colorKeyframes.filter((k) => k.id !== selected.id),
       });
       setSelected(null);
-    } else if (selected.kind === "led" && config.ledKeyframes.length > MIN_LED_KEYFRAMES) {
-      onChange({ ...config, ledKeyframes: config.ledKeyframes.filter((k) => k.id !== selected.id) });
+    } else if (selected.kind === "led" && layer.ledKeyframes.length > MIN_LED_KEYFRAMES) {
+      onChange({ ...layer, ledKeyframes: layer.ledKeyframes.filter((k) => k.id !== selected.id) });
       setSelected(null);
     } else if (selected.kind === "eq") {
       // No minimum: an EQ with no bands is flat, which is a valid state.
-      onChange({ ...config, eq: config.eq.filter((b) => b.id !== selected.id) });
+      onChange({ ...layer, eq: layer.eq.filter((b) => b.id !== selected.id) });
       setSelected(null);
     }
-  }, [config, onChange, selected]);
+  }, [layer, onChange, selected]);
 
   useHotkeys([
     ["Delete", removeSelected],
@@ -161,17 +174,17 @@ export function SpectrumEditor({
       const db = Math.round(dbOfY(layout, p.y));
       // Seeded with the colour already showing there, so dropping a keyframe
       // never makes the field jump before it has been given a colour.
-      const sampled = new ColorSurface(toSurface(config)).sample(hzToNorm(hz), dbToLevel(db));
+      const sampled = new ColorSurface(toSurface(layer)).sample(hzToNorm(hz), dbToLevel(db));
       const keyframe: ColorKeyframe = {
         id: nextId("ck"),
         hz,
         db,
         color: oklabToHex(sampled),
       };
-      onChange({ ...config, colorKeyframes: [...config.colorKeyframes, keyframe] });
+      onChange({ ...layer, colorKeyframes: [...layer.colorKeyframes, keyframe] });
       setSelected({ kind: "color", id: keyframe.id });
     },
-    [config, layout, localPoint, onChange],
+    [layer, layout, localPoint, onChange],
   );
 
   const addLed = useCallback(
@@ -182,12 +195,12 @@ export function SpectrumEditor({
       const keyframe: LedKeyframe = {
         id: nextId("led"),
         hz,
-        led: suggestLed(config.ledKeyframes, hz, ledCount),
+        led: suggestLed(layer.ledKeyframes, hz, ledCount),
       };
-      onChange({ ...config, ledKeyframes: sortByHz([...config.ledKeyframes, keyframe]) });
+      onChange({ ...layer, ledKeyframes: sortByHz([...layer.ledKeyframes, keyframe]) });
       setSelected({ kind: "led", id: keyframe.id });
     },
-    [config, layout, ledCount, localPoint, onChange],
+    [layer, layout, ledCount, localPoint, onChange],
   );
 
   const addEq = useCallback(
@@ -203,27 +216,27 @@ export function SpectrumEditor({
         gain: Math.round(gainOfY(layout, p.y) * 2) / 2,
         q: 1,
       };
-      onChange({ ...config, eq: sortByHz([...config.eq, band]) });
+      onChange({ ...layer, eq: sortByHz([...layer.eq, band]) });
       setSelected({ kind: "eq", id: band.id });
     },
-    [config, layout, localPoint, onChange],
+    [layer, layout, localPoint, onChange],
   );
 
   const updateEq = useCallback(
     (id: string, patch: Partial<EqBand>) => {
-      onChange({ ...config, eq: config.eq.map((b) => (b.id === id ? { ...b, ...patch } : b)) });
+      onChange({ ...layer, eq: layer.eq.map((b) => (b.id === id ? { ...b, ...patch } : b)) });
     },
-    [config, onChange],
+    [layer, onChange],
   );
 
   const selectedColor =
     selected?.kind === "color"
-      ? config.colorKeyframes.find((k) => k.id === selected.id)
+      ? layer.colorKeyframes.find((k) => k.id === selected.id)
       : undefined;
   const selectedLed =
-    selected?.kind === "led" ? config.ledKeyframes.find((k) => k.id === selected.id) : undefined;
+    selected?.kind === "led" ? layer.ledKeyframes.find((k) => k.id === selected.id) : undefined;
   const selectedEq =
-    selected?.kind === "eq" ? config.eq.find((b) => b.id === selected.id) : undefined;
+    selected?.kind === "eq" ? layer.eq.find((b) => b.id === selected.id) : undefined;
 
   const anchor = selectedColor
     ? { x: xOfHz(layout, selectedColor.hz), y: yOfDb(layout, selectedColor.db) }
@@ -244,7 +257,8 @@ export function SpectrumEditor({
       <SpectrumCanvas layout={layout} surface={surface} frame={frame} axis={axis} />
       <GizmoLayer
         layout={layout}
-        config={config}
+        layer={layer}
+        gizmos={gizmos}
         palette={palette}
         axis={axis}
         sampleRate={sampleRate}
@@ -293,7 +307,7 @@ export function SpectrumEditor({
                   <ActionIcon
                     color="red"
                     aria-label="Delete keyframe"
-                    disabled={config.colorKeyframes.length <= MIN_COLOR_KEYFRAMES}
+                    disabled={layer.colorKeyframes.length <= MIN_COLOR_KEYFRAMES}
                     onClick={removeSelected}
                   >
                     <TrashIcon />
@@ -313,8 +327,8 @@ export function SpectrumEditor({
                 value={selectedColor.color}
                 onChange={(color) =>
                   onChange({
-                    ...config,
-                    colorKeyframes: config.colorKeyframes.map((k) =>
+                    ...layer,
+                    colorKeyframes: layer.colorKeyframes.map((k) =>
                       k.id === selectedColor.id ? { ...k, color } : k,
                     ),
                   })
@@ -336,7 +350,7 @@ export function SpectrumEditor({
                   <ActionIcon
                     color="red"
                     aria-label="Delete LED keyframe"
-                    disabled={config.ledKeyframes.length <= MIN_LED_KEYFRAMES}
+                    disabled={layer.ledKeyframes.length <= MIN_LED_KEYFRAMES}
                     onClick={removeSelected}
                   >
                     <TrashIcon />
@@ -350,8 +364,8 @@ export function SpectrumEditor({
                 value={selectedLed.led}
                 onChange={(value) =>
                   onChange({
-                    ...config,
-                    ledKeyframes: config.ledKeyframes.map((k) =>
+                    ...layer,
+                    ledKeyframes: layer.ledKeyframes.map((k) =>
                       k.id === selectedLed.id
                         ? { ...k, led: clamp(Number(value) || 0, 0, ledCount - 1) }
                         : k,
@@ -367,9 +381,9 @@ export function SpectrumEditor({
                 value={Math.round(selectedLed.hz)}
                 onChange={(value) =>
                   onChange({
-                    ...config,
+                    ...layer,
                     ledKeyframes: sortByHz(
-                      config.ledKeyframes.map((k) =>
+                      layer.ledKeyframes.map((k) =>
                         k.id === selectedLed.id
                           ? { ...k, hz: clamp(Number(value) || 20, 20, 20_000) }
                           : k,
@@ -458,21 +472,21 @@ const SWATCHES = [
 
 function grabOffset(
   target: GizmoTarget,
-  config: EditorConfig,
+  layer: EditorLayer,
   layout: PlotLayout,
   p: { x: number; y: number },
 ): { dx: number; dy: number } {
   // Only the point-like gizmos need an offset; the rails snap to the pointer.
   if (target.kind === "color") {
-    const k = config.colorKeyframes.find((c) => c.id === target.id);
+    const k = layer.colorKeyframes.find((c) => c.id === target.id);
     if (k) return { dx: xOfHz(layout, k.hz) - p.x, dy: yOfDb(layout, k.db) - p.y };
   }
   if (target.kind === "led") {
-    const k = config.ledKeyframes.find((c) => c.id === target.id);
+    const k = layer.ledKeyframes.find((c) => c.id === target.id);
     if (k) return { dx: xOfHz(layout, k.hz) - p.x, dy: 0 };
   }
   if (target.kind === "eq") {
-    const b = config.eq.find((c) => c.id === target.id);
+    const b = layer.eq.find((c) => c.id === target.id);
     if (b) {
       return {
         dx: xOfHz(layout, b.hz) - p.x,
@@ -484,12 +498,12 @@ function grabOffset(
 }
 
 function applyDrag(
-  config: EditorConfig,
+  layer: EditorLayer,
   layout: PlotLayout,
   grab: Grab,
   px: number,
   py: number,
-): EditorConfig {
+): EditorLayer {
   const x = px + grab.dx;
   const y = py + grab.dy;
 
@@ -499,17 +513,17 @@ function applyDrag(
       const hz = snapHz(hzOfX(layout, x));
       const db = Math.round(dbOfY(layout, y) * 2) / 2;
       return {
-        ...config,
-        colorKeyframes: config.colorKeyframes.map((k) => (k.id === id ? { ...k, hz, db } : k)),
+        ...layer,
+        colorKeyframes: layer.colorKeyframes.map((k) => (k.id === id ? { ...k, hz, db } : k)),
       };
     }
     case "led": {
       const id = grab.target.id;
       const hz = snapHz(hzOfX(layout, x));
       return {
-        ...config,
+        ...layer,
         ledKeyframes: sortByHz(
-          config.ledKeyframes.map((k) => (k.id === id ? { ...k, hz } : k)),
+          layer.ledKeyframes.map((k) => (k.id === id ? { ...k, hz } : k)),
         ),
       };
     }
@@ -517,9 +531,9 @@ function applyDrag(
       const id = grab.target.id;
       const hz = snapHz(hzOfX(layout, x));
       return {
-        ...config,
+        ...layer,
         eq: sortByHz(
-          config.eq.map((b) => {
+          layer.eq.map((b) => {
             if (b.id !== id) return b;
             // A pass filter has no gain to drag, so vertical movement is
             // discarded rather than silently stored and never used.
@@ -531,23 +545,23 @@ function applyDrag(
     }
     case "threshold":
       return {
-        ...config,
-        threshold: clamp(round1(dbOfY(layout, y)), DB_MIN, config.clamp - MIN_WINDOW_DB),
+        ...layer,
+        threshold: clamp(round1(dbOfY(layout, y)), DB_MIN, layer.clamp - MIN_WINDOW_DB),
       };
     case "clamp":
       return {
-        ...config,
-        clamp: clamp(round1(dbOfY(layout, y)), config.threshold + MIN_WINDOW_DB, DB_MAX),
+        ...layer,
+        clamp: clamp(round1(dbOfY(layout, y)), layer.threshold + MIN_WINDOW_DB, DB_MAX),
       };
     case "curve": {
-      const box = curveBox(layout, config.clamp, config.threshold);
-      if (box.h <= 0 || box.w <= 0) return config;
+      const box = curveBox(layout, layer.clamp, layer.threshold);
+      if (box.h <= 0 || box.w <= 0) return layer;
       const point = {
         x: clamp(1 - (y - box.y) / box.h, 0, 1),
         y: clamp((x - box.x) / box.w, 0, 1),
       };
       const key = grab.target.point === 1 ? "p1" : "p2";
-      return { ...config, curve: { ...config.curve, [key]: point } };
+      return { ...layer, curve: { ...layer.curve, [key]: point } };
     }
   }
 }

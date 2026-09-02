@@ -42,7 +42,7 @@ impl Pipeline {
     /// Built the way the engine builds it: the point count is whatever the
     /// *link* says it will take, never what the protocol theoretically allows.
     fn driving(cfg: MidiConfig, layout: LayoutConfig, link: MockLink) -> Self {
-        let notes = NoteEngine::new(&cfg, None, ShowConfig::default().decay());
+        let notes = NoteEngine::new(&cfg, None, ShowConfig::default().base().decay());
         let renderer = Renderer::new(
             RenderConfig::default(),
             &SurfaceConfig::default(),

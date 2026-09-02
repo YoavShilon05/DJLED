@@ -4,7 +4,7 @@
  * The engine is a headless service and this is just a client, so the UI can be
  * opened, reloaded or closed without the strip noticing. Reconnection is
  * automatic and the editor stays fully usable while disconnected — you can
- * author a palette with nothing running and it will be sent when the engine
+ * author a stack with nothing running and it will be sent when the engine
  * appears.
  */
 
@@ -16,13 +16,23 @@ import type { LedKeyframe } from "./config/editor";
 export const DEFAULT_URL = "ws://127.0.0.1:9001";
 
 /**
- * The engine's `ShowConfig`, verbatim.
+ * The engine's `show::Layer`, verbatim.
  *
- * Everything the editor holds that the engine acts on, in one message. The
- * colour keyframes travel as the normalised surface because that is the form
- * the renderer samples; the rest is sent as authored.
+ * Everything that shapes one layer, including what it listens to. The source
+ * travels here rather than in a command of its own because it is part of the
+ * layer: two layers of one show can be watching two different devices, and a
+ * reorder must carry each one's device with it.
  */
-export interface ShowConfig {
+export interface LayerConfig {
+  /** Stable across a reorder, which is how per-layer telemetry finds its row. */
+  id: string;
+  name: string;
+  /** Off skips the layer entirely — not composited, and not analysed. */
+  enabled: boolean;
+  /** Master opacity, multiplied into every sample's own. The Photoshop slider:
+   *  it fades toward what is underneath, not toward black. */
+  opacity: number;
+  source: InputSource;
   surface: SurfaceConfig;
   eq: EqBand[];
   ledKeyframes: LedKeyframe[];
@@ -37,11 +47,21 @@ export interface ShowConfig {
 }
 
 /**
+ * The engine's `ShowConfig`, verbatim: a stack of layers, bottom first.
+ *
+ * The order *is* the compositing order, so a drag in the editor is a reorder of
+ * this array and nothing else.
+ */
+export interface ShowConfig {
+  layers: LayerConfig[];
+}
+
+/**
  * The engine's `midi::MidiConfig`, verbatim.
  *
- * Part of the show rather than of the source selection: the note range and
+ * Part of the layer rather than of the source selection: the note range and
  * spread are as much a part of a look as the colours are, so they are saved
- * with it and survive switching to audio and back.
+ * with it and survive switching that layer to audio and back.
  */
 export interface MidiConfig {
   /** Note at the left end of the axis. */
@@ -55,14 +75,14 @@ export interface MidiConfig {
 }
 
 /**
- * Which kind of endpoint is being listened to.
+ * Which kind of endpoint a layer is listening to.
  *
  * A WASAPI endpoint is one direction or the other, never both — an interface
  * appears as a separate playback endpoint and capture endpoint, usually under
  * the same name. So the direction is a property of the device, not something
  * the user picks alongside it; it only matters on its own when no device is
  * named. MIDI ports are a third kind, listed alongside them because choosing
- * what drives the strip is one choice, not two.
+ * what drives a layer is one choice, not two.
  */
 export type SourceKind = "loopback" | "input" | "midi";
 
@@ -87,45 +107,64 @@ export interface InputDevice {
   channels: number | null;
 }
 
-export interface InputState {
-  devices: InputDevice[];
-  /** The live selection, as resolved rather than as requested. */
-  source: InputSource;
-  /** The endpoint the selection currently resolves to. Not redundant with
-   *  `source`: "the default output" names no device, and you still want to see
-   *  which one you got. */
+/**
+ * What one layer's selection actually resolved to.
+ *
+ * The authored half is already in the config this editor sent; this is the half
+ * only the engine can answer. A layer whose device would not open reports it
+ * here and every other layer keeps running, which is the whole reason this is
+ * per layer rather than per connection.
+ */
+export interface LayerStatus {
+  /** Matches `LayerConfig.id`. */
+  id: string;
+  /** The endpoint the selection resolves to. Not redundant with the layer's
+   *  own `source`: "the default output" names no device, and you still want to
+   *  see which one you got. */
   deviceName: string;
   kind: SourceKind;
   channels: number;
   /** Zero for MIDI, which has no sample rate. */
   sampleRate: number;
+  /** Bands for audio, semitones for MIDI. */
+  points: number;
+  /** Notes dropped for falling outside the note range. Null for audio. */
+  notesOutOfRange: number | null;
   error: string | null;
 }
 
-export interface Frame {
+/** One layer's analysis, as the editor plots it. */
+export interface LayerFrame {
+  id: string;
   levels: number[];
   /** Band centre frequencies in Hz, so the axis can be labelled correctly. */
   centers: number[];
-  /** Strip as the firmware will drive it, hex-encoded RGB. */
+}
+
+export interface Frame {
+  /** Bottom layer first, matching the show. */
+  layers: LayerFrame[];
+  /** The whole stack composited, as the firmware will drive it — hex-encoded
+   *  RGB. The one thing no single layer can tell you. */
   strip: string;
-  sampleRate: number;
   connected: boolean;
   droppedFrames: number;
-  /** Notes seen outside the configured range. Live rather than state: it is
-   *  the answer to "why is the strip dark", and it changes while someone is
-   *  playing rather than when they change a setting. */
-  notesOutOfRange: number;
 }
 
 export interface EngineState {
   config: ShowConfig;
   brightness: number;
   ledCount: number;
-  bandCount: number;
+  /** Colours on the wire per frame, which is what the whole stack renders at. */
+  pointCount: number;
   /** Analyser dB window. The EQ is authored in these terms, not the plot's. */
   dbFloor: number;
   dbCeil: number;
-  input: InputState;
+  /** Everything selectable, as of the last scan. Global rather than per layer:
+   *  what exists does not depend on who is listening to it. */
+  devices: InputDevice[];
+  /** What each layer resolved to, bottom first. */
+  layers: LayerStatus[];
 }
 
 export type Status = "connecting" | "connected" | "offline";
@@ -223,12 +262,20 @@ export class EngineClient {
   }
 
   /**
-   * Push the whole configuration.
+   * Push the whole show — every layer, including what each one listens to.
    *
-   * Sent as one message even on the hot path — dragging a keyframe produces one
-   * of these per pointer move. The engine compares each stage against what it
-   * already has, so the cost is a few float comparisons, and a single message
-   * means the two sides cannot disagree about which half of an edit landed.
+   * Sent as one message even on the hot path, where dragging a keyframe
+   * produces one of these per pointer move. The engine compares each stage
+   * against what it already has, so the cost is a few float comparisons, and a
+   * single message means the two sides cannot disagree about which half of an
+   * edit landed. That matters more with a stack than without one: a reorder and
+   * a recolour can arrive in the same gesture.
+   *
+   * Moving a layer to a different device is part of this message rather than a
+   * command of its own. The engine opens the new stream before dropping the old
+   * one, so a device that cannot be opened leaves that layer where it was and
+   * comes back as an error against it in the next `state` — every other layer
+   * carries on regardless.
    */
   setConfig(config: ShowConfig): void {
     this.send({ type: "config", config });
@@ -238,18 +285,8 @@ export class EngineClient {
     this.send({ type: "brightness", value });
   }
 
-  /**
-   * Listen to a different endpoint.
-   *
-   * The engine opens the new stream before dropping the old one, so a source
-   * that cannot be opened leaves capture running and comes back as an error in
-   * the next `state` message rather than as silence.
-   */
-  setSource(source: InputSource): void {
-    this.send({ type: "setSource", source });
-  }
-
-  /** Rescan the endpoints, e.g. after plugging an interface in. */
+  /** Rescan the endpoints, e.g. after plugging an interface in. Also retries
+   *  any layer whose device would not open. */
   listSources(): void {
     this.send({ type: "listSources" });
   }

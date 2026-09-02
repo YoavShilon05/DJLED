@@ -5,7 +5,7 @@
 //! but could still be wired together wrongly.
 
 use djled_engine::color::intensity::IntensityConfig;
-use djled_engine::color::{Geometry, LayoutConfig, RenderConfig, Renderer, SurfaceConfig};
+use djled_engine::color::{Geometry, LayerVisual, LayoutConfig, RenderConfig, Renderer, SurfaceConfig};
 use djled_engine::link::{expand_bands_to_leds, Link, MockLink};
 use djled_engine::{Engine, EngineConfig};
 
@@ -366,4 +366,168 @@ fn editor_db_and_engine_level_agree() {
     }
     assert_eq!(db_to_level(-80.0), 0.0);
     assert_eq!(db_to_level(0.0), 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// The layer stack, end to end.
+//
+// The compositor has unit tests over its own maths. What they cannot catch is
+// the failure that matters here: a layer being composited correctly and then
+// dropped between the renderer and the wire, or a stack that quietly renders
+// only its bottom layer because the levels never reached the top one.
+// ---------------------------------------------------------------------------
+
+/// Two layers driven by one analyser, which is what two layers on one device
+/// really are.
+struct Stack {
+    engine: Engine,
+    renderer: Renderer,
+    link: MockLink,
+}
+
+impl Stack {
+    fn new(layers: &[LayerVisual]) -> Self {
+        let engine = Engine::new(&EngineConfig::default(), SR);
+        let renderer = Renderer::stacked(
+            RenderConfig { dither: false, ..Default::default() },
+            layers,
+            engine.band_count(),
+            LEDS,
+        )
+        .unwrap();
+        Self { engine, renderer, link: MockLink::new(LEDS) }
+    }
+
+    fn run(&mut self, secs: f64, signal: impl Fn(usize) -> f32) {
+        let block = (SR * 0.010) as usize;
+        let mut buf = vec![0.0f32; block];
+        let mut i = 0;
+        while i < (SR * secs) as usize {
+            for (k, s) in buf.iter_mut().enumerate() {
+                *s = signal(i + k);
+            }
+            if self.engine.push(&buf) {
+                let levels = self.engine.levels();
+                let each: Vec<&[f32]> = vec![levels; self.renderer.layer_count()];
+                let pixels = self.renderer.render_stack(&each);
+                self.link.send(pixels).unwrap();
+            }
+            i += block;
+        }
+    }
+
+    fn brightest_led(&self) -> [u8; 3] {
+        *self
+            .link
+            .leds()
+            .iter()
+            .max_by_key(|px| px.iter().map(|&c| c as u32).sum::<u32>())
+            .unwrap()
+    }
+}
+
+fn layer(color: &str, opacity: f32, centers: &[f32]) -> LayerVisual {
+    LayerVisual {
+        surface: SurfaceConfig {
+            keyframes: vec![
+                djled_engine::color::Keyframe::new(0.0, 0.0, color),
+                djled_engine::color::Keyframe::new(1.0, 1.0, color),
+            ],
+            sigma: 0.5,
+        },
+        layout: LayoutConfig::spanning(LEDS),
+        intensity: IntensityConfig::pass_through(),
+        opacity,
+        centers: centers.to_vec(),
+    }
+}
+
+fn centers() -> Vec<f32> {
+    Engine::new(&EngineConfig::default(), SR).centers().to_vec()
+}
+
+/// The claim the feature was asked for, all the way to the LED bytes: red under
+/// green is green on the wall.
+#[test]
+fn the_top_layer_reaches_the_leds() {
+    let c = centers();
+    let mut stacked = Stack::new(&[layer("#ff2000", 1.0, &c), layer("#40ff60", 1.0, &c)]);
+    stacked.run(1.5, tone(440.0));
+
+    let mut alone = Stack::new(&[layer("#40ff60", 1.0, &c)]);
+    alone.run(1.5, tone(440.0));
+
+    assert_eq!(
+        stacked.link.leds(),
+        alone.link.leds(),
+        "the top layer did not survive the trip to the wire"
+    );
+
+    // ...and it is genuinely the green one, not merely equal to something.
+    let px = stacked.brightest_led();
+    assert!(px[1] > px[0], "the strip is not showing the top layer: {px:?}");
+}
+
+/// A layer faded halfway lands between the two on the strip, rather than
+/// halfway to black. This is the difference between opacity and brightness, and
+/// it only becomes visible once there is something underneath.
+#[test]
+fn layer_opacity_blends_on_the_wall() {
+    let c = centers();
+    let mut blended = Stack::new(&[layer("#ff2000", 1.0, &c), layer("#40ff60", 0.5, &c)]);
+    blended.run(1.5, tone(440.0));
+
+    let mut red = Stack::new(&[layer("#ff2000", 1.0, &c)]);
+    red.run(1.5, tone(440.0));
+    let mut green = Stack::new(&[layer("#40ff60", 1.0, &c)]);
+    green.run(1.5, tone(440.0));
+
+    for (i, px) in blended.link.leds().iter().enumerate() {
+        for (ch, &got) in px.iter().enumerate() {
+            let want =
+                0.5 * green.link.leds()[i][ch] as f32 + 0.5 * red.link.leds()[i][ch] as f32;
+            assert!(
+                (got as f32 - want).abs() <= 3.0,
+                "LED {i} channel {ch}: got {got}, expected about {want}"
+            );
+        }
+    }
+}
+
+/// The other half of the design: opaque black covers. A quiet top layer with an
+/// opaque field blanks the strip, and the same layer authored transparent does
+/// not — which is what makes "black blocks, opacity blends" a choice the editor
+/// can actually express.
+#[test]
+fn opaque_black_blanks_the_strip_and_transparent_black_does_not() {
+    let c = centers();
+
+    let mut blocked = Stack::new(&[layer("#ff2000", 1.0, &c), layer("#000000", 1.0, &c)]);
+    blocked.run(1.5, tone(440.0));
+    assert!(
+        blocked.link.leds().iter().all(|px| px == &[0, 0, 0]),
+        "opaque black did not reach the wire as a blackout"
+    );
+
+    let mut passed = Stack::new(&[layer("#ff2000", 1.0, &c), layer("#00000000", 1.0, &c)]);
+    passed.run(1.5, tone(440.0));
+    let mut alone = Stack::new(&[layer("#ff2000", 1.0, &c)]);
+    alone.run(1.5, tone(440.0));
+    assert_eq!(passed.link.leds(), alone.link.leds(), "transparent black blanked the strip");
+}
+
+/// The wire is unchanged by the stack: still one colour per control point,
+/// still 149 bytes, however many layers went into computing them. That is the
+/// whole reason no firmware change was needed.
+#[test]
+fn the_wire_format_is_unchanged_by_the_stack() {
+    let c = centers();
+    let layers: Vec<LayerVisual> =
+        (0..5).map(|_| layer("#40c0ff", 0.6, &c)).collect();
+    let mut p = Stack::new(&layers);
+    p.run(1.0, tone(440.0));
+
+    assert_eq!(p.renderer.pixels().len(), BANDS);
+    assert_eq!(p.link.last_frame_bytes(), 149);
+    assert_eq!(p.link.leds().len(), LEDS);
 }
