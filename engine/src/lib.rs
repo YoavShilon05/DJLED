@@ -13,8 +13,10 @@ pub mod capture;
 pub mod color;
 pub mod dsp;
 pub mod engine;
+pub mod hotkeys;
 pub mod link;
 pub mod midi;
+pub mod presets;
 pub mod show;
 pub mod source;
 pub mod stack;
@@ -22,6 +24,7 @@ pub mod ui;
 
 pub use engine::{Engine, EngineConfig};
 pub use midi::MidiConfig;
+pub use presets::{PresetInfo, Presets};
 pub use show::{Layer, ShowConfig};
 pub use source::{LiveSource, Source, SourceKind};
 pub use stack::{LayerStatus, LiveStack};

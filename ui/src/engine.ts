@@ -133,6 +133,20 @@ export interface LayerStatus {
   error: string | null;
 }
 
+/**
+ * The engine's `presets::PresetInfo`, verbatim: one slot of the dropdown.
+ *
+ * The shows themselves never come with this. Twelve of them would be resent
+ * every time a device is rescanned, and the editor only ever needs one — the
+ * live one, which arrives as `EngineState.config` like it always has.
+ */
+export interface PresetInfo {
+  name: string;
+  /** Whether anything has been authored into this slot. An empty one opens a
+   *  blank canvas from the dropdown and is declined by its hotkey. */
+  stored: boolean;
+}
+
 /** One layer's analysis, as the editor plots it. */
 export interface LayerFrame {
   id: string;
@@ -165,6 +179,17 @@ export interface EngineState {
   devices: InputDevice[];
   /** What each layer resolved to, bottom first. */
   layers: LayerStatus[];
+  /** The twelve slots in hotkey order: index 0 is ctrl+alt+F1. */
+  presets: PresetInfo[];
+  /**
+   * Which slot `config` came from, and which one edits are saved into.
+   *
+   * The editor watches this. A change in it is the only signal that the show
+   * was replaced by something other than this editor's own hands — a global
+   * hotkey, or a second browser tab — and the one case where adopting the
+   * engine's config rather than pushing our own is the correct move.
+   */
+  activePreset: number;
 }
 
 export type Status = "connecting" | "connected" | "offline";
@@ -289,6 +314,24 @@ export class EngineClient {
    *  any layer whose device would not open. */
   listSources(): void {
     this.send({ type: "listSources" });
+  }
+
+  /**
+   * Make a preset slot live.
+   *
+   * Deliberately does *not* send a config with it. The engine holds the twelve
+   * shows — they have to survive with no browser open, which is the whole point
+   * of the global hotkeys — so this asks for a switch and the new show arrives
+   * in the next `state`, exactly as it does when somebody hits ctrl+alt+F<n>
+   * instead. One path, so the two cannot drift.
+   */
+  selectPreset(slot: number): void {
+    this.send({ type: "selectPreset", slot });
+  }
+
+  /** Rename a slot. Names label the dropdown and nothing else. */
+  renamePreset(slot: number, name: string): void {
+    this.send({ type: "renamePreset", slot, name });
   }
 
   close(): void {

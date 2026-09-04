@@ -31,6 +31,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::presets::PresetInfo;
 use crate::show::ShowConfig;
 use crate::source::DeviceInfo;
 use crate::stack::LayerStatus;
@@ -97,6 +98,22 @@ pub enum Command {
     ListSources,
     /// Ask for the current configuration, e.g. after a reload.
     RequestState,
+    /// Make a preset slot live: put its show on the wall, and send every
+    /// subsequent [`Command::Config`] into it.
+    ///
+    /// The same operation the global hotkey performs, and it lands in the same
+    /// place — the dropdown and `ctrl+alt+F<n>` are two ways in to one thing,
+    /// which is what keeps the editor showing what the wall is doing when
+    /// somebody reaches for the keyboard instead.
+    ///
+    /// They differ in one respect, and only for a slot nothing has been
+    /// authored into: choosing an empty slot here opens the default show,
+    /// because picking it from a list is a deliberate request for a blank
+    /// canvas. The hotkey declines — see [`crate::presets`].
+    SelectPreset { slot: usize },
+    /// Rename a slot. Names are for the dropdown alone and are never
+    /// interpreted; a blank one falls back to the positional `Preset N`.
+    RenamePreset { slot: usize, name: String },
 }
 
 /// Sent once on connect, on request, and whenever the engine announces a change,
@@ -122,6 +139,16 @@ pub struct State {
     /// What each layer's selection actually resolved to, and what went wrong if
     /// anything did. Bottom layer first, matching the show.
     pub layers: Vec<LayerStatus>,
+    /// The twelve slots, in hotkey order: index 0 is `ctrl+alt+F1`. Names and
+    /// whether anything is in them — not the shows themselves, which are far
+    /// too big to resend twelve of every time a device is rescanned.
+    pub presets: Vec<PresetInfo>,
+    /// Which slot `config` came from, and which one edits are being saved into.
+    ///
+    /// The editor watches this: a change in it is the *only* signal that the
+    /// show was replaced by something other than the editor's own hands, which
+    /// is exactly what a hotkey switch is.
+    pub active_preset: usize,
 }
 
 #[derive(Serialize)]
@@ -443,6 +470,24 @@ mod tests {
         }
     }
 
+
+    /// The preset commands, whose whole job is carrying one small number
+    /// correctly — a slot off by one switches to the wrong show.
+    #[test]
+    fn preset_commands_parse_from_the_ui_wire_format() {
+        let cmd: Command = serde_json::from_str(r#"{"type":"selectPreset","slot":7}"#).unwrap();
+        assert!(matches!(cmd, Command::SelectPreset { slot: 7 }));
+
+        let cmd: Command =
+            serde_json::from_str(r#"{"type":"renamePreset","slot":0,"name":"Warm"}"#).unwrap();
+        match cmd {
+            Command::RenamePreset { slot, name } => {
+                assert_eq!(slot, 0);
+                assert_eq!(name, "Warm");
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
 
     /// A malformed command must be reported, not crash the client thread.
     #[test]

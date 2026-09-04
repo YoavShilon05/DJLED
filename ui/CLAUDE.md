@@ -13,10 +13,11 @@ that make this directory dangerous.
 ```bash
 npm install
 npm run dev         # vite on 5173
-npm test            # vitest run — 59 tests, 7 files
+npm test            # vitest run — 65 tests, 8 files
 npm run typecheck   # tsc --noEmit
 npm run build       # typecheck + vite build
 npm run smoke       # node scripts/stack-smoke.mjs, against a running engine
+npm run preset-smoke  # node scripts/preset-smoke.mjs, same
 ```
 
 No linter and no lint script. `tsconfig.json` is strict, with `noUnusedLocals`
@@ -34,6 +35,7 @@ editor's squiggles.
 | `config/eq.ts` | RBJ cookbook biquads, verbatim |
 | `config/curve.ts` | Intensity curve — cubic Béziers pinned at (0,0)–(1,1) |
 | `config/notes.ts` | MIDI note ↔ position on the frequency axis, and the relabelled ticks |
+| `config/presets.ts` | Slot ↔ function key, and the dropdown's labels. The *only* place 0-based slots meet 1-based keys |
 | `color/oklab.ts` | Port of `engine/src/color/oklab.rs` |
 | `color/surface.ts` | Port of `engine/src/color/surface.rs` |
 | `color/display.ts` | Screen-side conversion. **Not** the same as the LED path |
@@ -42,7 +44,7 @@ editor's squiggles.
 | `spectrum/paint.ts` | Canvas raster: colour field, grid, bars. Pure functions, no React |
 | `spectrum/GizmoLayer.tsx` | SVG interaction layer over the canvas |
 | `spectrum/render.ts` | Port of the compositing fold in `engine/src/color/render.rs` |
-| `components/` | Mantine panels: layer stack, source, MIDI, settings, gizmos, strip preview |
+| `components/` | Mantine panels: presets, layer stack, source, MIDI, settings, gizmos, strip preview |
 | `theme.ts` | Every colour, radius and spacing decision, including `theme.other.plot` |
 | `styles.css` | Two rules. Keep it that way |
 
@@ -75,6 +77,16 @@ editor's squiggles.
 - **The whole config goes over the wire on every pointer move.** That's
   deliberate — one message means the two sides can't disagree about which half
   of an edit landed. Keep `toEngineConfig` cheap and allocation-light.
+- **The engine owns the presets, so it owns the show while it is connected.**
+  `App.tsx` adopts `state.config` whenever `state.activePreset` changes and
+  ignores it otherwise — a hotkey can swap the show with this page closed, and
+  that field is the only signal it happened. localStorage is now the *offline*
+  cache: it seeds an engine whose live slot has never been authored into, and
+  is re-asserted after a reconnect, and is otherwise deferred to.
+- **`PresetPanel` selects, it does not load.** `selectPreset` sends a slot and
+  nothing else; the new show arrives in the next `state`, on the same path a
+  global hotkey takes. Sending a config with it would give the dropdown and the
+  keyboard two different ways to disagree.
 - **Gizmo checkboxes are visibility, not bypass.** Nothing in that panel touches
   the signal.
 - `MAX_LAYERS` is 12 and `SAMPLE_LENGTHS` is a fixed list, both in
@@ -90,7 +102,14 @@ editor's squiggles.
 | `spectrum/render.test.ts` | Spatial mapping — including that an even-length strip's mirror fold lands on one specific index |
 | `config/eq.test.ts` | Closed-form properties, not captured values |
 | `config/editor.test.ts`, `config/notes.test.ts` | Round-tripping and the note axis |
+| `config/presets.test.ts` | Slot ↔ function key numbering, and that the dropdown lists all twelve in hotkey order |
 
-`scripts/stack-smoke.mjs` is the only check that crosses the real socket: it
-sends a two-layer show to a running engine and reports the state echo, the
-per-layer frames and the composited strip. Start the engine first.
+`scripts/stack-smoke.mjs` and `scripts/preset-smoke.mjs` are the only checks
+that cross the real socket. The first sends a two-layer show to a running engine
+and reports the state echo, the per-layer frames and the composited strip. The
+second authors two presets, switches between them and confirms each comes back
+intact. Start the engine first.
+
+The hotkeys themselves cannot be checked from either — they are registered with
+Windows, so pressing them is the test. What `preset-smoke` covers is the switch
+they trigger, which is the same code path.

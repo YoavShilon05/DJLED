@@ -10,9 +10,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 
 use djled_engine::color::{RenderConfig, Renderer};
+use djled_engine::hotkeys::Hotkeys;
 use djled_engine::link::protocol::TestPattern;
 use djled_engine::link::serial::DEFAULT_BAUD;
 use djled_engine::link::{expand_bands_to_leds, Link, MockLink, SerialLink};
+use djled_engine::presets::{Presets, SLOTS};
 use djled_engine::source::{self, LiveSource, Source, SourceKind};
 use djled_engine::stack::LiveStack;
 use djled_engine::ui::{encode_strip, Command, LayerFrame, State, UiServer};
@@ -93,6 +95,17 @@ struct Args {
     /// Run without the UI server, leaving the port free.
     #[arg(long)]
     no_ui: bool,
+
+    /// Where the twelve presets are kept. Defaults to
+    /// %APPDATA%\djled\presets.json.
+    #[arg(long, value_name = "PATH")]
+    presets: Option<std::path::PathBuf>,
+
+    /// Run without the global ctrl+alt+F1..F12 hotkeys. The presets themselves
+    /// still work from the editor; this only gives the combinations back to
+    /// whatever else wants them.
+    #[arg(long)]
+    no_hotkeys: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -163,10 +176,28 @@ fn main() -> Result<()> {
         },
         ..Default::default()
     };
-    // One layer to start with, listening to whatever the flags asked for. The
-    // editor grows the stack from there; the command line deliberately does
-    // not, because a stack is authored rather than typed.
-    let show = starting_show(led_count, select_source(&args)?);
+    // The show that was live when the engine last exited comes back, so a
+    // restart mid-set puts the wall back where it was rather than at the
+    // default. On a first run there is nothing saved and the flags describe the
+    // show instead.
+    let mut presets = Presets::load(args.presets.clone().unwrap_or_else(Presets::default_path));
+    let show = match presets.active_show() {
+        // A saved show carries a source per layer, which is more specific than
+        // anything the command line can say — so the flags only override it
+        // when one was actually typed. Silently ignoring `--source` would be
+        // worse than either.
+        Some(saved) => {
+            let mut show = saved.clone();
+            if let Some(source) = explicit_source(&args)? {
+                show.layers[0].source = source;
+            }
+            show
+        }
+        // One layer to start with, listening to whatever the flags asked for.
+        // The editor grows the stack from there; the command line deliberately
+        // does not, because a stack is authored rather than typed.
+        None => starting_show(led_count, select_source(&args)?),
+    };
     // What the board says it will take, not what the protocol allows. A frame
     // over the firmware's own limit is dropped at the MCU without a word.
     let point_cap = link.max_points();
@@ -181,7 +212,24 @@ fn main() -> Result<()> {
     let mut stack = LiveStack::open(&show, &base, CAPTURE_BUFFER_SECS);
     let mut renderer = build_renderer(args.brightness, &stack, led_count, point_cap)?;
 
+    // Registered before the header so the banner reports what was actually
+    // claimed, not what was asked for — a combination another application
+    // already holds is refused, and a hotkey that silently does nothing is the
+    // hardest kind to diagnose.
+    let hotkeys = if args.no_hotkeys {
+        None
+    } else {
+        match Hotkeys::start() {
+            Ok(h) => Some(h),
+            Err(e) => {
+                println!("  hotkeys  unavailable: {e}");
+                None
+            }
+        }
+    };
+
     print_header(&stack, link.as_ref(), led_count, point_cap);
+    print_presets(&presets, hotkeys.as_ref());
 
     // The UI is optional by design: the engine is a headless service and
     // nothing about the strip depends on a browser being attached.
@@ -197,6 +245,8 @@ fn main() -> Result<()> {
             db_ceil: base.post.db_ceil,
             devices: source::devices(),
             layers: stack.status(),
+            presets: presets.info(),
+            active_preset: presets.active(),
         };
         match UiServer::start(args.ui_port, state) {
             Ok(s) => {
@@ -210,7 +260,17 @@ fn main() -> Result<()> {
         }
     };
 
-    run(&mut stack, show, &mut renderer, link.as_mut(), led_count, point_cap, server.as_ref())
+    run(
+        &mut stack,
+        show,
+        &mut renderer,
+        link.as_mut(),
+        led_count,
+        point_cap,
+        server.as_ref(),
+        &mut presets,
+        hotkeys.as_ref(),
+    )
 }
 
 /// The show the engine starts with: one layer, spanning the strip, listening to
@@ -245,6 +305,19 @@ fn select_source(args: &Args) -> Result<Source> {
     Ok(source)
 }
 
+/// The source the flags name, but only if any of them were actually typed.
+///
+/// A saved preset already says what each of its layers listens to, and that is
+/// more specific than anything one flag can express — so it stands unless
+/// somebody explicitly asked for something else on this run. `--channel` counts
+/// as asking: it is meaningless without a source, and reaches the same layer.
+fn explicit_source(args: &Args) -> Result<Option<Source>> {
+    if args.source.is_none() && !args.input && !args.midi && args.channel.is_none() {
+        return Ok(None);
+    }
+    select_source(args).map(Some)
+}
+
 /// Build the renderer for whatever the stack currently produces.
 ///
 /// Separated out because a source switch or a layer added can change the
@@ -267,6 +340,55 @@ fn build_renderer(
         led_count,
     )
     .map_err(anyhow::Error::msg)
+}
+
+/// Put a show on the wall: the stack first, then the colour half.
+///
+/// The order is load-bearing. The renderer is built around the shape the stack
+/// reports — how many layers, on what grids — so applying the colour half
+/// against a shape that has already moved is how a stack ends up painting one
+/// layer with another one's field.
+///
+/// Returns whether the stack changed *shape*, which is the only case that
+/// forces a rebuild rather than a reconfigure.
+fn apply_show(
+    next: &ShowConfig,
+    stack: &mut LiveStack,
+    renderer: &mut Renderer,
+    led_count: usize,
+    point_cap: usize,
+) -> Result<bool, String> {
+    let reshaped = stack.apply(next);
+    if reshaped {
+        *renderer = build_renderer(renderer.config().brightness, stack, led_count, point_cap)
+            .map_err(|e| e.to_string())?;
+    } else {
+        renderer.set_layers(&stack.visuals())?;
+    }
+    Ok(reshaped)
+}
+
+/// Make a slot live and say what should now be on the wall, or `None` to leave
+/// the wall alone.
+///
+/// `blank_if_empty` is the one difference between the two ways in. Chosen from
+/// the editor's dropdown it is true — picking an empty slot from a list is a
+/// deliberate request for a blank canvas. Struck as a hotkey it is false, so a
+/// mis-hit during a set cannot blank the wall.
+fn load_preset(
+    slot: usize,
+    blank_if_empty: bool,
+    presets: &mut Presets,
+    led_count: usize,
+) -> Option<ShowConfig> {
+    if slot >= SLOTS || (!blank_if_empty && presets.show(slot).is_none()) {
+        return None;
+    }
+    // Selecting flushes the slot being left, so the switch cannot lose it.
+    match presets.select(slot) {
+        Some(show) => Some(show.clone()),
+        None => Some(ShowConfig::spanning(led_count)),
+    }
 }
 
 fn list_devices() {
@@ -336,6 +458,8 @@ fn run(
     led_count: usize,
     point_cap: usize,
     server: Option<&UiServer>,
+    presets: &mut Presets,
+    hotkeys: Option<&Hotkeys>,
 ) -> Result<()> {
     let mut leds = vec![[0u8; 3]; led_count];
     let mut last_draw = Instant::now();
@@ -378,34 +502,25 @@ fn run(
                 match cmd {
                     Command::Config { config } => {
                         let next = *config;
-                        // The stack is applied first because the renderer is
-                        // built around the shape it reports — how many layers,
-                        // on what grids. Applying the colour half against a
-                        // shape that has already moved is how a stack ends up
-                        // painting one layer with another one's field.
-                        let reshaped = stack.apply(&next);
-                        let applied = if reshaped {
-                            build_renderer(
-                                renderer.config().brightness,
-                                stack,
-                                led_count,
-                                point_cap,
-                            )
-                            .map(|r| *renderer = r)
-                            .map_err(|e| e.to_string())
-                        } else {
-                            renderer.set_layers(&stack.visuals())
-                        };
-
-                        match applied {
-                            Ok(()) => {
+                        match apply_show(&next, stack, renderer, led_count, point_cap) {
+                            Ok(reshaped) => {
+                                // Every edit lands in the live slot; there is
+                                // no save button, and so nothing is ever in
+                                // flight when a hotkey replaces the show.
+                                // `filled` is true once per slot ever — the
+                                // edit that stops it reading as empty.
+                                let filled = presets.store(&next);
                                 show = next.clone();
                                 status.clear();
                                 let (points, layers) = (renderer.points(), stack.status());
+                                let listing = filled.then(|| presets.info());
                                 server.update_state(|s| {
                                     s.point_count = points;
                                     s.layers = layers;
                                     s.config = next;
+                                    if let Some(listing) = listing {
+                                        s.presets = listing;
+                                    }
                                 });
                                 // Pushed only when the stack changed shape, and
                                 // that condition is doing real work in both
@@ -416,7 +531,7 @@ fn run(
                                 // Announcing on every edit instead would echo a
                                 // config back at drag rate and have the editor
                                 // fighting the user's own hands.
-                                if reshaped {
+                                if reshaped || filled {
                                     server.announce_state(|_| {});
                                 }
                             }
@@ -462,8 +577,85 @@ fn run(
                             s.layers = layers;
                         });
                     }
+                    // The dropdown's half of the preset feature; the
+                    // keyboard's half is below, and both end up here.
+                    Command::SelectPreset { slot } => {
+                        if let Some(next) = load_preset(slot, true, presets, led_count) {
+                            match apply_show(&next, stack, renderer, led_count, point_cap) {
+                                Ok(_) => {
+                                    show = next.clone();
+                                    status.clear();
+                                    let (points, layers) = (renderer.points(), stack.status());
+                                    let (listing, active) = (presets.info(), presets.active());
+                                    // Announced rather than merely updated: the
+                                    // whole show has been replaced by something
+                                    // other than the editor's own hands, which
+                                    // is the one case it has to be told about.
+                                    server.announce_state(|s| {
+                                        s.point_count = points;
+                                        s.layers = layers;
+                                        s.config = next;
+                                        s.presets = listing;
+                                        s.active_preset = active;
+                                    });
+                                }
+                                Err(e) => status = format!("preset {} rejected: {e}", slot + 1),
+                            }
+                        }
+                    }
+                    Command::RenamePreset { slot, name } => {
+                        presets.rename(slot, &name);
+                        let listing = presets.info();
+                        server.announce_state(|s| s.presets = listing);
+                    }
                     Command::RequestState => {}
                 }
+            }
+        }
+
+        // Drained on every pass, beside the UI's commands and for the same
+        // reason: the moment a preset most needs switching is the moment the
+        // source has gone silent and nothing else is arriving.
+        //
+        // Outside the `server` block, because the hotkeys are the half of this
+        // that works with no editor attached — which is the whole reason they
+        // are registered with the OS rather than handled in the browser.
+        if let Some(hotkeys) = hotkeys {
+            for slot in hotkeys.drain() {
+                let Some(next) = load_preset(slot, false, presets, led_count) else {
+                    // An empty slot, said out loud: a hotkey that does nothing
+                    // and reports nothing is indistinguishable from one that
+                    // failed to register.
+                    status = format!("{} is empty", Hotkeys::label(slot));
+                    continue;
+                };
+                match apply_show(&next, stack, renderer, led_count, point_cap) {
+                    Ok(_) => {
+                        show = next.clone();
+                        status.clear();
+                        if let Some(server) = server {
+                            let (points, layers) = (renderer.points(), stack.status());
+                            let (listing, active) = (presets.info(), presets.active());
+                            server.announce_state(|s| {
+                                s.point_count = points;
+                                s.layers = layers;
+                                s.config = next;
+                                s.presets = listing;
+                                s.active_preset = active;
+                            });
+                        }
+                    }
+                    Err(e) => status = format!("preset {} rejected: {e}", slot + 1),
+                }
+            }
+        }
+
+        // Coalesced writes: an edit marks the store dirty and this is where it
+        // reaches the disk, at most once every 750 ms rather than once per
+        // pointer move. Costs one comparison when there is nothing to save.
+        if presets.tick() {
+            if let Some(e) = presets.error() {
+                status = e.to_string();
             }
         }
 
@@ -693,6 +885,49 @@ fn print_header(stack: &LiveStack, link: &dyn Link, led_count: usize, point_cap:
     }
 
     println!("\n  play something. ctrl-c to quit.\n");
+}
+
+/// What the twelve slots hold and which keys reach them.
+///
+/// Printed after the header rather than inside it because a preset can be
+/// switched with no editor open, and someone doing that from the keyboard alone
+/// needs to be told two things the engine cannot show any other way: which slot
+/// is live, and which combinations were refused by another application. A
+/// hotkey that was never registered is otherwise silent — indistinguishable
+/// from one that fired and did nothing.
+fn print_presets(presets: &Presets, hotkeys: Option<&Hotkeys>) {
+    let info = presets.info();
+    let filled = info.iter().filter(|p| p.stored).count();
+    let live = &info[presets.active()];
+
+    println!(
+        "  presets  {} of {SLOTS} saved · live: {} ({})",
+        filled,
+        live.name,
+        Hotkeys::label(presets.active())
+    );
+    println!("           {}", presets.path().display());
+
+    match hotkeys {
+        Some(keys) if keys.refused().is_empty() => {
+            println!("           ctrl+alt+F1..F12 switch presets, from any window")
+        }
+        Some(keys) => {
+            // Named individually, because "some hotkeys failed" is not
+            // actionable and "ctrl+alt+F4 is taken" is.
+            let taken: Vec<String> = keys.refused().iter().map(|&s| Hotkeys::label(s)).collect();
+            println!("           ctrl+alt+F1..F12 switch presets, except {}", taken.join(", "));
+            println!("           — those are held by another application, which will not give");
+            println!("             them up while it is running.");
+        }
+        None => println!("           hotkeys off; switch presets in the editor"),
+    }
+
+    if let Some(e) = presets.error() {
+        println!("  WARNING  {e}");
+    }
+
+    println!();
 }
 
 /// The terminal display: the bottom layer bars over the composited strip.

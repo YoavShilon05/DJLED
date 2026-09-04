@@ -38,6 +38,8 @@ the primary documentation and are usually more current than any summary here.
 | `link/serial.rs` | Speaks it to a real board |
 | `link/mock.rs` | Renders frames in the terminal — full pipeline with no hardware |
 | `ui.rs` | WebSocket server: `Snapshot` out per frame, `Command` in |
+| `presets.rs` | Twelve shows on disk, one live. Coalesced writes, atomic rename |
+| `hotkeys.rs` | `RegisterHotKey` for ctrl+alt+F1..F12 on a message-pump thread |
 
 ## Signal flow, in order
 
@@ -68,6 +70,8 @@ the primary documentation and are usually more current than any summary here.
 | `READY` / `MAGIC` | `0x7E` / `A5 5A` | `link/protocol.rs` |
 | `MAX_PAYLOAD` / `OVERHEAD` | 255 / 5 → `max_bands()` = 85 | `link/protocol.rs` |
 | `DEFAULT_PORT` (UI) | 9001 | `ui.rs` |
+| `SLOTS` | 12 — fixed by the keyboard, not chosen | `presets.rs` |
+| `WRITE_DELAY` | 750 ms between preset writes | `presets.rs` |
 
 ## Rules that are easy to break
 
@@ -92,10 +96,26 @@ the primary documentation and are usually more current than any summary here.
   contributing black. Invisible until there is a layer underneath.
 - `#[serde(default)]` on every `Layer` field, and `ShowConfig::normalise` never
   leaves the stack empty — `base()` calls `.expect()` on that guarantee.
+- **Every `Command::Config` is stored into the live preset slot.** There is no
+  save message and no save button; that is what makes a hotkey switch safe,
+  since nothing is ever in flight to lose. Writes are coalesced by
+  `Presets::tick`, called once per pass of the loop.
+- **`Presets::select` flushes before it switches**, so the slot being left
+  reaches disk before the slot being entered replaces it in memory. Delayed
+  writes are the reason that has to be explicit.
+- **A preset switch is `announce_state`, a config edit is `update_state`.** The
+  editor cannot predict a switch — a hotkey or a second tab can cause one — and
+  `active_preset` changing is the only signal it has that the show was replaced
+  by something other than its own hands.
+- **The hotkey drain sits outside the `if let Some(server)` block.** The keys are
+  the half of this that works with no editor attached, which is the entire reason
+  they are registered with the OS rather than handled in the browser.
+- **Failing to persist is never fatal.** A corrupt or unwritable presets file
+  costs the presets and not the strip; the reason goes to the status line.
 
 ## Tests
 
-240 total: 199 unit (in-module `#[cfg(test)]`) + 41 integration.
+255 total: 210 unit (in-module `#[cfg(test)]`) + 45 integration.
 
 | File | What it defends |
 |---|---|
@@ -103,6 +123,7 @@ the primary documentation and are usually more current than any summary here.
 | `tests/pipeline.rs` (19) | Every editor control's effect reaches the LED bytes. **Add a row here for any new control** |
 | `tests/midi_pipeline.rs` (11) | The note path end to end, delivered as bytes — the only MIDI coverage that runs without a port |
 | `tests/color_reference.rs` (3) | The Rust side of the TS parity fixture |
+| `tests/presets.rs` (4) | A preset stored, reloaded from disk, and rendered — the bytes have to match the show it was saved from |
 
 Layer behaviour is pinned in three places on purpose: `color/render.rs` (the
 fold, including one-layer byte-identity), `stack.rs` (pooling against the

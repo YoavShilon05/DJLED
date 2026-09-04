@@ -65,7 +65,42 @@ Useful flags:
 --bands 48            frequency bands, and colours sent per frame
 --brightness 0.5      master brightness
 --no-ui               don't open the editor's WebSocket port
+--presets PATH        where the twelve presets live
+--no-hotkeys          give ctrl+alt+F1..F12 back to whatever else wants them
 ```
+
+## Presets
+
+Twelve saved shows, and `ctrl+alt+F1`…`F12` to switch between them.
+
+The shows live in the **engine**, not the editor — `%APPDATA%\djled\presets.json`
+by default. That is the whole design decision, and it follows from when a preset
+is actually switched: mid-set, with the browser behind a DAW or closed
+altogether. A shortcut that only works while a particular window has focus is
+not a shortcut for that, so the keys are registered with Windows itself
+(`RegisterHotKey`) and the store had to move to the side that is always running.
+
+That inverts the usual direction. Everywhere else the editor authors and pushes
+down; here the engine is authoritative and the editor adopts what it is serving.
+The editor's dropdown selects which slot is live, and *that is also which slot is
+being edited* — there is no save button, because every config the editor sends
+lands in the live slot as it is sent. Writes are coalesced to at most one every
+750 ms, so dragging a keyframe is one file write rather than sixty.
+
+The one asymmetry worth knowing:
+
+- Chosen in the **dropdown**, an empty slot opens the default show. Picking an
+  empty row from a list is a deliberate request for a blank canvas.
+- Struck as a **hotkey**, an empty slot does nothing. A mis-hit during a set must
+  not blank the wall.
+
+If another application already owns one of the combinations, `RegisterHotKey`
+refuses it and there is nothing to be done — that application will not give it
+up. So the engine names the ones it lost at startup rather than leaving a key
+that silently does nothing, which is the hardest kind of fault to diagnose.
+
+A restart comes back on the slot it left on, so an engine that crashed mid-set
+puts the same show back on the wall.
 
 ## Where the audio comes from
 
@@ -491,8 +526,8 @@ next during the blackout.
 ## Tests
 
 ```bash
-cargo test --manifest-path engine/Cargo.toml   # 240
-cd ui && npm test && npm run typecheck         # 59
+cargo test --manifest-path engine/Cargo.toml   # 255
+cd ui && npm test && npm run typecheck         # 65
 ```
 
 The ones worth knowing about live in `engine/tests/artifacts.rs`: they assert the
@@ -511,6 +546,12 @@ has an end-to-end test that its effect reaches the LED bytes — mirroring light
 both ends, a sector confines a tone to its own LEDs, a 24 dB cut halves the
 output, red under green comes out green — because the unit tests for each stage
 all pass whether or not anything is plugged into them.
+
+`engine/tests/presets.rs` makes the same claim for the preset store, and for
+the same reason: a preset that reloads with every field intact and still lights
+the wall differently would look like a save bug and would not be one. So the
+tests render — a show is stored, the file is reloaded, and the LED bytes have to
+match those of the show it was saved from.
 
 The layer tests are in three places, because there are three ways a stack can be
 wrong. `color/render.rs` pins the fold itself, including that a one-layer stack

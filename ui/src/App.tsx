@@ -11,6 +11,7 @@ import {
   Stack,
   Text,
   Title,
+  Tooltip,
 } from "@mantine/core";
 import { useDebouncedCallback } from "@mantine/hooks";
 
@@ -29,9 +30,11 @@ import {
   type EditorLayer,
 } from "./config/editor";
 import { DEFAULT_SAMPLE_RATE, EqCurve } from "./config/eq";
+import { presetName } from "./config/presets";
 import { GizmoPanel } from "./components/GizmoPanel";
 import { LayerStack } from "./components/LayerStack";
 import { MidiPanel } from "./components/MidiPanel";
+import { PresetPanel } from "./components/PresetPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { SourcePanel } from "./components/SourcePanel";
 import { StripPreview } from "./components/StripPreview";
@@ -42,6 +45,7 @@ import {
   type Frame,
   type InputDevice,
   type LayerStatus,
+  type PresetInfo,
   type Status,
 } from "./engine";
 import { FREQUENCY_AXIS, noteAxis } from "./spectrum/axis";
@@ -57,6 +61,8 @@ const DEFAULT_DB_SPAN = 60;
 
 const NO_STATUS = new Map<string, LayerStatus>();
 
+const NO_PRESETS: PresetInfo[] = [];
+
 export default function App() {
   const [config, setConfig] = useState<EditorConfig>(loadConfig);
   const [status, setStatus] = useState<Status>("connecting");
@@ -66,24 +72,48 @@ export default function App() {
   const [dbSpan, setDbSpan] = useState(DEFAULT_DB_SPAN);
   const [devices, setDevices] = useState<InputDevice[]>([]);
   const [layerStatus, setLayerStatus] = useState<LayerStatus[]>([]);
+  const [presets, setPresets] = useState<PresetInfo[]>(NO_PRESETS);
+  const [activePreset, setActivePreset] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
   const clientRef = useRef<EngineClient | null>(null);
   /**
-   * Whether the engine's own show has already been adopted.
+   * The last preset slot the engine reported, or null before the first state.
    *
-   * Only the *first* state message is allowed to replace what is on screen.
-   * The engine announces again whenever the stack changes shape — that is how a
-   * newly added layer learns which device it resolved to — and adopting on one
-   * of those would re-mint every id and pull the selection out from under the
-   * edit that caused it.
+   * This is the whole of the editor's rule for when to replace what is on
+   * screen, and it needs to be, because presets moved the show's home. The
+   * engine holds the twelve of them on disk and a global hotkey can swap them
+   * with this page closed — so the engine's copy is authoritative, and a change
+   * in *which slot* it is serving is the one unambiguous signal that the show
+   * changed underneath us rather than because of us.
+   *
+   * Everything else stays as it was. The engine announces again whenever the
+   * stack changes shape — that is how a newly added layer learns which device
+   * it resolved to — and adopting on one of those would re-mint every id and
+   * pull the selection out from under the edit that caused it. Those announces
+   * carry the same slot, so they are ignored here.
    */
-  const adopted = useRef(HAD_LOCAL_CONFIG);
+  const seenPreset = useRef<number | null>(null);
+  /**
+   * Set when the socket comes back after having been up before.
+   *
+   * Edits made while the engine was away never reached it, so its copy of the
+   * live slot is behind ours. Re-asserting on reconnect is what keeps a socket
+   * blip from quietly discarding them — the one case where the editor still
+   * pushes rather than adopts.
+   */
+  const reconnected = useRef(false);
+  /** The current config, for the reconnect push — which happens inside a socket
+   *  callback and cannot close over a render's state. */
+  const configRef = useRef<EditorConfig | null>(null);
 
   useEffect(() => {
     const client = new EngineClient(DEFAULT_URL, {
       onStatus: (next) => {
         setStatus(next);
+        // A reconnect, as opposed to the first connect: only then is there
+        // anything the engine could have missed.
+        if (next === "connected") reconnected.current = seenPreset.current !== null;
         // Nothing is being listened to while the engine is away, and leaving
         // the last devices on screen would invite selecting one into the void.
         if (next !== "connected") {
@@ -101,12 +131,37 @@ export default function App() {
         // authored here: they are the engine reporting what it managed to open.
         setDevices(state.devices);
         setLayerStatus(state.layers);
-        // The engine's config is authoritative on first connect, but only if
-        // nothing has been authored here — otherwise a reconnect would throw
-        // away unsaved edits.
-        if (!adopted.current) {
-          adopted.current = true;
+        setPresets(state.presets ?? NO_PRESETS);
+        setActivePreset(state.activePreset ?? 0);
+
+        const first = seenPreset.current === null;
+        const switched = !first && state.activePreset !== seenPreset.current;
+        const wasReconnect = reconnected.current;
+        seenPreset.current = state.activePreset ?? 0;
+        reconnected.current = false;
+
+        if (switched) {
+          // A hotkey, or another tab. Adopt: the wall is already showing this.
           setConfig((c) => fromEngineConfig(c, state.config));
+          return;
+        }
+
+        if (first) {
+          // An untouched slot on the engine's side and a show authored here is
+          // the upgrade path — everything anyone had before presets existed
+          // lives in localStorage, and would otherwise be replaced on sight by
+          // an empty slot. Seed the slot from it instead. Any other first
+          // connect adopts, because the engine's presets are where shows live
+          // now and the editor is a client of them.
+          if (HAD_LOCAL_CONFIG && state.presets?.[state.activePreset]?.stored === false) {
+            if (configRef.current) client.setConfig(toEngineConfig(configRef.current));
+          } else {
+            setConfig((c) => fromEngineConfig(c, state.config));
+          }
+        } else if (wasReconnect && configRef.current) {
+          // Same slot, but the socket was away — anything edited during the gap
+          // is here and not there.
+          client.setConfig(toEngineConfig(configRef.current));
         }
       },
     });
@@ -114,6 +169,10 @@ export default function App() {
     client.connect();
     return () => client.close();
   }, []);
+
+  // Kept in step with the state so a socket callback can read the current
+  // config without being re-created on every edit.
+  configRef.current = config;
 
   const persist = useDebouncedCallback(saveConfig, 400);
 
@@ -140,6 +199,22 @@ export default function App() {
 
   const refreshSources = useCallback(() => {
     clientRef.current?.listSources();
+  }, []);
+
+  /**
+   * Switch which preset is being edited.
+   *
+   * Nothing is sent with it and nothing is set locally: the engine owns the
+   * twelve shows, so it answers with the new one in a `state` and the adoption
+   * above picks it up — the same path a global hotkey takes. Two ways in, one
+   * way through, so the dropdown and the keyboard cannot disagree.
+   */
+  const selectPreset = useCallback((slot: number) => {
+    clientRef.current?.selectPreset(slot);
+  }, []);
+
+  const renamePreset = useCallback((slot: number, name: string) => {
+    clientRef.current?.renamePreset(slot, name);
   }, []);
 
   const live = status === "connected";
@@ -218,15 +293,20 @@ export default function App() {
               statuses={layerStatus}
             />
           </Group>
-          <Button
-            variant="default"
-            onClick={() => {
-              clearConfig();
-              applyConfig(DEFAULT_CONFIG);
-            }}
-          >
-            Reset
-          </Button>
+          {/* Worth spelling out now that edits are saved as they are made:
+              this does not put an old show back, it replaces the live preset
+              with the default one. The other eleven are untouched. */}
+          <Tooltip label={`Replace ${presetName(activePreset, presets[activePreset])} with the default show`}>
+            <Button
+              variant="default"
+              onClick={() => {
+                clearConfig();
+                applyConfig(DEFAULT_CONFIG);
+              }}
+            >
+              Reset
+            </Button>
+          </Tooltip>
         </Group>
 
         {error && (
@@ -237,6 +317,13 @@ export default function App() {
 
         <Flex gap="md" align="flex-start" direction={{ base: "column", md: "row" }}>
           <Stack gap="md" w={{ base: "100%", md: 300 }} style={{ flexShrink: 0 }}>
+            <PresetPanel
+              presets={presets}
+              active={activePreset}
+              onSelect={selectPreset}
+              onRename={renamePreset}
+              connected={live}
+            />
             <LayerStack config={config} onChange={applyConfig} status={statusById} />
             <SourcePanel
               layer={layer}

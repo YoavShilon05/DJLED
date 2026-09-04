@@ -17,6 +17,8 @@ expands them across a WS2812B strip.
 capture.rs / midi/  →  dsp/  →  color/  →  link/  →  Arduino
      (sources)        (levels)  (bytes)   (serial)
                           └──────────────→ ui.rs (WebSocket 9001) → ui/ (React)
+
+presets.rs (12 shows on disk) ←→ hotkeys.rs (ctrl+alt+F1..F12, system-wide)
 ```
 
 The single most load-bearing idea: **everything downstream of `source.rs` reads
@@ -38,12 +40,13 @@ cargo run --manifest-path engine/Cargo.toml --release -- --port COM3
 cd ui && npm install && npm run dev
 
 # Tests
-cargo test --manifest-path engine/Cargo.toml        # 240 pass (199 lib + 41 integration)
-cd ui && npm test                                   # 59 pass across 7 files
+cargo test --manifest-path engine/Cargo.toml        # 255 pass (210 lib + 45 integration)
+cd ui && npm test                                   # 65 pass across 8 files
 cd ui && npm run typecheck                          # tsc --noEmit, clean
 
 # End-to-end over the real socket, against a running engine
-cd ui && npm run smoke
+cd ui && npm run smoke              # the layer stack
+cd ui && npm run preset-smoke       # the twelve preset slots
 
 # Regenerate the Rust→TS colour parity fixture (see Invariants)
 cargo run --manifest-path engine/Cargo.toml --example color_reference \
@@ -57,6 +60,8 @@ Diagnostics that answer "is it the wiring or the software":
 --list-devices          audio endpoints and MIDI ports in one list
 --probe 3               capture for 3s and report what actually arrived
 --test rgb|chase|white  drive the strip with no audio at all — see docs/wiring.md
+--presets PATH          where the twelve presets live
+--no-hotkeys            give ctrl+alt+F1..F12 back to whatever else wants them
 ```
 
 There is no CI, no linter config, and no `rustfmt.toml`.
@@ -110,6 +115,14 @@ keyframe tints its neighbours. See `README.md` § Colour.
 **6. No gamma step to the LEDs.** `Oklab → linear RGB → byte` is complete.
 Adding one is the classic wrong fix.
 
+**7. While a client is connected, the engine's show is authoritative — not the
+editor's.** Presets inverted this. The twelve shows live in `engine/src/presets.rs`
+and a global hotkey can replace the live one with the browser closed, so
+`App.tsx` adopts the engine's config whenever `state.activePreset` changes and
+otherwise leaves what is on screen alone. That single field is the whole rule;
+`engine/tests/presets.rs` and `ui/scripts/preset-smoke.mjs` defend the round
+trip.
+
 ## Gotchas
 
 - **Windows-only in practice.** WASAPI loopback (`capture.rs`) and WinMM MIDI
@@ -139,6 +152,18 @@ Adding one is the classic wrong fix.
   composite results on the preview, never on the graph.
 - **Gizmo checkboxes are visibility, not bypass.** A hidden EQ still shapes the
   signal.
+- **There is no save button, and the preset dropdown is not a loader.** Selecting
+  a slot makes it live *and* makes it the thing being edited; every config the
+  editor sends goes straight into it. `Reset` therefore replaces the live preset
+  with the default show — it does not put an older one back.
+- **An empty preset slot behaves differently by dropdown and by hotkey.** The
+  dropdown opens a blank canvas, the hotkey declines. A mis-hit during a set must
+  not blank the wall. Pinned in `presets.rs` and `main.rs::load_preset`.
+- **`RegisterHotKey` refusals are normal and must stay visible.** Another
+  application holding `ctrl+alt+F4` is not an error and cannot be fixed from
+  here; the engine names the ones it lost at startup, because a hotkey that never
+  registered is otherwise indistinguishable from one that fired and did
+  nothing.
 
 ## Conventions
 
