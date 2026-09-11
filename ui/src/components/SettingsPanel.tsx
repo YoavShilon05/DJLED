@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { Checkbox, Divider, Paper, Select, Slider, Stack, Text } from "@mantine/core";
 
 import { CURVE_OPTIONS, type CurveType } from "../config/curve";
@@ -15,7 +16,11 @@ interface Props {
   sampleRate: number;
 }
 
-export function SettingsPanel({
+/**
+ * Memoised: nothing in here is driven by a frame, and a frame arrives thirty
+ * times a second. See the note on `frame` in `App.tsx`.
+ */
+export const SettingsPanel = memo(function SettingsPanel({
   layer,
   onChange,
   brightness,
@@ -146,7 +151,7 @@ export function SettingsPanel({
       </Stack>
     </Paper>
   );
-}
+});
 
 /**
  * Spelled out rather than left to the checkbox labels: the combination of the

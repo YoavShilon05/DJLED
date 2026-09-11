@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { Checkbox, Paper, RangeSlider, Slider, Stack, Text } from "@mantine/core";
 
 import type { EditorLayer } from "../config/editor";
@@ -30,8 +31,11 @@ interface Props {
  * — it magnifies. Two octaves across a wall is a legitimate and very different
  * look from eighty-eight keys, and the hint says so, because nothing about a
  * pair of note numbers suggests it.
+ *
+ * Memoised: nothing in here is driven by a frame, and a frame arrives thirty
+ * times a second. See the note on `frame` in `App.tsx`.
  */
-export function MidiPanel({ layer, onChange, live }: Props) {
+export const MidiPanel = memo(function MidiPanel({ layer, onChange, live }: Props) {
   const { midi } = layer;
   const [low, high] = noteRange(midi.lowNote, midi.highNote);
   const octaves = (high - low) / 12;
@@ -106,4 +110,4 @@ export function MidiPanel({ layer, onChange, live }: Props) {
       </Stack>
     </Paper>
   );
-}
+});

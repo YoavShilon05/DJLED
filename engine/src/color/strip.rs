@@ -144,6 +144,43 @@ pub fn level_at(levels: &[f32], centers: &[f32], hz: f32) -> f32 {
     levels[n - 1]
 }
 
+/// The loudest level between two frequencies, or `None` when no band centre
+/// falls between them. `centers` must be ascending, which both band plans and
+/// the note grid are.
+///
+/// This is the other half of [`level_at`], and which one is correct depends on
+/// which of the two grids is finer. Reading a level *between* centres is
+/// interpolation, and that is right whenever the frame has at least as many
+/// control points as the analyser has bands — the audio path, always. It is
+/// wrong the moment the analyser is the finer of the two, because then a
+/// control point stands for a span of the grid rather than a position in it,
+/// and sampling one position inside that span slides off whatever peak is in
+/// there.
+///
+/// MIDI is exactly that case and is the reason this exists: the note grid is
+/// one point per semitone — 88 of them for a piano — and the wire carries 64.
+/// A note is about a semitone wide, so the sample lands beside its peak and
+/// reports a velocity nobody played; at 64 points the worst-placed note loses a
+/// quarter of its level. On a colour surface that is not a slightly dimmer
+/// note, it is a different colour.
+///
+/// Taking the loudest rather than averaging, for the same reason
+/// [`crate::midi::notes::NoteEngine`] does when it spreads a note over its
+/// neighbours: two notes a semitone apart are two notes, not one of them at
+/// half strength.
+pub fn peak_level_between(levels: &[f32], centers: &[f32], a: f32, b: f32) -> Option<f32> {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let n = levels.len().min(centers.len());
+    let centers = &centers[..n];
+
+    let first = centers.partition_point(|&c| c < lo);
+    let last = centers.partition_point(|&c| c <= hi);
+    if first >= last {
+        return None;
+    }
+    Some(levels[first..last].iter().copied().fold(f32::NEG_INFINITY, f32::max))
+}
+
 /// What one wire colour is sampled from.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ControlPoint {
@@ -175,6 +212,15 @@ pub struct StripMap {
     centers: Vec<f32>,
     led_count: usize,
     points: Vec<ControlPoint>,
+    /// Whether the level grid is finer than the frame, which decides how a
+    /// level is read off it — see [`peak_level_between`].
+    ///
+    /// One flag for the whole map rather than a decision per point: both grids
+    /// are near-uniform on the log axis, so either the analyser is the finer of
+    /// the two everywhere or it is nowhere. A sector that stretches a narrow
+    /// range over many LEDs is the exception, and it falls back on its own —
+    /// a span with no centre in it has nothing to take a peak of.
+    dense: bool,
 }
 
 impl StripMap {
@@ -192,6 +238,7 @@ impl StripMap {
             centers: centers.to_vec(),
             led_count,
             points: vec![ControlPoint::default(); point_count],
+            dense: centers.len() > point_count,
         };
         map.set_layout(layout);
         map
@@ -233,7 +280,13 @@ impl StripMap {
                 // layer below. See [`ControlPoint::covered`].
                 None => ControlPoint { x: u, y: 0.0, gain: 0.0, covered: false },
                 Some(hz) => {
-                    let level = level_at(levels, &self.centers, hz).clamp(0.0, 1.0);
+                    // A frame coarser than the grid has to aggregate rather
+                    // than sample, or it slides off the peaks. See
+                    // [`peak_level_between`].
+                    let level = self
+                        .span_peak(levels, i, last_point, last_led)
+                        .unwrap_or_else(|| level_at(levels, &self.centers, hz))
+                        .clamp(0.0, 1.0);
                     ControlPoint {
                         x: hz_to_norm(hz),
                         y: level,
@@ -245,6 +298,36 @@ impl StripMap {
             self.points[i] = point;
         }
         &self.points
+    }
+
+    /// The loudest level across the span of the axis one control point stands
+    /// for, or `None` when there is nothing to aggregate — the frame is not the
+    /// coarser grid, or this particular span happens to hold no band centre.
+    ///
+    /// The span runs between the midpoints to the neighbouring control points,
+    /// taken through the same sector, mirror and reverse mapping as the point
+    /// itself, so it is the span on the *axis* rather than on the strip. At a
+    /// mirror fold the two edges land on the same side and the span collapses,
+    /// which falls back by itself.
+    fn span_peak(
+        &self,
+        levels: &[f32],
+        i: usize,
+        last_point: f32,
+        last_led: f32,
+    ) -> Option<f32> {
+        if !self.dense {
+            return None;
+        }
+        let edge = |offset: f32| {
+            let u = source_position(
+                (i as f32 + offset) / last_point,
+                self.layout.mirror,
+                self.layout.reverse,
+            );
+            led_frequency(&self.sorted, u * last_led)
+        };
+        peak_level_between(levels, &self.centers, edge(-0.5)?, edge(0.5)?)
     }
 }
 
@@ -335,8 +418,72 @@ mod tests {
         assert_eq!(level_at(&levels, &centers, 20_000.0), 0.0);
     }
 
+    #[test]
+    fn the_peak_lookup_takes_the_loudest_in_the_span_and_nothing_outside_it() {
+        let centers = [100.0, 200.0, 400.0, 800.0];
+        let levels = [0.2, 0.9, 0.3, 1.0];
+        assert_eq!(peak_level_between(&levels, &centers, 150.0, 500.0), Some(0.9));
+        assert_eq!(peak_level_between(&levels, &centers, 90.0, 810.0), Some(1.0));
+
+        // The bounds are inclusive, so a centre sitting exactly on an edge is
+        // in — adjacent control points share their edges and a note landing on
+        // one must reach both rather than neither.
+        assert_eq!(peak_level_between(&levels, &centers, 200.0, 200.0), Some(0.9));
+
+        // Nothing in the span is not the same as silence in it: the caller has
+        // to know it got no answer, so it can interpolate instead.
+        assert_eq!(peak_level_between(&levels, &centers, 210.0, 390.0), None);
+        assert_eq!(peak_level_between(&[], &[], 0.0, 1.0), None);
+    }
+
     fn centers(n: usize) -> Vec<f32> {
         (0..n).map(|i| norm_to_hz(i as f32 / (n - 1) as f32)).collect()
+    }
+
+    /// The bug this whole aggregation exists for.
+    ///
+    /// A note is one grid point wide and the wire is narrower than the grid, so
+    /// point-sampling lands beside the peak and reports a quieter band than was
+    /// played. The surface's y *is* that level, so the note comes out the wrong
+    /// colour rather than merely dimmer — and at spread 0 the sample can miss
+    /// it altogether.
+    #[test]
+    fn a_grid_finer_than_the_frame_keeps_every_peak() {
+        let c = centers(88);
+        for spike in 0..88 {
+            let mut levels = vec![0.0; 88];
+            levels[spike] = 1.0;
+
+            for points in [85, 64] {
+                let mut map = StripMap::new(
+                    LayoutConfig::spanning(150),
+                    IntensityConfig::pass_through(),
+                    &c,
+                    points,
+                    150,
+                );
+                let peak = map.map(&levels).iter().map(|p| p.y).fold(0.0f32, f32::max);
+                assert_eq!(peak, 1.0, "grid point {spike} of 88 lost its peak at {points} points");
+            }
+        }
+    }
+
+    /// And only when the frame really is the coarser grid. Interpolation is
+    /// what the audio path has always done and what the colour reference is
+    /// written against, so a frame with room for every band must still get it.
+    #[test]
+    fn a_frame_at_least_as_fine_as_the_grid_still_interpolates() {
+        let c = centers(3);
+        let levels = [0.0, 1.0, 0.0];
+        let mut map =
+            StripMap::new(LayoutConfig::spanning(150), IntensityConfig::pass_through(), &c, 9, 150);
+        let points = map.map(&levels).to_vec();
+
+        // Quarter of the way along is halfway between the first two centres,
+        // which interpolation puts at 0.5 and an aggregate would round up to 1.
+        assert!((points[2].y - 0.5).abs() < 0.02, "point 2 was at {}", points[2].y);
+        assert_eq!(points[0].y, 0.0);
+        assert_eq!(points[4].y, 1.0);
     }
 
     #[test]

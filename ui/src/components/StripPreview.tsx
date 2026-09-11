@@ -22,8 +22,19 @@ export function StripPreview({ label, hint, colors, height = 26 }: Props) {
 
     const dpr = window.devicePixelRatio || 1;
     const w = canvas.clientWidth;
-    canvas.width = Math.max(1, Math.round(w * dpr));
-    canvas.height = Math.round(height * dpr);
+    const pw = Math.max(1, Math.round(w * dpr));
+    const ph = Math.max(1, Math.round(height * dpr));
+
+    // Only when it actually changed. This runs on every frame the engine sends,
+    // and assigning to `width` or `height` reallocates the backing store even
+    // when the number is the same — at 600 LEDs and 30 fps that is megabytes a
+    // second of buffer churn for a canvas whose size never moves. The repaint
+    // below covers every pixel, so nothing is relying on the clear that a
+    // resize would have done.
+    if (canvas.width !== pw || canvas.height !== ph) {
+      canvas.width = pw;
+      canvas.height = ph;
+    }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     ctx.fillStyle = "#000";

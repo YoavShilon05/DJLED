@@ -66,6 +66,23 @@ const NO_PRESETS: PresetInfo[] = [];
 export default function App() {
   const [config, setConfig] = useState<EditorConfig>(loadConfig);
   const [status, setStatus] = useState<Status>("connecting");
+  /**
+   * The engine's latest analysis, and the one piece of state that moves on its
+   * own — thirty times a second, for as long as the page is open.
+   *
+   * Two things follow from that, and both are easy to lose track of. The first
+   * is that it must not queue: the client coalesces frames onto an animation
+   * frame precisely so that a tab which cannot keep up drops them instead of
+   * banking them, which is what used to run the tab out of memory. See
+   * `engine.ts`.
+   *
+   * The second is that everything re-rendered by a frame is re-rendered thirty
+   * times a second. Only three things here are actually driven by one — the
+   * plot's canvas and the two strips — so every panel beside them is memoised
+   * and its props are kept referentially stable on purpose. A callback that
+   * forgets its `useCallback`, or a prop built inline, quietly puts a whole
+   * Mantine panel back on the frame path.
+   */
   const [frame, setFrame] = useState<Frame | null>(null);
   const [brightness, setBrightness] = useState(1);
   const [ledCount, setLedCount] = useState(150);

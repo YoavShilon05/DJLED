@@ -211,8 +211,29 @@ The grid is one point per semitone, which is finer than any audio band plan and
 is what keeps adjacent notes readable as separate bars. The *wire* carries fewer:
 the protocol allows 85 colours per frame and the stock sketch is built with
 `MAX_BANDS 64`, so a full 88-key range is resampled by frequency on the way out.
-That costs a little spatial resolution on the strip and nothing else — and the
-engine says so at startup when it happens.
+The engine says so at startup when it happens.
+
+**That resample takes the loudest point in the span, not the level at the
+middle of it.** The distinction is the difference between a note coming out the
+colour it was played and coming out a different one, and it is MIDI's alone. A
+band plan is coarser than the frame, so for audio the frame is interpolating a
+grid finer than nothing and point-sampling is exactly right. The note grid is
+the other way round: 88 points into 64, with each note about one point wide. A
+sample taken between two grid points lands beside the peak, and the worst-placed
+note loses a quarter of its level.
+
+A quarter would be a forgivable loss if level were brightness. It is not — level
+is the colour surface's *y*, so on a palette that ramps green at half velocity to
+red at full, a note struck as hard as MIDI allows comes out green. At note glow 0,
+where each note is a single hard point, the sample can miss it altogether. So a
+control point that stands for more than one grid point takes the loudest of them,
+for the same reason two notes a semitone apart take the loudest rather than
+summing: a note is a note, and its velocity is not an average of the silence
+around it.
+
+What is left is genuinely only spatial: two notes closer together than
+`88 / points` share a control point, and the firmware smooths between control
+points as it always has.
 
 **The limit comes from the board, not from the protocol.** The firmware sizes
 its receive buffer from its own `MAX_BANDS` and stops reading anything longer,

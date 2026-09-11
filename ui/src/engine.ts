@@ -6,6 +6,29 @@
  * automatic and the editor stays fully usable while disconnected — you can
  * author a stack with nothing running and it will be sent when the engine
  * appears.
+ *
+ * # Frames are dropped, not queued
+ *
+ * The engine publishes a frame every 33 ms whether anyone is keeping up or not.
+ * That is the right call there — the analysis thread must never wait on a
+ * browser — but it makes flow control this side's problem, and there is no
+ * back pressure on a WebSocket to do it with: a message that arrives while the
+ * main thread is busy waits in the event queue, holding its payload, and the
+ * queue has no limit. A tab that takes longer than 33 ms to fold a stack and
+ * repaint therefore falls behind by a few kilobytes per frame, for as long as
+ * it is open, until it is killed for running out of memory.
+ *
+ * So a frame is parked rather than delivered, and the newest one is handed over
+ * on the next animation frame. A frame is a whole snapshot rather than a delta,
+ * so an older one holds nothing a newer one does not — dropping it costs
+ * nothing but the redraw nobody would have seen. What this buys is that the
+ * socket's own handler stays cheap, the queue drains as fast as it fills, and
+ * at most one frame is ever held. A backgrounded tab, where animation frames
+ * stop entirely, simply holds that one and does no work at all.
+ *
+ * State messages are not coalesced. There are few of them, each one is a change
+ * the UI could not have predicted, and the editor's adoption rule reads
+ * `activePreset` transitions — skipping one would lose the transition.
  */
 
 import type { SurfaceConfig } from "./color/surface";
@@ -207,6 +230,9 @@ export class EngineClient {
   private socket: WebSocket | null = null;
   private timer: number | null = null;
   private closed = false;
+  /** The newest frame not yet handed on. See the module note. */
+  private pending: Frame | null = null;
+  private raf: number | null = null;
 
   constructor(
     private url: string,
@@ -250,7 +276,7 @@ export class EngineClient {
       const tagged = msg as { type?: string };
       switch (tagged.type) {
         case "frame":
-          this.handlers.onFrame?.(msg as Frame);
+          this.queueFrame(msg as Frame);
           break;
         case "state":
           this.handlers.onState?.(msg as EngineState);
@@ -270,6 +296,26 @@ export class EngineClient {
     // `onerror` is always followed by `onclose`, so reconnection is handled
     // there and this only avoids an unhandled event.
     socket.onerror = () => {};
+  }
+
+  /**
+   * Hold a frame until the next animation frame, replacing whatever was already
+   * waiting.
+   *
+   * The parse happens here rather than at flush time because it is the cheap
+   * half — a few tens of microseconds against a whole React pass — and doing it
+   * eagerly keeps the socket handler free of any knowledge of the wire format
+   * beyond the tag it already reads.
+   */
+  private queueFrame(frame: Frame): void {
+    this.pending = frame;
+    if (this.raf !== null) return;
+    this.raf = requestAnimationFrame(() => {
+      this.raf = null;
+      const next = this.pending;
+      this.pending = null;
+      if (next) this.handlers.onFrame?.(next);
+    });
   }
 
   private scheduleReconnect(): void {
@@ -340,6 +386,14 @@ export class EngineClient {
       window.clearTimeout(this.timer);
       this.timer = null;
     }
+    if (this.raf !== null) {
+      cancelAnimationFrame(this.raf);
+      this.raf = null;
+    }
+    // Dropped rather than delivered: a closed client has no one to deliver to,
+    // and holding the last frame would keep a whole stack's levels alive for as
+    // long as anything still references the client.
+    this.pending = null;
     this.socket?.close();
     this.socket = null;
   }

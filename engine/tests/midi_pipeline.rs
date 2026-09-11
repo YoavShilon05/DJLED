@@ -12,6 +12,7 @@
 //! can be delivered as bytes rather than by playing a keyboard at the CI box.
 
 use djled_engine::color::intensity::IntensityConfig;
+use djled_engine::color::surface::Keyframe;
 use djled_engine::color::{Geometry, LayoutConfig, RenderConfig, Renderer, SurfaceConfig};
 use djled_engine::link::protocol::max_bands;
 use djled_engine::link::{expand_bands_to_leds, Link, MockLink};
@@ -42,10 +43,19 @@ impl Pipeline {
     /// Built the way the engine builds it: the point count is whatever the
     /// *link* says it will take, never what the protocol theoretically allows.
     fn driving(cfg: MidiConfig, layout: LayoutConfig, link: MockLink) -> Self {
+        Self::painting(cfg, layout, link, SurfaceConfig::default())
+    }
+
+    fn painting(
+        cfg: MidiConfig,
+        layout: LayoutConfig,
+        link: MockLink,
+        surface: SurfaceConfig,
+    ) -> Self {
         let notes = NoteEngine::new(&cfg, None, ShowConfig::default().base().decay());
         let renderer = Renderer::new(
             RenderConfig::default(),
-            &SurfaceConfig::default(),
+            &surface,
             layout,
             IntensityConfig::pass_through(),
             Geometry {
@@ -78,6 +88,19 @@ impl Pipeline {
             self.link.send(pixels).unwrap();
         }
         expand_bands_to_leds(self.renderer.pixels(), &mut self.leds);
+    }
+
+    /// The brightest colour on the *wire*, before the firmware spreads the
+    /// frame across the run. Where a level claim belongs: the expansion to LEDs
+    /// blurs neighbouring control points together by design, so a note narrower
+    /// than `leds / points` is smeared there however right its level was.
+    fn brightest_point(&self) -> [u8; 3] {
+        *self
+            .renderer
+            .pixels()
+            .iter()
+            .max_by_key(|px| px.iter().map(|&c| c as u32).sum::<u32>())
+            .unwrap()
     }
 
     fn brightest_led(&self) -> usize {
@@ -150,6 +173,59 @@ fn a_link_refuses_a_frame_past_the_limit_it_reports() {
 
     let err = link.send(&vec![[10u8; 3]; 88]).unwrap_err().to_string();
     assert!(err.contains("64"), "the error should name the limit: {err}");
+}
+
+/// Velocity has to reach the *top* of the colour surface, not merely near it.
+///
+/// The surface's y is the level, so a note that arrives short of the velocity
+/// it was played at is painted a different colour rather than a dimmer one —
+/// which is what this caught: the note grid is one point per semitone and the
+/// wire carries 64, so point-sampling the grid slid off a note's peak and lost
+/// up to a quarter of its level. A ramp from black through green to red reads
+/// that back as a colour: every note struck as hard as MIDI allows must come
+/// out red, whatever the frame the board will take.
+///
+/// Audio never showed it because a band plan is coarser than the frame, so the
+/// frame is never the one doing the resampling. See
+/// [`djled_engine::color::strip::peak_level_between`].
+#[test]
+fn full_velocity_reaches_the_top_of_the_colour_surface_at_every_note() {
+    // Black at silence, green halfway, red at full, at both ends of the axis so
+    // the field is a pure vertical ramp and colour reports level alone.
+    let ramp = SurfaceConfig {
+        keyframes: [0.0, 1.0]
+            .iter()
+            .flat_map(|&x| {
+                [
+                    Keyframe::new(x, 0.0, "#000000"),
+                    Keyframe::new(x, 0.5, "#00ff00"),
+                    Keyframe::new(x, 1.0, "#ff0000"),
+                ]
+            })
+            .collect(),
+        sigma: 0.25,
+    };
+
+    for max_points in [85, 64] {
+        for note in DEFAULT_LOW..=DEFAULT_HIGH {
+            let mut p = Pipeline::painting(
+                MidiConfig::default(),
+                LayoutConfig::spanning(LEDS),
+                MockLink::with_max_points(LEDS, max_points),
+                ramp.clone(),
+            );
+            p.note_on(note, 127);
+            p.run(0.4);
+
+            let px = p.brightest_point();
+            assert!(
+                px[0] > 4 * px[1],
+                "note {note} at full velocity went on the wire as {px:?} through a \
+                 {max_points}-point frame — green means its level never reached \
+                 the top of the surface"
+            );
+        }
+    }
 }
 
 /// The stretch, seen from the far end of the chain: the lowest note lights the

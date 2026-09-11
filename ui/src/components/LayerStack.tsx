@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { memo, useCallback, useState } from "react";
 import {
   ActionIcon,
   Badge,
@@ -57,8 +57,11 @@ interface Props {
  *
  * Dragging reorders. Everything else in the editor edits whichever row is
  * selected, so this is also the navigation for the whole panel.
+ *
+ * Memoised: nothing in here is driven by a frame, and a frame arrives thirty
+ * times a second. See the note on `frame` in `App.tsx`.
  */
-export function LayerStack({ config, onChange, status }: Props) {
+export const LayerStack = memo(function LayerStack({ config, onChange, status }: Props) {
   const sensors = useSensors(
     // A small distance before a drag starts, so clicking a row to select it,
     // or grabbing its opacity slider, is not read as the beginning of a drag.
@@ -202,7 +205,7 @@ export function LayerStack({ config, onChange, status }: Props) {
       </Stack>
     </Paper>
   );
-}
+});
 
 interface RowProps {
   layer: EditorLayer;

@@ -77,6 +77,19 @@ editor's squiggles.
 - **The whole config goes over the wire on every pointer move.** That's
   deliberate — one message means the two sides can't disagree about which half
   of an edit landed. Keep `toEngineConfig` cheap and allocation-light.
+- **Frames are dropped, not queued, and almost nothing should re-render on
+  one.** The engine publishes thirty times a second whether anyone keeps up or
+  not, and a WebSocket has no back pressure — so `EngineClient` parks the newest
+  frame and hands it over on the next animation frame, and everything not driven
+  by a frame is memoised with referentially stable props. Without the first, a
+  tab that cannot keep up banks the backlog until it is killed for running out
+  of memory; without the second, it cannot keep up. Three things are on the
+  frame path on purpose: `SpectrumCanvas` and the two `StripPreview`s. Adding a
+  fourth is a decision, not an accident.
+- **Do not reallocate a canvas backing store per frame.** Assigning to
+  `canvas.width` or `.height` reallocates even when the value is unchanged.
+  Guard it with a size comparison, as `StripPreview` and `SpectrumCanvas` both
+  do.
 - **The engine owns the presets, so it owns the show while it is connected.**
   `App.tsx` adopts `state.config` whenever `state.activePreset` changes and
   ignores it otherwise — a hotkey can swap the show with this page closed, and

@@ -40,7 +40,7 @@ cargo run --manifest-path engine/Cargo.toml --release -- --port COM3
 cd ui && npm install && npm run dev
 
 # Tests
-cargo test --manifest-path engine/Cargo.toml        # 255 pass (210 lib + 45 integration)
+cargo test --manifest-path engine/Cargo.toml        # 259 pass (213 lib + 46 integration)
 cd ui && npm test                                   # 65 pass across 8 files
 cd ui && npm run typecheck                          # tsc --noEmit, clean
 
@@ -146,10 +146,26 @@ trip.
   command that most needs through is the one moving off it.
 - **MIDI mode's x axis is positions, not pitches.** The note range is stretched
   across 20 Hz–20 kHz. A keyframe "at 250 Hz" means a fifth of the way along.
+- **A frame narrower than the level grid aggregates; one at least as wide
+  interpolates.** `StripMap` picks between `level_at` and `peak_level_between`
+  on that alone. Audio is always the second case — a band plan is coarser than
+  the frame — so this is MIDI's code path in practice: 88 semitones into 64
+  points, where sampling *between* grid points slides off a note's peak and
+  reports a velocity nobody played. Level is the colour surface's y, so that
+  arrives as the wrong colour rather than a dimmer one. Pinned by
+  `a_grid_finer_than_the_frame_keeps_every_peak` and
+  `full_velocity_reaches_the_top_of_the_colour_surface_at_every_note`.
 - **"Frame hop" is not an FFT window length.** Bands each draw from one of five
   tiers (8192→128); the hop is how often those transforms run.
 - **The editor plot shows one layer; the strip preview shows the stack.** Judge
   composite results on the preview, never on the graph.
+- **Anything a frame re-renders re-renders thirty times a second.** The engine
+  publishes at a fixed rate with no back pressure, so the editor coalesces
+  frames onto an animation frame (`engine.ts`) and memoises every panel that is
+  not driven by one. Both halves matter: without the first a tab that falls
+  behind banks the backlog until it is killed for running out of memory, and
+  without the second it falls behind. A prop built inline, or a callback that
+  loses its `useCallback`, puts a whole Mantine panel back on the frame path.
 - **Gizmo checkboxes are visibility, not bypass.** A hidden EQ still shapes the
   signal.
 - **There is no save button, and the preset dropdown is not a loader.** Selecting

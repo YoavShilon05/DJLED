@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { Kbd, Paper, Select, Stack, Text, TextInput } from "@mantine/core";
 
 import { PRESET_SLOTS, hotkeyLabel, presetName, presetOptions } from "../config/presets";
@@ -28,8 +28,11 @@ interface Props {
  * this panel is as much a legend as a control: it is where somebody learns that
  * ctrl+alt+F7 is the one with the slow red wash, without having to try it
  * during a set.
+ *
+ * Memoised: nothing in here is driven by a frame, and a frame arrives thirty
+ * times a second. See the note on `frame` in `App.tsx`.
  */
-export function PresetPanel({ presets, active, onSelect, onRename, connected }: Props) {
+export const PresetPanel = memo(function PresetPanel({ presets, active, onSelect, onRename, connected }: Props) {
   const info = presets[active];
 
   // Renaming is typed a character at a time and each keystroke would otherwise
@@ -88,4 +91,4 @@ export function PresetPanel({ presets, active, onSelect, onRename, connected }: 
       </Stack>
     </Paper>
   );
-}
+});

@@ -51,6 +51,9 @@ export function dbToLevel(db: number): number {
 export class ColorField {
   private canvas = document.createElement("canvas");
   private key = "";
+  /** The object the cached key was taken from, so a repaint that was not caused
+   *  by an edit costs one reference comparison instead of a serialisation. */
+  private source: SurfaceConfig | null = null;
 
   constructor() {
     this.canvas.width = FIELD_W;
@@ -58,6 +61,14 @@ export class ColorField {
   }
 
   render(surface: SurfaceConfig): HTMLCanvasElement {
+    // The plot repaints on every frame the engine sends, and the surface it is
+    // handed is rebuilt only when the layer changes — so the common case is the
+    // same object twice and never needs stringifying at all. The key stays for
+    // the case that is not: a config adopted from the engine is a new object
+    // holding what was already on screen.
+    if (surface === this.source) return this.canvas;
+    this.source = surface;
+
     const key = JSON.stringify(surface);
     if (key === this.key) return this.canvas;
     this.key = key;

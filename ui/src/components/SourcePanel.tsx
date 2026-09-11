@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { Alert, Anchor, List, Paper, Select, Stack, Text } from "@mantine/core";
 
 import type { EditorLayer } from "../config/editor";
@@ -39,8 +40,11 @@ interface Props {
  * reorder, a duplicate and a save. Whether it *opened* is the engine's answer,
  * and that is what the hint underneath reports — showing a selection that
  * failed would be a lie the size of a dark row.
+ *
+ * Memoised: nothing in here is driven by a frame, and a frame arrives thirty
+ * times a second. See the note on `frame` in `App.tsx`.
  */
-export function SourcePanel({ layer, onChange, devices, status, connected, onRefresh }: Props) {
+export const SourcePanel = memo(function SourcePanel({ layer, onChange, devices, status, connected, onRefresh }: Props) {
   const selected = layer.source.id ?? DEFAULT_KEYS[layer.source.kind];
   const midi = layer.source.kind === "midi";
   const noMidiPorts = connected && !devices.some((d) => d.kind === "midi");
@@ -156,7 +160,7 @@ export function SourcePanel({ layer, onChange, devices, status, connected, onRef
       </Stack>
     </Paper>
   );
-}
+});
 
 /**
  * The one thing about MIDI on Windows that cannot be discovered by looking.

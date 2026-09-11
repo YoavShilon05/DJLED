@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { Checkbox, Paper, Stack, Text } from "@mantine/core";
 
 import type { EditorConfig, GizmoFlags } from "../config/editor";
@@ -21,8 +22,11 @@ const ITEMS: Array<{ key: keyof GizmoFlags; label: string }> = [
  *
  * These are visibility, not bypass: a hidden EQ still shapes the spectrum, and
  * a hidden threshold still cuts. Nothing here changes the signal.
+ *
+ * Memoised: nothing in here is driven by a frame, and a frame arrives thirty
+ * times a second. See the note on `frame` in `App.tsx`.
  */
-export function GizmoPanel({ config, onChange }: Props) {
+export const GizmoPanel = memo(function GizmoPanel({ config, onChange }: Props) {
   const value = ITEMS.filter((i) => config.gizmos[i.key]).map((i) => i.key);
 
   return (
@@ -55,4 +59,4 @@ export function GizmoPanel({ config, onChange }: Props) {
       </Stack>
     </Paper>
   );
-}
+});
