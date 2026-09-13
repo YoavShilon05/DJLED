@@ -35,7 +35,7 @@ editor's squiggles.
 | `config/eq.ts` | RBJ cookbook biquads, verbatim |
 | `config/curve.ts` | Intensity curve — cubic Béziers pinned at (0,0)–(1,1) |
 | `config/notes.ts` | MIDI note ↔ position on the frequency axis, and the relabelled ticks |
-| `config/presets.ts` | Slot ↔ function key, and the dropdown's labels. The *only* place 0-based slots meet 1-based keys |
+| `config/presets.ts` | Slot ↔ function key, and the preset bar's labels. The *only* place 0-based slots meet 1-based keys |
 | `color/oklab.ts` | Port of `engine/src/color/oklab.rs` |
 | `color/surface.ts` | Port of `engine/src/color/surface.rs` |
 | `color/display.ts` | Screen-side conversion. **Not** the same as the LED path |
@@ -44,9 +44,42 @@ editor's squiggles.
 | `spectrum/paint.ts` | Canvas raster: colour field, grid, bars. Pure functions, no React |
 | `spectrum/GizmoLayer.tsx` | SVG interaction layer over the canvas |
 | `spectrum/render.ts` | Port of the compositing fold in `engine/src/color/render.rs` |
-| `components/` | Mantine panels: presets, layer stack, source, MIDI, settings, gizmos, strip preview |
+| `components/` | Mantine panels — see the shell below |
+| `components/strip.ts` | `paintStrip`, shared by the preview strips and the row thumbnails |
 | `theme.ts` | Every colour, radius and spacing decision, including `theme.other.plot` |
 | `styles.css` | Two rules. Keep it that way |
+
+### The shell
+
+`App.tsx` lays the editor out as one screen with no page scroll. Four blocks are
+pinned and two columns scroll under them:
+
+```
+HeaderBar      status · master brightness · the ⋯ menu (Reset lives here)
+PresetBar      all twelve shows, always visible; click the live one to rename
+StripPreview   Preview over Engine — the wall, and what it is really doing
+────────────────────────────────────────────────────────────────
+LayerStack     │  SpectrumEditor + OverlayMenu
+Inspector      │
+ (scrolls)     │   (scrolls)
+```
+
+The pinned half is the point: the preview strip is the only ground truth in the
+application and it used to be at the bottom of a tall document. Anything added
+to that half costs the graph the same height on every screen, so it is a
+decision rather than a placement.
+
+`Inspector` is a tabbed box — Source, Shape, Notes — over the *selected* layer.
+Those three were separate panels, each with its own border and its own heading
+repeating the layer's name; the MIDI one was on screen at full height for audio
+layers purely to say that it did nothing. The tab persists across selecting a
+different row, which is what makes comparing one setting across a stack a matter
+of clicking rows.
+
+Long explanations live behind `Field`'s and `PanelHeading`'s `info` prop — an
+`InfoDot`, hoverable and focusable — rather than under the control. The prose is
+worth keeping and was what made the column unreadable; `hint` is for the one
+line worth having on screen permanently.
 
 ## Rules that are easy to break
 
@@ -84,8 +117,20 @@ editor's squiggles.
   by a frame is memoised with referentially stable props. Without the first, a
   tab that cannot keep up banks the backlog until it is killed for running out
   of memory; without the second, it cannot keep up. Three things are on the
-  frame path on purpose: `SpectrumCanvas` and the two `StripPreview`s. Adding a
-  fourth is a decision, not an accident.
+  React frame path on purpose: `SpectrumCanvas` and the two `StripPreview`s.
+  Adding a fourth is a decision, not an accident.
+- **A layer row's thumbnail is pulled, not passed.** `LayerThumb` looks the
+  latest strip up in a ref that `App` refreshes per frame, and paints it on its
+  own timer at a third of the rate. Handing each row a fresh array of colours
+  instead would re-render twelve memoised Mantine panels thirty times a second
+  to repaint twelve canvases — which is the rule above, broken in the one place
+  it looks unavoidable. The same trick is what any future live readout beside a
+  control should use.
+- **Thumbnails ignore layer opacity and master brightness.** A deliberate
+  disagreement with the wall: they answer "which layer is this", and a row
+  faded to 10% or a master pulled down for a quiet passage would make every one
+  of them an identical black rectangle. How much of a layer is getting through
+  is what its slider and its dimmed row already say.
 - **Do not reallocate a canvas backing store per frame.** Assigning to
   `canvas.width` or `.height` reallocates even when the value is unchanged.
   Guard it with a size comparison, as `StripPreview` and `SpectrumCanvas` both
@@ -96,12 +141,13 @@ editor's squiggles.
   that field is the only signal it happened. localStorage is now the *offline*
   cache: it seeds an engine whose live slot has never been authored into, and
   is re-asserted after a reconnect, and is otherwise deferred to.
-- **`PresetPanel` selects, it does not load.** `selectPreset` sends a slot and
+- **`PresetBar` selects, it does not load.** `selectPreset` sends a slot and
   nothing else; the new show arrives in the next `state`, on the same path a
-  global hotkey takes. Sending a config with it would give the dropdown and the
-  keyboard two different ways to disagree.
-- **Gizmo checkboxes are visibility, not bypass.** Nothing in that panel touches
-  the signal.
+  global hotkey takes. Sending a config with it would give the bar and the
+  keyboard two different ways to disagree. Rename is the one thing the bar does
+  send directly, and it is committed on blur or Enter rather than per keystroke.
+- **Gizmo checkboxes are visibility, not bypass.** Nothing in `OverlayMenu`
+  touches the signal.
 - `MAX_LAYERS` is 12 and `SAMPLE_LENGTHS` is a fixed list, both in
   `config/editor.ts`.
 
@@ -111,11 +157,11 @@ editor's squiggles.
 |---|---|
 | `color/reference.test.ts` | Parity with the Rust colour path, against the generated fixture |
 | `color/oklab.test.ts` | The conversions on their own |
-| `spectrum/stack.test.ts` | The browser's copy of the compositing fold |
+| `spectrum/stack.test.ts` | The browser's copy of the compositing fold, and that `renderLayer` and a one-layer `renderStack` are the same bytes |
 | `spectrum/render.test.ts` | Spatial mapping — including that an even-length strip's mirror fold lands on one specific index |
 | `config/eq.test.ts` | Closed-form properties, not captured values |
 | `config/editor.test.ts`, `config/notes.test.ts` | Round-tripping and the note axis |
-| `config/presets.test.ts` | Slot ↔ function key numbering, and that the dropdown lists all twelve in hotkey order |
+| `config/presets.test.ts` | Slot ↔ function key numbering, and that the bar lists all twelve in hotkey order |
 
 `scripts/stack-smoke.mjs` and `scripts/preset-smoke.mjs` are the only checks
 that cross the real socket. The first sends a two-layer show to a running engine

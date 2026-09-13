@@ -1,5 +1,5 @@
 import { memo } from "react";
-import { Alert, Anchor, List, Paper, Select, Stack, Text } from "@mantine/core";
+import { Alert, Anchor, List, Select, Stack, Text } from "@mantine/core";
 
 import type { EditorLayer } from "../config/editor";
 import type { InputDevice, InputSource, LayerStatus, SourceKind } from "../engine";
@@ -41,10 +41,22 @@ interface Props {
  * and that is what the hint underneath reports — showing a selection that
  * failed would be a lie the size of a dark row.
  *
+ * A tab of the inspector rather than a panel of its own: this, the shape
+ * controls and the note axis all edit the selected layer, and stacking three
+ * boxes that say "· Layer 2" in their headings made a column nobody could see
+ * the end of. One box, one layer, three tabs.
+ *
  * Memoised: nothing in here is driven by a frame, and a frame arrives thirty
  * times a second. See the note on `frame` in `App.tsx`.
  */
-export const SourcePanel = memo(function SourcePanel({ layer, onChange, devices, status, connected, onRefresh }: Props) {
+export const SourcePanel = memo(function SourcePanel({
+  layer,
+  onChange,
+  devices,
+  status,
+  connected,
+  onRefresh,
+}: Props) {
   const selected = layer.source.id ?? DEFAULT_KEYS[layer.source.kind];
   const midi = layer.source.kind === "midi";
   const noMidiPorts = connected && !devices.some((d) => d.kind === "midi");
@@ -65,102 +77,108 @@ export const SourcePanel = memo(function SourcePanel({ layer, onChange, devices,
   };
 
   return (
-    <Paper>
-      <Stack gap="md">
-        <Text size="xs" c="dimmed" fw={700} tt="uppercase" lts="0.08em">
-          Source · {layer.name}
-        </Text>
+    <Stack gap="md">
+      <Field
+        label="Listening to"
+        value={
+          <Anchor
+            component="button"
+            type="button"
+            size="xs"
+            onClick={onRefresh}
+            disabled={!connected}
+          >
+            rescan
+          </Anchor>
+        }
+        hint={resolved(layer, status, connected)}
+        info={ADVICE}
+      >
+        <Select
+          data={group(devices)}
+          value={selected}
+          onChange={change}
+          placeholder="select a source"
+          allowDeselect={false}
+          comboboxProps={{ withinPortal: true }}
+        />
+      </Field>
 
+      {/* Only worth showing where there is a choice to make: a mono
+          microphone has nothing to pick between. */}
+      {channels > 1 && (
         <Field
-          label="Listening to"
-          value={
-            <Anchor
-              component="button"
-              type="button"
-              size="xs"
-              onClick={onRefresh}
-              disabled={!connected}
-            >
-              rescan
-            </Anchor>
+          label={midi ? "MIDI channel" : "Channel"}
+          info={
+            midi
+              ? "A DAW can send several parts down one cable. Pick one to light this layer from that part alone — another layer can take a different one, and they share the port."
+              : "An instrument in input 1 only exists on one channel — mixing it with a silent neighbour costs 6 dB and adds that neighbour's noise."
           }
-          hint={describe(layer, status, connected)}
         >
           <Select
-            data={group(devices)}
-            value={selected}
-            onChange={change}
-            placeholder="select a source"
+            data={[
+              {
+                value: "mix",
+                label: midi ? `All ${channels} channels` : `Mix all ${channels}`,
+              },
+              ...Array.from({ length: channels }, (_, i) => ({
+                value: String(i),
+                label: `Channel ${i + 1}`,
+              })),
+            ]}
+            value={layer.source.channel === null ? "mix" : String(layer.source.channel)}
+            onChange={(value) =>
+              onChange({
+                ...layer,
+                source: {
+                  ...layer.source,
+                  channel: value === null || value === "mix" ? null : Number(value),
+                },
+              })
+            }
             allowDeselect={false}
             comboboxProps={{ withinPortal: true }}
           />
         </Field>
+      )}
 
-        {/* Only worth showing where there is a choice to make: a mono
-            microphone has nothing to pick between. */}
-        {channels > 1 && (
-          <Field
-            label={midi ? "MIDI channel" : "Channel"}
-            hint={
-              midi
-                ? "A DAW can send several parts down one cable. Pick one to light this layer from that part alone — another layer can take a different one, and they share the port."
-                : "An instrument in input 1 only exists on one channel — mixing it with a silent neighbour costs 6 dB and adds that neighbour's noise."
-            }
-          >
-            <Select
-              data={[
-                {
-                  value: "mix",
-                  label: midi ? `All ${channels} channels` : `Mix all ${channels}`,
-                },
-                ...Array.from({ length: channels }, (_, i) => ({
-                  value: String(i),
-                  label: `Channel ${i + 1}`,
-                })),
-              ]}
-              value={layer.source.channel === null ? "mix" : String(layer.source.channel)}
-              onChange={(value) =>
-                onChange({
-                  ...layer,
-                  source: {
-                    ...layer.source,
-                    channel: value === null || value === "mix" ? null : Number(value),
-                  },
-                })
-              }
-              allowDeselect={false}
-              comboboxProps={{ withinPortal: true }}
-            />
-          </Field>
-        )}
+      {/* The symptom this explains is "the strip is dark and nothing is
+          wrong" — notes arriving in an octave the axis does not cover. */}
+      {midi && outOfRange > 0 && (
+        <Alert color="yellow" variant="light" title="Notes outside the range">
+          <Text size="xs" lh={1.4}>
+            {outOfRange} note{outOfRange === 1 ? "" : "s"} arrived outside this layer's note range
+            and were dropped. Widen the range under Notes, or transpose what is playing.
+          </Text>
+        </Alert>
+      )}
 
-        {/* The symptom this explains is "the strip is dark and nothing is
-            wrong" — notes arriving in an octave the axis does not cover. */}
-        {midi && outOfRange > 0 && (
-          <Alert color="yellow" variant="light" title="Notes outside the range">
-            <Text size="xs" lh={1.4}>
-              {outOfRange} note{outOfRange === 1 ? "" : "s"} arrived outside this layer's note
-              range and were dropped. Widen the range under MIDI, or transpose what is playing.
-            </Text>
-          </Alert>
-        )}
+      {noMidiPorts && <LoopMidiHint />}
 
-        {noMidiPorts && <LoopMidiHint />}
-
-        {status?.error && (
-          <Alert color="red" variant="light" title="Source">
-            <Text size="xs" lh={1.4}>
-              {status.error}
-            </Text>
-            <Text size="xs" c="dimmed" lh={1.4} mt={4}>
-              Only this layer is affected — the rest of the stack is still running.
-            </Text>
-          </Alert>
-        )}
-      </Stack>
-    </Paper>
+      {status?.error && (
+        <Alert color="red" variant="light" title="Source">
+          <Text size="xs" lh={1.4}>
+            {status.error}
+          </Text>
+          <Text size="xs" c="dimmed" lh={1.4} mt={4}>
+            Only this layer is affected — the rest of the stack is still running.
+          </Text>
+        </Alert>
+      )}
+    </Stack>
   );
 });
+
+/**
+ * The failure this whole control exists for, described by its symptom rather
+ * than its cause — "Spotify shows up, my DAW doesn't" is how it is met.
+ *
+ * Behind the icon rather than under the select: it is the one paragraph that
+ * saves an evening, and also the one paragraph that is irrelevant every other
+ * time the panel is opened.
+ */
+const ADVICE =
+  "Loopback hears anything Windows mixes, but never a DAW on an ASIO driver — ASIO bypasses Windows entirely. Select this interface's input for that, or send it MIDI instead. Layers naming the same device share one open handle, so a five-layer show on one output is still a single capture.";
 
 /**
  * The one thing about MIDI on Windows that cannot be discovered by looking.
@@ -248,11 +266,12 @@ function label(device: InputDevice, all: InputDevice[]): string {
  * What this layer is actually listening to. The selection alone does not say:
  * "the system default" names no device, and the rate comes from the endpoint
  * rather than from anything that was asked for.
+ *
+ * One line, because it is on screen permanently. The advice that used to be
+ * glued to the end of it is in {@link ADVICE}.
  */
-function describe(layer: EditorLayer, status: LayerStatus | null, connected: boolean): string {
-  if (!connected) {
-    return "Start the engine to see what this resolves to. The selection is saved with the layer either way.";
-  }
+function resolved(layer: EditorLayer, status: LayerStatus | null, connected: boolean): string {
+  if (!connected) return "Saved with the layer. Start the engine to see what it resolves to.";
   if (!status) return "Waiting for the engine to report on this layer.";
 
   if (status.kind === "midi") {
@@ -260,10 +279,10 @@ function describe(layer: EditorLayer, status: LayerStatus | null, connected: boo
       layer.source.channel === null
         ? "all channels"
         : `channel ${layer.source.channel + 1} of ${status.channels}`;
-    return `${status.deviceName} · midi · ${channel}. Notes land across the strip by pitch and velocity sets brightness; the range and glow are under MIDI. Other layers can share this port on other channels.`;
+    return `${status.deviceName} · midi · ${channel}`;
   }
 
-  const parts = [
+  return [
     status.deviceName,
     // Second, not buried at the end: which half of a device is being read is the
     // thing most likely to be wrong, and the least visible once chosen.
@@ -272,14 +291,5 @@ function describe(layer: EditorLayer, status: LayerStatus | null, connected: boo
     layer.source.channel === null
       ? `${status.channels} ch mixed`
       : `channel ${layer.source.channel + 1} of ${status.channels}`,
-  ];
-
-  // The failure this whole control exists for, described by its symptom rather
-  // than its cause — "Spotify shows up, my DAW doesn't" is how it is met.
-  const hint =
-    status.kind === "loopback"
-      ? " Loopback hears anything Windows mixes, but never a DAW on an ASIO driver — ASIO bypasses Windows entirely. Select this interface's input for that, or send it MIDI instead."
-      : "";
-
-  return `${parts.join(" · ")}.${hint}`;
+  ].join(" · ");
 }

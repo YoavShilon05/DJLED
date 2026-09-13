@@ -2,6 +2,7 @@ import { useLayoutEffect, useRef } from "react";
 import { Group, Stack, Text } from "@mantine/core";
 
 import type { Rgb } from "../color/display";
+import { paintStrip } from "./strip";
 
 interface Props {
   label: string;
@@ -17,43 +18,13 @@ export function StripPreview({ label, hint, colors, height = 26 }: Props) {
 
   useLayoutEffect(() => {
     const canvas = canvasRef.current;
-    const ctx = canvas?.getContext("2d");
-    if (!canvas || !ctx) return;
-
-    const dpr = window.devicePixelRatio || 1;
-    const w = canvas.clientWidth;
-    const pw = Math.max(1, Math.round(w * dpr));
-    const ph = Math.max(1, Math.round(height * dpr));
-
-    // Only when it actually changed. This runs on every frame the engine sends,
-    // and assigning to `width` or `height` reallocates the backing store even
-    // when the number is the same — at 600 LEDs and 30 fps that is megabytes a
-    // second of buffer churn for a canvas whose size never moves. The repaint
-    // below covers every pixel, so nothing is relying on the clear that a
-    // resize would have done.
-    if (canvas.width !== pw || canvas.height !== ph) {
-      canvas.width = pw;
-      canvas.height = ph;
-    }
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-    ctx.fillStyle = "#000";
-    ctx.fillRect(0, 0, w, height);
-    if (colors.length === 0) return;
-
-    const step = w / colors.length;
-    for (let i = 0; i < colors.length; i++) {
-      const [r, g, b] = colors[i];
-      ctx.fillStyle = `rgb(${r},${g},${b})`;
-      // Overdrawn by a pixel so sub-pixel widths leave no seam between LEDs.
-      ctx.fillRect(i * step, 0, step + 1, height);
-    }
+    if (canvas) paintStrip(canvas, colors, height);
   }, [colors, height]);
 
   return (
-    <Stack gap={6}>
+    <Stack gap={4}>
       <Group justify="space-between" gap="xs">
-        <Text size="xs" c="dimmed" fw={700} tt="uppercase">
+        <Text size="xs" c="dimmed" fw={700} tt="uppercase" lts="0.06em">
           {label}
         </Text>
         {hint && (

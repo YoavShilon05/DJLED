@@ -1,18 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  Alert,
-  Badge,
-  Button,
-  Container,
-  Flex,
-  Group,
-  Kbd,
-  Paper,
-  Stack,
-  Text,
-  Title,
-  Tooltip,
-} from "@mantine/core";
+import { Alert, Box, Group, Kbd, Paper, ScrollArea, Stack, Text } from "@mantine/core";
 import { useDebouncedCallback } from "@mantine/hooks";
 
 import { ledBytesToDisplay, type Rgb } from "./color/display";
@@ -31,12 +18,12 @@ import {
 } from "./config/editor";
 import { DEFAULT_SAMPLE_RATE, EqCurve } from "./config/eq";
 import { presetName } from "./config/presets";
-import { GizmoPanel } from "./components/GizmoPanel";
+import { HeaderBar } from "./components/HeaderBar";
+import { Inspector } from "./components/Inspector";
 import { LayerStack } from "./components/LayerStack";
-import { MidiPanel } from "./components/MidiPanel";
-import { PresetPanel } from "./components/PresetPanel";
-import { SettingsPanel } from "./components/SettingsPanel";
-import { SourcePanel } from "./components/SourcePanel";
+import type { LayerPreview } from "./components/LayerThumb";
+import { OverlayMenu } from "./components/OverlayMenu";
+import { PresetBar } from "./components/PresetBar";
 import { StripPreview } from "./components/StripPreview";
 import {
   DEFAULT_URL,
@@ -51,7 +38,7 @@ import {
 import { FREQUENCY_AXIS, noteAxis } from "./spectrum/axis";
 import { SpectrumEditor } from "./spectrum/SpectrumEditor";
 import type { SpectrumFrame } from "./spectrum/paint";
-import { applyEq, renderStack } from "./spectrum/render";
+import { applyEq, renderLayer, renderStack } from "./spectrum/render";
 
 /** Sampled once at load: a later save must not change what a reconnect does. */
 const HAD_LOCAL_CONFIG = hasStoredConfig();
@@ -62,6 +49,19 @@ const DEFAULT_DB_SPAN = 60;
 const NO_STATUS = new Map<string, LayerStatus>();
 
 const NO_PRESETS: PresetInfo[] = [];
+
+/**
+ * Length of a layer-row thumbnail, in LEDs.
+ *
+ * Far coarser than the wall, and deliberately: a hundred-odd screen pixels
+ * cannot show 600 of anything, and this is rendered for every row of the stack
+ * on every frame. See `LayerThumb`.
+ */
+const THUMB_LEDS = 48;
+
+/** The sidebar's width. Wide enough for a device name, narrow enough to leave
+ *  the graph the majority of a laptop screen. */
+const SIDEBAR_W = 340;
 
 export default function App() {
   const [config, setConfig] = useState<EditorConfig>(loadConfig);
@@ -77,11 +77,15 @@ export default function App() {
    * `engine.ts`.
    *
    * The second is that everything re-rendered by a frame is re-rendered thirty
-   * times a second. Only three things here are actually driven by one — the
-   * plot's canvas and the two strips — so every panel beside them is memoised
-   * and its props are kept referentially stable on purpose. A callback that
-   * forgets its `useCallback`, or a prop built inline, quietly puts a whole
-   * Mantine panel back on the frame path.
+   * times a second. Only the plot's canvas and the two strips are actually
+   * driven by one, so every panel beside them is memoised and its props are
+   * kept referentially stable on purpose. A callback that forgets its
+   * `useCallback`, or a prop built inline, quietly puts a whole Mantine panel
+   * back on the frame path.
+   *
+   * The layer thumbnails are the one thing that looks like an exception and is
+   * not: they are painted from a ref on their own timer rather than from a
+   * prop, so the rows around them never re-render. See `LayerThumb`.
    */
   const [frame, setFrame] = useState<Frame | null>(null);
   const [brightness, setBrightness] = useState(1);
@@ -224,7 +228,7 @@ export default function App() {
    * Nothing is sent with it and nothing is set locally: the engine owns the
    * twelve shows, so it answers with the new one in a `state` and the adoption
    * above picks it up — the same path a global hotkey takes. Two ways in, one
-   * way through, so the dropdown and the keyboard cannot disagree.
+   * way through, so the bar and the keyboard cannot disagree.
    */
   const selectPreset = useCallback((slot: number) => {
     clientRef.current?.selectPreset(slot);
@@ -233,6 +237,13 @@ export default function App() {
   const renamePreset = useCallback((slot: number, name: string) => {
     clientRef.current?.renamePreset(slot, name);
   }, []);
+
+  /** Replaces the live preset with the default show. Not an undo — edits are
+   *  saved as they are made, so there is no older version to put back. */
+  const resetShow = useCallback(() => {
+    clearConfig();
+    applyConfig(DEFAULT_CONFIG);
+  }, [applyConfig]);
 
   const live = status === "connected";
   const layer = activeLayer(config);
@@ -293,83 +304,140 @@ export default function App() {
     [live, frame],
   );
 
+  /**
+   * A strip per layer, for the thumbnails on the stack.
+   *
+   * Parked in a ref rather than put into state, because state is what puts
+   * something on the frame path: the rows are memoised, and handing each one a
+   * fresh array thirty times a second would re-render twelve Mantine panels to
+   * repaint twelve canvases. The canvases read this on their own timer instead.
+   *
+   * Rendered at full opacity and full brightness, which is a deliberate
+   * disagreement with the wall: a thumbnail answers "which layer is this", and
+   * a row faded to 10% or a master pulled down for a quiet passage would make
+   * every one of them an identical black rectangle. How much of a layer is
+   * getting through is what its slider and its dimmed row already say.
+   */
+  const thumbs = useRef(new Map<string, Rgb[]>());
+  const preview = useMemo<LayerPreview>(
+    () => ({ read: (id) => thumbs.current.get(id) ?? null }),
+    [],
+  );
+
+  useEffect(() => {
+    const next = new Map<string, Rgb[]>();
+    for (const l of config.layers) {
+      const full = l.opacity === 1 ? l : { ...l, opacity: 1 };
+      next.set(l.id, renderLayer(full, spectrumFor(l), THUMB_LEDS));
+    }
+    thumbs.current = next;
+  }, [config.layers, spectrumFor]);
+
   const enabled = config.layers.filter((l) => l.enabled && l.opacity > 0).length;
 
   return (
-    <Container size={1600} py="md">
-      <Stack gap="md">
-        <Group justify="space-between" align="center">
-          <Group gap="sm" align="baseline">
-            <Title order={1} size="h4" tt="uppercase" lts="0.12em">
-              DJLED
-            </Title>
-            <StatusBadge
-              status={status}
-              ledCount={ledCount}
-              layers={config.layers.length}
-              statuses={layerStatus}
-            />
-          </Group>
-          {/* Worth spelling out now that edits are saved as they are made:
-              this does not put an old show back, it replaces the live preset
-              with the default one. The other eleven are untouched. */}
-          <Tooltip label={`Replace ${presetName(activePreset, presets[activePreset])} with the default show`}>
-            <Button
-              variant="default"
-              onClick={() => {
-                clearConfig();
-                applyConfig(DEFAULT_CONFIG);
-              }}
-            >
-              Reset
-            </Button>
-          </Tooltip>
-        </Group>
+    /*
+     * One screen, no page scroll.
+     *
+     * The editor used to be a tall document: six panels down the left, the
+     * graph beside them, and the strip preview at the very bottom — so the
+     * picture of what the wall was doing, which is the only ground truth in
+     * the whole application, was the one thing you had to scroll to see. Here
+     * the header, the twelve shows and both preview strips are pinned, and the
+     * two columns under them scroll independently.
+     */
+    <Box
+      h="100dvh"
+      p="xs"
+      style={{ display: "flex", flexDirection: "column", gap: "var(--mantine-spacing-xs)" }}
+    >
+      <HeaderBar
+        status={status}
+        ledCount={ledCount}
+        layers={config.layers.length}
+        statuses={layerStatus}
+        brightness={brightness}
+        onBrightness={applyBrightness}
+        presetLabel={presetName(activePreset, presets[activePreset])}
+        onReset={resetShow}
+      />
 
-        {error && (
-          <Alert color="red" variant="light" title="Engine error">
-            {error}
-          </Alert>
-        )}
+      <PresetBar
+        presets={presets}
+        active={activePreset}
+        onSelect={selectPreset}
+        onRename={renamePreset}
+        connected={live}
+      />
 
-        <Flex gap="md" align="flex-start" direction={{ base: "column", md: "row" }}>
-          <Stack gap="md" w={{ base: "100%", md: 300 }} style={{ flexShrink: 0 }}>
-            <PresetPanel
-              presets={presets}
-              active={activePreset}
-              onSelect={selectPreset}
-              onRename={renamePreset}
-              connected={live}
+      <Paper p="xs">
+        <Stack gap={6}>
+          <StripPreview
+            label="Preview"
+            hint={[
+              `${ledCount} LEDs`,
+              `${enabled} of ${config.layers.length} layers`,
+            ].join(" · ")}
+            colors={previewStrip}
+            height={26}
+          />
+          {/* Kept mounted at zero content rather than unmounted while offline,
+              so connecting does not shove the graph down the page. */}
+          <StripPreview
+            label="Engine"
+            hint={
+              !engineStrip
+                ? "not connected"
+                : frame && frame.droppedFrames > 0
+                  ? `${frame.droppedFrames} dropped`
+                  : "live"
+            }
+            colors={engineStrip ?? []}
+            height={12}
+          />
+        </Stack>
+      </Paper>
+
+      {error && (
+        <Alert color="red" variant="light" title="Engine error" py={6}>
+          {error}
+        </Alert>
+      )}
+
+      <Box style={{ display: "flex", gap: "var(--mantine-spacing-xs)", flex: 1, minHeight: 0 }}>
+        <ScrollArea h="100%" w={SIDEBAR_W} style={{ flexShrink: 0 }} type="hover">
+          <Stack gap="xs" pr="xs">
+            <LayerStack
+              config={config}
+              onChange={applyConfig}
+              status={statusById}
+              preview={preview}
             />
-            <LayerStack config={config} onChange={applyConfig} status={statusById} />
-            <SourcePanel
+            <Inspector
               layer={layer}
               onChange={applyLayer}
               devices={devices}
               status={activeStatus}
               connected={live}
               onRefresh={refreshSources}
+              midi={midi}
             />
-            <SettingsPanel
-              layer={layer}
-              onChange={applyLayer}
-              brightness={brightness}
-              onBrightness={applyBrightness}
-              sampleRate={activeStatus?.sampleRate ?? 0}
-            />
-            <MidiPanel layer={layer} onChange={applyLayer} live={midi} />
-            <GizmoPanel config={config} onChange={applyConfig} />
           </Stack>
+        </ScrollArea>
 
-          <Paper flex={1} miw={0}>
-            <Stack gap="sm">
-              <Group justify="space-between" align="baseline">
-                <Text size="xs" c="dimmed" fw={700} tt="uppercase" lts="0.08em">
-                  {layer.name}
-                </Text>
-                <Text size="xs" c="dimmed">
-                  {layerSummary(layer, config.layers.length, enabled)}
-                </Text>
+        <ScrollArea h="100%" style={{ flex: 1, minWidth: 0 }} type="hover">
+          <Paper p="sm" mr="xs">
+            <Stack gap="xs">
+              <Group justify="space-between" align="center" gap="xs" wrap="nowrap">
+                <Group gap="xs" align="baseline" wrap="nowrap" style={{ minWidth: 0 }}>
+                  <Text size="xs" c="dimmed" fw={700} tt="uppercase" lts="0.08em" truncate>
+                    {layer.name}
+                  </Text>
+                  <Text size="xs" c="dimmed" truncate>
+                    {layerSummary(layer, config.layers.length, enabled)}
+                  </Text>
+                </Group>
+                <OverlayMenu config={config} onChange={applyConfig} />
               </Group>
               <SpectrumEditor
                 layer={layer}
@@ -387,35 +455,9 @@ export default function App() {
               </Text>
             </Stack>
           </Paper>
-        </Flex>
-
-        <Paper>
-          <Stack gap="md">
-            <StripPreview
-              label="Preview"
-              hint={[
-                `${ledCount} LEDs`,
-                `${enabled} of ${config.layers.length} layers`,
-                layer.mirror && "active layer mirrored",
-                layer.reverse && "active layer reversed",
-              ]
-                .filter(Boolean)
-                .join(" · ")}
-              colors={previewStrip}
-              height={30}
-            />
-            {engineStrip && (
-              <StripPreview
-                label="Engine"
-                hint={frame && frame.droppedFrames > 0 ? `${frame.droppedFrames} dropped` : "live"}
-                colors={engineStrip}
-                height={18}
-              />
-            )}
-          </Stack>
-        </Paper>
-      </Stack>
-    </Container>
+        </ScrollArea>
+      </Box>
+    </Box>
   );
 }
 
@@ -423,7 +465,7 @@ export default function App() {
  * What the plot is showing, and what it is not.
  *
  * Worth saying out loud because the plot only ever draws one layer while the
- * strip below draws all of them, and someone looking at a bar that does not
+ * strip above draws all of them, and someone looking at a bar that does not
  * match the wall should not have to work out why.
  */
 function layerSummary(layer: EditorLayer, total: number, enabled: number): string {
@@ -432,35 +474,6 @@ function layerSummary(layer: EditorLayer, total: number, enabled: number): strin
   if (total === 1) return "the only layer";
   const opacity = layer.opacity < 1 ? `${Math.round(layer.opacity * 100)}% opacity · ` : "";
   return `${opacity}one of ${enabled} showing`;
-}
-
-function StatusBadge({
-  status,
-  ledCount,
-  layers,
-  statuses,
-}: {
-  status: Status;
-  ledCount: number;
-  layers: number;
-  statuses: LayerStatus[];
-}) {
-  if (status === "connected") {
-    // One dead layer is not a dead engine, and burying it in a per-layer panel
-    // would let a stack run half-dark without anything saying so up here.
-    const failed = statuses.filter((s) => s.error).length;
-    if (failed > 0) {
-      return (
-        <Badge color="red">{`${failed} of ${statuses.length} layers have no source`}</Badge>
-      );
-    }
-    const kinds = new Set(statuses.map((s) => s.kind));
-    const label = kinds.size === 1 ? [...kinds][0] : `${kinds.size} kinds`;
-    const stack = layers === 1 ? "1 layer" : `${layers} layers`;
-    return <Badge color="teal">{`${stack} · ${label} · ${ledCount} LEDs`}</Badge>;
-  }
-  if (status === "connecting") return <Badge color="gray">connecting…</Badge>;
-  return <Badge color="yellow">offline — editing locally</Badge>;
 }
 
 const DEMO_BANDS = 48;

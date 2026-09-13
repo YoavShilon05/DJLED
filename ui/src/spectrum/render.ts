@@ -227,3 +227,30 @@ export function renderStack(
   }
   return out;
 }
+
+/**
+ * One layer on its own, over an unlit strip.
+ *
+ * The stack answers "what will the wall do"; this answers "what is *this* row
+ * contributing", which is the question the layer list is asking. It is the same
+ * coverage the fold above uses, composited onto black instead of onto the
+ * layers below — so a row whose sectors reach only the first fifty LEDs reads
+ * as fifty lit pixels and a hundred dark ones, rather than as a mystery.
+ *
+ * Deliberately not part of `renderStack`: the thumbnails are drawn at a
+ * fraction of the strip's length and a fraction of its rate, and folding that
+ * compromise into the fold the preview depends on would be the wrong trade.
+ */
+export function renderLayer(
+  layer: EditorLayer,
+  frame: SpectrumFrame,
+  ledCount: number,
+  masterBrightness = 1,
+): Rgb[] {
+  const coverage = layerCoverage(layer, frame, ledCount);
+  const out: Rgb[] = new Array(ledCount);
+  for (let i = 0; i < ledCount; i++) {
+    out[i] = masterBrightness <= 0 ? BLACK_RGB : linearRgbToDisplay(coverage[i], masterBrightness);
+  }
+  return out;
+}

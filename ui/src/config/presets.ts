@@ -39,20 +39,38 @@ export function presetName(slot: number, info?: PresetInfo): string {
   return info?.name?.trim() || `Preset ${slot + 1}`;
 }
 
+/** One slot, as the preset bar draws it. */
+export interface PresetSlot {
+  slot: number;
+  /** `F7` — just the key; the modifiers are said once, above the row. */
+  key: string;
+  name: string;
+  /**
+   * Whether anything has been authored into it.
+   *
+   * An empty slot is drawn quietly rather than hidden, and claimed empty only
+   * when the engine has said so: offline it has made no claim either way, and
+   * a row of twelve "empty" chips would be a lie about shows that exist.
+   */
+  stored: boolean;
+}
+
 /**
- * The dropdown's entries, always twelve of them.
+ * All twelve slots, always, in hotkey order.
  *
- * Always twelve, and always in hotkey order, because the list is also how
- * somebody learns which key reaches which show — hiding the empty ones would
- * renumber the rest against the keys that do not move.
+ * Always twelve and always in order, because the row is also how somebody
+ * learns which key reaches which show — hiding the empty ones would renumber
+ * the rest against keys that do not move, and the fourth chip would be
+ * ctrl+alt+F7.
  */
-export function presetOptions(presets: PresetInfo[]): Array<{ value: string; label: string }> {
+export function presetSlots(presets: PresetInfo[]): PresetSlot[] {
   return Array.from({ length: PRESET_SLOTS }, (_, slot) => {
     const info = presets[slot];
-    const name = presetName(slot, info);
     return {
-      value: String(slot),
-      label: `${keyLabel(slot)} · ${name}${info && !info.stored ? " — empty" : ""}`,
+      slot,
+      key: keyLabel(slot),
+      name: presetName(slot, info),
+      stored: info?.stored !== false,
     };
   });
 }

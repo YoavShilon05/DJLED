@@ -158,7 +158,14 @@ trip.
 - **"Frame hop" is not an FFT window length.** Bands each draw from one of five
   tiers (8192→128); the hop is how often those transforms run.
 - **The editor plot shows one layer; the strip preview shows the stack.** Judge
-  composite results on the preview, never on the graph.
+  composite results on the preview, never on the graph. Each row of the layer
+  list also carries a thumbnail of that layer alone — at full opacity and full
+  brightness, so it stays legible; it identifies a layer, it does not measure
+  one.
+- **The editor is one screen, not a document.** Header, the twelve shows and
+  both preview strips are pinned; the layer list, the inspector and the graph
+  scroll under them. Anything added to the pinned half costs the graph that
+  height on every screen the editor is ever opened on.
 - **Anything a frame re-renders re-renders thirty times a second.** The engine
   publishes at a fixed rate with no back pressure, so the editor coalesces
   frames onto an animation frame (`engine.ts`) and memoises every panel that is
@@ -166,14 +173,18 @@ trip.
   behind banks the backlog until it is killed for running out of memory, and
   without the second it falls behind. A prop built inline, or a callback that
   loses its `useCallback`, puts a whole Mantine panel back on the frame path.
+  The layer thumbnails are the exception that proves it: they read a ref on
+  their own timer rather than taking a prop, precisely so twelve rows do not
+  re-render to repaint twelve canvases.
 - **Gizmo checkboxes are visibility, not bypass.** A hidden EQ still shapes the
-  signal.
-- **There is no save button, and the preset dropdown is not a loader.** Selecting
-  a slot makes it live *and* makes it the thing being edited; every config the
-  editor sends goes straight into it. `Reset` therefore replaces the live preset
-  with the default show — it does not put an older one back.
-- **An empty preset slot behaves differently by dropdown and by hotkey.** The
-  dropdown opens a blank canvas, the hotkey declines. A mis-hit during a set must
+  signal. They live in the graph's own `Overlays` menu, not in the sidebar.
+- **There is no save button, and the preset bar is not a loader.** Selecting a
+  slot makes it live *and* makes it the thing being edited; every config the
+  editor sends goes straight into it. `Reset` — in the ⋯ menu, beside the
+  master brightness — therefore replaces the live preset with the default show;
+  it does not put an older one back.
+- **An empty preset slot behaves differently by the bar and by hotkey.** Clicking
+  the chip opens a blank canvas, the hotkey declines. A mis-hit during a set must
   not blank the wall. Pinned in `presets.rs` and `main.rs::load_preset`.
 - **`RegisterHotKey` refusals are normal and must stay visible.** Another
   application holding `ctrl+alt+F4` is not an error and cannot be fixed from

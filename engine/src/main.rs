@@ -372,7 +372,8 @@ fn apply_show(
 /// the wall alone.
 ///
 /// `blank_if_empty` is the one difference between the two ways in. Chosen from
-/// the editor's dropdown it is true — picking an empty slot from a list is a
+/// the editor's preset bar it is true — picking an empty slot from a row of
+/// them is a
 /// deliberate request for a blank canvas. Struck as a hotkey it is false, so a
 /// mis-hit during a set cannot blank the wall.
 fn load_preset(
@@ -577,8 +578,8 @@ fn run(
                             s.layers = layers;
                         });
                     }
-                    // The dropdown's half of the preset feature; the
-                    // keyboard's half is below, and both end up here.
+                    // The preset bar's half of the feature; the keyboard's
+                    // half is below, and both end up here.
                     Command::SelectPreset { slot } => {
                         if let Some(next) = load_preset(slot, true, presets, led_count) {
                             match apply_show(&next, stack, renderer, led_count, point_cap) {

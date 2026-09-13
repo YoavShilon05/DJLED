@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { PRESET_SLOTS, hotkeyLabel, keyLabel, presetName, presetOptions } from "./presets";
+import { PRESET_SLOTS, hotkeyLabel, keyLabel, presetName, presetSlots } from "./presets";
 import type { PresetInfo } from "../engine";
 
 const info = (name: string, stored: boolean): PresetInfo => ({ name, stored });
@@ -28,37 +28,39 @@ describe("preset labels", () => {
   });
 });
 
-describe("the dropdown", () => {
+describe("the preset bar", () => {
   /**
-   * Always twelve entries, in hotkey order.
+   * Always twelve chips, in hotkey order.
    *
-   * Hiding the empty slots would renumber the list against keys that do not
-   * move — the fourth row would be ctrl+alt+F7 — and the list is also how
+   * Hiding the empty slots would renumber the row against keys that do not
+   * move — the fourth chip would be ctrl+alt+F7 — and the row is also how
    * somebody learns which key reaches which show.
    */
   it("lists every slot in hotkey order, however few are used", () => {
-    const options = presetOptions([info("Warm", true)]);
-    expect(options).toHaveLength(PRESET_SLOTS);
-    expect(options[0].value).toBe("0");
-    expect(options[11].value).toBe("11");
-    expect(options[0].label).toBe("F1 · Warm");
+    const slots = presetSlots([info("Warm", true)]);
+    expect(slots).toHaveLength(PRESET_SLOTS);
+    expect(slots.map((s) => s.slot)).toEqual([...Array(PRESET_SLOTS).keys()]);
+    expect(slots[0].key).toBe("F1");
+    expect(slots[11].key).toBe("F12");
+    expect(slots[0].name).toBe("Warm");
   });
 
   it("says which slots have nothing in them", () => {
-    const options = presetOptions([info("Warm", true), info("Preset 2", false)]);
-    expect(options[0].label).toBe("F1 · Warm");
-    expect(options[1].label).toBe("F2 · Preset 2 — empty");
+    const slots = presetSlots([info("Warm", true), info("Preset 2", false)]);
+    expect(slots[0].stored).toBe(true);
+    expect(slots[1].stored).toBe(false);
   });
 
   /**
-   * Offline the engine has told the editor nothing, and a dropdown of twelve
-   * blanks is worse than one that counts. "Empty" is a claim about the engine's
-   * store, so it is not made when there is no engine to have made it.
+   * Offline the engine has told the editor nothing, and a row of twelve blanks
+   * is worse than one that counts. "Empty" is a claim about the engine's store,
+   * so it is not made when there is no engine to have made it.
    */
   it("counts rather than blanks while the engine is away", () => {
-    const options = presetOptions([]);
-    expect(options).toHaveLength(PRESET_SLOTS);
-    expect(options[0].label).toBe("F1 · Preset 1");
-    expect(options[11].label).toBe("F12 · Preset 12");
+    const slots = presetSlots([]);
+    expect(slots).toHaveLength(PRESET_SLOTS);
+    expect(slots[0].name).toBe("Preset 1");
+    expect(slots[11].name).toBe("Preset 12");
+    expect(slots.every((s) => s.stored)).toBe(true);
   });
 });

@@ -82,15 +82,15 @@ not a shortcut for that, so the keys are registered with Windows itself
 
 That inverts the usual direction. Everywhere else the editor authors and pushes
 down; here the engine is authoritative and the editor adopts what it is serving.
-The editor's dropdown selects which slot is live, and *that is also which slot is
-being edited* — there is no save button, because every config the editor sends
+The editor's preset bar selects which slot is live, and *that is also which slot
+is being edited* — there is no save button, because every config the editor sends
 lands in the live slot as it is sent. Writes are coalesced to at most one every
 750 ms, so dragging a keyframe is one file write rather than sixty.
 
 The one asymmetry worth knowing:
 
-- Chosen in the **dropdown**, an empty slot opens the default show. Picking an
-  empty row from a list is a deliberate request for a blank canvas.
+- Chosen in the **preset bar**, an empty slot opens the default show. Picking an
+  empty chip out of a row of twelve is a deliberate request for a blank canvas.
 - Struck as a **hotkey**, an empty slot does nothing. A mis-hit during a set must
   not blank the wall.
 

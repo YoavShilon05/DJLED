@@ -155,7 +155,7 @@ mod imp {
 /// The rest of the engine has Windows assumptions it does not gate, but those
 /// fail at *run* time on a device that is not there. This one would fail at
 /// compile time and take the build with it, so it is the one that is gated —
-/// presets still work from the dropdown, which is all this changes.
+/// presets still work from the preset bar, which is all this changes.
 #[cfg(not(windows))]
 mod imp {
     use std::sync::mpsc::Sender;

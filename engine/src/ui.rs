@@ -102,7 +102,7 @@ pub enum Command {
     /// subsequent [`Command::Config`] into it.
     ///
     /// The same operation the global hotkey performs, and it lands in the same
-    /// place — the dropdown and `ctrl+alt+F<n>` are two ways in to one thing,
+    /// place — the preset bar and `ctrl+alt+F<n>` are two ways in to one thing,
     /// which is what keeps the editor showing what the wall is doing when
     /// somebody reaches for the keyboard instead.
     ///
@@ -111,7 +111,7 @@ pub enum Command {
     /// because picking it from a list is a deliberate request for a blank
     /// canvas. The hotkey declines — see [`crate::presets`].
     SelectPreset { slot: usize },
-    /// Rename a slot. Names are for the dropdown alone and are never
+    /// Rename a slot. Names are for the preset bar alone and are never
     /// interpreted; a blank one falls back to the positional `Preset N`.
     RenamePreset { slot: usize, name: String },
 }

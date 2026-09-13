@@ -38,12 +38,16 @@ import {
   type EditorLayer,
 } from "../config/editor";
 import type { LayerStatus } from "../engine";
+import { LayerThumb, type LayerPreview } from "./LayerThumb";
+import { PanelHeading } from "./PanelHeading";
 
 interface Props {
   config: EditorConfig;
   onChange: (config: EditorConfig) => void;
   /** What each layer resolved to, keyed by id. Empty while offline. */
   status: Map<string, LayerStatus>;
+  /** Each row's own strip, pulled rather than passed. See `LayerThumb`. */
+  preview: LayerPreview;
 }
 
 /**
@@ -56,12 +60,14 @@ interface Props {
  * anyone reaching for this expects.
  *
  * Dragging reorders. Everything else in the editor edits whichever row is
- * selected, so this is also the navigation for the whole panel.
+ * selected, so this is also the navigation for the whole panel — which is why
+ * each row carries a live picture of what that layer alone is putting on the
+ * wall. A name and a device name is not enough to pick the blue one out of six.
  *
  * Memoised: nothing in here is driven by a frame, and a frame arrives thirty
  * times a second. See the note on `frame` in `App.tsx`.
  */
-export const LayerStack = memo(function LayerStack({ config, onChange, status }: Props) {
+export const LayerStack = memo(function LayerStack({ config, onChange, status, preview }: Props) {
   const sensors = useSensors(
     // A small distance before a drag starts, so clicking a row to select it,
     // or grabbing its opacity slider, is not read as the beginning of a drag.
@@ -149,21 +155,17 @@ export const LayerStack = memo(function LayerStack({ config, onChange, status }:
   );
 
   return (
-    <Paper>
-      <Stack gap="sm">
-        <Group justify="space-between" align="center">
-          <Text size="xs" c="dimmed" fw={700} tt="uppercase" lts="0.08em">
-            Layers
-          </Text>
-          <Text size="xs" c="dimmed">
-            {config.layers.length} of {MAX_LAYERS}
-          </Text>
-        </Group>
-
-        <Text size="xs" c="dimmed" lh={1.35}>
-          Top of the list paints over the rest. Drag to reorder; opacity blends with what is
-          below, and black covers it.
-        </Text>
+    <Paper p="sm">
+      <Stack gap="xs">
+        <PanelHeading
+          title="Layers"
+          info="Top of the list paints over the rest. Drag the handle to reorder, click a row to edit it, double-click its name to rename it. Opacity blends a layer with what is below it, and black covers rather than fades. The strip under each name is what that layer alone is putting on the wall — at full opacity, so it stays legible however far the slider is pulled down."
+          right={
+            <Text size="xs" c="dimmed" ff="monospace">
+              {config.layers.length}/{MAX_LAYERS}
+            </Text>
+          }
+        />
 
         <DndContext
           sensors={sensors}
@@ -171,16 +173,14 @@ export const LayerStack = memo(function LayerStack({ config, onChange, status }:
           modifiers={[restrictToVerticalAxis, restrictToParentElement]}
           onDragEnd={onDragEnd}
         >
-          <SortableContext
-            items={rows.map((l) => l.id)}
-            strategy={verticalListSortingStrategy}
-          >
-            <Stack gap={6}>
+          <SortableContext items={rows.map((l) => l.id)} strategy={verticalListSortingStrategy}>
+            <Stack gap={4}>
               {rows.map((layer) => (
                 <LayerRow
                   key={layer.id}
                   layer={layer}
                   status={status.get(layer.id) ?? null}
+                  preview={preview}
                   selected={layer.id === config.activeLayerId}
                   canRemove={config.layers.length > 1}
                   canDuplicate={config.layers.length < MAX_LAYERS}
@@ -210,6 +210,7 @@ export const LayerStack = memo(function LayerStack({ config, onChange, status }:
 interface RowProps {
   layer: EditorLayer;
   status: LayerStatus | null;
+  preview: LayerPreview;
   selected: boolean;
   canRemove: boolean;
   canDuplicate: boolean;
@@ -222,6 +223,7 @@ interface RowProps {
 function LayerRow({
   layer,
   status,
+  preview,
   selected,
   canRemove,
   canDuplicate,
@@ -240,8 +242,9 @@ function LayerRow({
   return (
     <Paper
       ref={setNodeRef}
-      p="xs"
+      p={6}
       withBorder
+      bg={selected ? "dark.6" : undefined}
       onPointerDown={onSelect}
       style={{
         transform: CSS.Transform.toString(transform),
@@ -255,8 +258,8 @@ function LayerRow({
         cursor: "pointer",
       }}
     >
-      <Stack gap={6}>
-        <Group gap={6} wrap="nowrap" align="center">
+      <Stack gap={5}>
+        <Group gap={4} wrap="nowrap" align="center">
           {/*
             The handle is its own target rather than the whole row: the row also
             selects, renames and carries a slider, and a drag that starts
@@ -299,6 +302,9 @@ function LayerRow({
               style={{ flex: 1, minWidth: 0 }}
             />
           ) : (
+            // No tooltip on the name: a row is four controls inside 70 pixels,
+            // and a hover bubble here lands squarely on the opacity slider of
+            // the row below it. Double-click to rename is in the panel's note.
             <Text
               size="sm"
               fw={selected ? 600 : 400}
@@ -315,6 +321,20 @@ function LayerRow({
               {layer.name}
             </Text>
           )}
+
+          {/* The full description is a sentence long and there can be twelve of
+              these. Which kind it is earns a permanent line; the rest of it is
+              worth a hover. */}
+          <Tooltip label={describe(layer, status)} openDelay={300} multiline w={260}>
+            <Badge
+              size="xs"
+              variant="light"
+              color={status?.error ? "red" : status ? "teal" : "gray"}
+              style={{ cursor: "help" }}
+            >
+              {status?.error ? "no source" : (status?.kind ?? layer.source.kind)}
+            </Badge>
+          </Tooltip>
 
           <Tooltip label="Duplicate">
             <ActionIcon
@@ -347,10 +367,14 @@ function LayerRow({
           </Tooltip>
         </Group>
 
+        {/* Dimmed rather than removed when the layer is off: a hidden layer
+            still has a look, and seeing it is how anyone decides whether to
+            bring it back. */}
+        <Box opacity={dim ? 0.3 : 1}>
+          <LayerThumb id={layer.id} preview={preview} />
+        </Box>
+
         <Group gap={8} wrap="nowrap" align="center">
-          <Text size="xs" c="dimmed" w={30} ff="monospace">
-            {Math.round(layer.opacity * 100)}%
-          </Text>
           <Slider
             flex={1}
             size="xs"
@@ -365,22 +389,8 @@ function LayerRow({
             style={{ touchAction: "none" }}
             onPointerDown={(e) => e.stopPropagation()}
           />
-        </Group>
-
-        <Group gap={6} wrap="nowrap">
-          <Badge
-            size="xs"
-            variant="light"
-            color={status?.error ? "red" : status ? "teal" : "gray"}
-          >
-            {status?.kind ?? layer.source.kind}
-          </Badge>
-          <Text
-            size="xs"
-            c={status?.error ? "red" : "dimmed"}
-            style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-          >
-            {describe(layer, status)}
+          <Text size="xs" c="dimmed" w={30} ta="right" ff="monospace">
+            {Math.round(layer.opacity * 100)}%
           </Text>
         </Group>
       </Stack>

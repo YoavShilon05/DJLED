@@ -8,7 +8,7 @@ import {
   type EditorLayer,
 } from "../config/editor";
 import { DB_MAX, DB_MIN } from "../config/scales";
-import { renderStack } from "./render";
+import { renderLayer, renderStack } from "./render";
 import type { SpectrumFrame } from "./paint";
 
 const LEDS = 150;
@@ -180,4 +180,37 @@ describe("the layer stack", () => {
       true,
     );
   });
+});
+
+describe("a layer on its own", () => {
+  /**
+   * The thumbnail beside each row and the preview strip above have to agree
+   * about what one layer looks like, or the list is pointing at the wrong row.
+   *
+   * They agree by construction — both fold the same `layerCoverage` — and this
+   * is what pins that they still do: an opaque layer over an unlit strip is
+   * the whole stack, so the two renders are the same bytes, not merely similar
+   * ones.
+   */
+  it("renders the same bytes a one-layer stack does", () => {
+    const only = flat("#ff2000");
+    expect(renderLayer(only, LOUD, LEDS)).toEqual(render(show(only)));
+  });
+
+  /**
+   * The thumbnails are drawn at a fraction of the strip's length, so the fold
+   * has to survive being asked for a different number of LEDs — a sector
+   * authored in LED indices is the part most able to fall over here.
+   */
+  it("answers at whatever length it is asked for", () => {
+    expect(renderLayer(flat("#40ff60"), LOUD, 48)).toHaveLength(48);
+  });
+
+  /** Master brightness scales light, so zero is a black strip rather than a
+   *  transparent one — an unlit LED, which is what the picture is of. */
+  it("goes black at zero brightness", () => {
+    const dark = renderLayer(flat("#40ff60"), LOUD, LEDS, 0);
+    expect(dark.every(([r, g, b]) => r === 0 && g === 0 && b === 0)).toBe(true);
+  });
+
 });

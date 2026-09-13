@@ -1,5 +1,5 @@
 import { memo } from "react";
-import { Checkbox, Paper, RangeSlider, Slider, Stack, Text } from "@mantine/core";
+import { Checkbox, RangeSlider, Slider, Stack, Text } from "@mantine/core";
 
 import type { EditorLayer } from "../config/editor";
 import {
@@ -44,70 +44,61 @@ export const MidiPanel = memo(function MidiPanel({ layer, onChange, live }: Prop
     onChange({ ...layer, midi: { ...midi, lowNote, highNote } });
 
   return (
-    <Paper>
-      <Stack gap="md">
-        <Text size="xs" c="dimmed" fw={700} tt="uppercase" lts="0.08em">
-          MIDI · {layer.name}
+    <Stack gap="md">
+      {!live && (
+        <Text size="xs" c="dimmed" lh={1.35}>
+          Saved with the layer, but nothing here changes the strip until a MIDI port is its
+          source.
         </Text>
+      )}
 
-        {!live && (
-          <Text size="xs" c="dimmed" lh={1.35}>
-            Nothing here changes the strip until a MIDI port is this layer's source.
-          </Text>
-        )}
+      <Field
+        label="Note range"
+        value={`${noteName(low)} – ${noteName(high)}`}
+        hint={`${octaves.toFixed(1)} octaves end to end, ${high - low + 1} keys.`}
+        info="Stretched across the whole strip, so this magnifies rather than crops: narrowing it gives each remaining note more wall, it does not hide the rest of it. Notes outside the range are dropped."
+      >
+        <RangeSlider
+          min={MIN_NOTE}
+          max={MAX_NOTE}
+          step={1}
+          minRange={MIN_NOTE_SPAN}
+          value={[low, high]}
+          onChange={setRange}
+          label={(v) => `${noteName(v)} · ${noteHz(v).toFixed(0)} Hz`}
+        />
+      </Field>
 
-        <Field
-          label="Note range"
-          value={`${noteName(low)} – ${noteName(high)}`}
-          hint={`Stretched across the whole strip, so this magnifies rather than crops: ${octaves.toFixed(
-            1,
-          )} octaves end to end, ${(high - low + 1)} keys. Notes outside it are dropped.`}
-        >
-          <RangeSlider
-            min={MIN_NOTE}
-            max={MAX_NOTE}
-            step={1}
-            minRange={MIN_NOTE_SPAN}
-            value={[low, high]}
-            onChange={setRange}
-            label={(v) => `${noteName(v)} · ${noteHz(v).toFixed(0)} Hz`}
-          />
-        </Field>
+      <Field
+        label="Note glow"
+        value={midi.spread === 0 ? "off" : `${midi.spread.toFixed(1)} st`}
+        hint={midi.spread === 0 ? "One hard bar per note." : "Notes bleed into their neighbours."}
+        info="How far a note spreads, in semitones. Wide enough and a chord reads as one block rather than as its notes."
+      >
+        <Slider
+          min={0}
+          max={6}
+          step={0.1}
+          value={midi.spread}
+          onChange={(spread) => onChange({ ...layer, midi: { ...midi, spread } })}
+          label={(v) => (v === 0 ? "off" : `${v.toFixed(1)} st`)}
+        />
+      </Field>
 
-        <Field
-          label="Note glow"
-          value={midi.spread === 0 ? "off" : `${midi.spread.toFixed(1)} st`}
-          hint={
-            midi.spread === 0
-              ? "One hard bar per note."
-              : "How far a note bleeds into its neighbours. Wide enough and a chord reads as one block rather than as its notes."
+      <Stack gap={4}>
+        <Checkbox
+          label="Sustain pedal"
+          checked={midi.sustain}
+          onChange={(e) =>
+            onChange({ ...layer, midi: { ...midi, sustain: e.currentTarget.checked } })
           }
-        >
-          <Slider
-            min={0}
-            max={6}
-            step={0.1}
-            value={midi.spread}
-            onChange={(spread) => onChange({ ...layer, midi: { ...midi, spread } })}
-            label={(v) => (v === 0 ? "off" : `${v.toFixed(1)} st`)}
-          />
-        </Field>
-
-        <Stack gap="xs">
-          <Checkbox
-            label="Sustain pedal"
-            checked={midi.sustain}
-            onChange={(e) =>
-              onChange({ ...layer, midi: { ...midi, sustain: e.currentTarget.checked } })
-            }
-          />
-          <Text size="xs" c="dimmed" lh={1.35}>
-            {midi.sustain
-              ? "CC64 holds released notes lit, as it holds them sounding."
-              : "CC64 ignored — notes go out when the key does."}
-          </Text>
-        </Stack>
+        />
+        <Text size="xs" c="dimmed" lh={1.35}>
+          {midi.sustain
+            ? "CC64 holds released notes lit, as it holds them sounding."
+            : "CC64 ignored — notes go out when the key does."}
+        </Text>
       </Stack>
-    </Paper>
+    </Stack>
   );
 });

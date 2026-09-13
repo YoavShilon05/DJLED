@@ -1,14 +1,14 @@
 /**
  * End-to-end check of the preset store over the real wire.
  *
- * Connects to a running engine and exercises the path the dropdown takes:
+ * Connects to a running engine and exercises the path the preset bar takes:
  * edit, switch, edit, switch back, and confirm the first show came back. The
  * seam this crosses is the one no unit test can — a `ShowConfig` out of the
  * editor, into a slot on disk, and back out as the show the engine is running.
  *
  * The hotkeys are the half that cannot be checked from here: they are
  * registered with Windows, so pressing them is the test. What this does check
- * is that the switch they trigger behaves — they and the dropdown take the
+ * is that the switch they trigger behaves — they and the preset bar take the
  * same path through the engine.
  *
  *   cargo run --manifest-path engine/Cargo.toml --release

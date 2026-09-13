@@ -31,7 +31,7 @@
 //! A slot nothing has been authored into is *not* the same as a slot holding
 //! the default show, and the difference is only visible at the two ways in:
 //!
-//! - Chosen in the dropdown, it opens the default show — a blank canvas, which
+//! - Chosen in the preset bar, it opens the default show — a blank canvas, which
 //!   is what someone deliberately picking an empty slot is asking for.
 //! - Struck as a hotkey, it does nothing. A mis-hit during a set must not blank
 //!   the wall, and a slot with nothing in it has nothing to show.
@@ -73,7 +73,8 @@ struct Slot {
     show: Option<ShowConfig>,
 }
 
-/// What the editor is told about a slot: enough to label a dropdown entry, and
+/// What the editor is told about a slot: enough to label one chip of the
+/// preset bar, and
 /// nothing else. The shows themselves are far too big to send twelve of every
 /// time a device is rescanned.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -170,7 +171,7 @@ impl Presets {
         self.error.as_deref()
     }
 
-    /// What the editor needs to draw its dropdown.
+    /// What the editor needs to draw its preset bar.
     pub fn info(&self) -> Vec<PresetInfo> {
         self.slots
             .iter()
@@ -192,7 +193,7 @@ impl Presets {
     /// Make `slot` live, and say what should now be on the wall.
     ///
     /// The slot being left is flushed first, so the switch cannot lose it. An
-    /// empty slot yields `None` and the caller decides — the dropdown opens a
+    /// empty slot yields `None` and the caller decides — the bar opens a
     /// blank canvas, the hotkey declines.
     pub fn select(&mut self, slot: usize) -> Option<&ShowConfig> {
         if slot < SLOTS && slot != self.active {
@@ -209,7 +210,7 @@ impl Presets {
     ///
     /// Returns whether the slot's *listing* changed — which happens exactly
     /// once per slot, when the first show lands in it and it stops reading as
-    /// empty. The caller uses that to push a new dropdown to the editor without
+    /// empty. The caller uses that to push a new listing to the editor without
     /// pushing one on every pointer move.
     pub fn store(&mut self, show: &ShowConfig) -> bool {
         let Some(slot) = self.slots.get_mut(self.active) else { return false };
@@ -232,7 +233,7 @@ impl Presets {
     }
 
     /// Rename a slot. Blank falls back to the positional name rather than
-    /// leaving an unlabelled row in the dropdown.
+    /// leaving an unlabelled chip in the preset bar.
     pub fn rename(&mut self, slot: usize, name: &str) {
         let Some(target) = self.slots.get_mut(slot) else { return };
         let name = name.trim();
