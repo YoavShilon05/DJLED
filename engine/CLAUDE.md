@@ -79,6 +79,11 @@ the primary documentation and are usually more current than any summary here.
   asymmetry is the whole pooling scheme: a WASAPI endpoint's channel is chosen
   when the stream is built (two channels really are two streams), a MIDI channel
   is a per-layer filter (Windows won't open the port twice).
+- **Never have bytes in flight while the board is deaf.** One READY buys exactly
+  one frame, and `Readiness` in `link/serial.rs` expires it after the sketch's
+  own 25 ms listening window. That single-token discipline is what keeps the
+  write path from queueing: the moment the PC can get ahead, the strip runs
+  seconds late and the sketch resynchronises on garbage.
 - **A device that won't open is not fatal.** The layer keeps its place, sits at
   silence, and carries the reason in `LayerStatus`. `ListSources` retries them,
   because a rescan is exactly what someone does after plugging the interface
@@ -115,7 +120,7 @@ the primary documentation and are usually more current than any summary here.
 
 ## Tests
 
-255 total: 210 unit (in-module `#[cfg(test)]`) + 45 integration.
+263 total: 217 unit (in-module `#[cfg(test)]`) + 46 integration.
 
 | File | What it defends |
 |---|---|

@@ -40,7 +40,7 @@ cargo run --manifest-path engine/Cargo.toml --release -- --port COM3
 cd ui && npm install && npm run dev
 
 # Tests
-cargo test --manifest-path engine/Cargo.toml        # 259 pass (213 lib + 46 integration)
+cargo test --manifest-path engine/Cargo.toml        # 263 pass (217 lib + 46 integration)
 cd ui && npm test                                   # 65 pass across 8 files
 cd ui && npm run typecheck                          # tsc --noEmit, clean
 
@@ -137,6 +137,16 @@ trip.
   silence* while every PC-side display keeps working — which looks exactly like
   broken hardware. A full 88-key MIDI range is resampled on the way out, and the
   engine says so at startup.
+- **READY is one invitation, not a credit.** The board announces it can receive,
+  listens for 25 ms, then writes the strip with the UART deaf. So there is never
+  more than one outstanding and an old one is worthless: `link/serial.rs` keeps
+  a single timestamped token, and a stale input queue is binned rather than
+  decoded. Banking them instead let a silent stretch — nothing to send, so
+  nothing reading the port either — accumulate hundreds, which were then spent
+  in a burst that desynced the sketch's reader with no gap to recover in. The
+  wall fell to about a frame a second, seconds behind the music, while the
+  terminal preview and the editor stayed perfect, because neither crosses the
+  wire.
 - **A MIDI input opens once, per process.** Windows hands a port to one
   application at a time. Two layers on two channels of one keyboard share the
   handle and filter per layer (`Layer::feed_key` drops the channel for MIDI,

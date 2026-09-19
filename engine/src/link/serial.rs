@@ -25,6 +25,23 @@ const RESET_GRACE: Duration = Duration::from_secs(4);
 /// than the worst strip write (18 ms at 600 LEDs) plus transfer.
 const READY_TIMEOUT: Duration = Duration::from_millis(120);
 
+/// How long a READY is worth acting on.
+///
+/// The sketch announces itself and then listens for `FRAME_TIMEOUT_MS` (25 ms
+/// in `firmware/djled/djled.ino`) before going back round its loop to write the
+/// strip with interrupts off. Past that window the board is deaf, so a frame
+/// sent on the strength of an older token is a frame torn in half.
+const READY_LIFETIME: Duration = Duration::from_millis(25);
+
+/// A backlog this big is not a conversation. READY is one byte and the only
+/// other thing the board ever sends is a ten-byte HELLO, so hundreds of queued
+/// bytes mean nothing has read this port for a long while — see [`Readiness`].
+const STALE_INPUT: usize = 256;
+
+/// Cap on reads per drain, so a board that talks faster than we read cannot
+/// hold the loop. 16 × 512 bytes is far more than a sane board produces.
+const MAX_DRAIN_READS: usize = 16;
+
 pub struct SerialLink {
     port: Box<dyn SerialPort>,
     decoder: Decoder,
@@ -33,9 +50,47 @@ pub struct SerialLink {
     baud: u32,
     scratch: Vec<u8>,
     read_buf: [u8; 512],
-    /// READY tokens received but not yet spent. The MCU can signal readiness
-    /// while we are still computing, and dropping those would halve throughput.
-    credits: u32,
+    ready: Readiness,
+}
+
+/// The board's readiness: one invitation with a shelf life, not a quantity.
+///
+/// READY means *send one frame now*. The firmware writes it, listens for
+/// `FRAME_TIMEOUT_MS`, then goes round its loop — strip write with interrupts
+/// off, UART deaf — and announces again. There is never more than one
+/// invitation outstanding, and an old one is worth nothing.
+///
+/// This used to be a counter, and counting is what broke long sessions. Any
+/// stretch where the PC sends slower than the board asks banks tokens: a silent
+/// loopback sends no frames at all and nothing reads the port for as long as
+/// the silence lasts. The bank was then spent all at once, streaming frames
+/// into a board that is deaf for 4.5 ms out of every 7. Bytes lost during each
+/// strip write leave the sketch's reader mid-frame, and because the stream
+/// never stops there is no gap to resynchronise in — so the wall drops to about
+/// a frame a second and runs seconds behind the music while the terminal
+/// preview and the editor, which never cross the wire, stay perfectly correct.
+#[derive(Default)]
+struct Readiness(Option<Instant>);
+
+impl Readiness {
+    /// Record a READY. It *supersedes* any outstanding one rather than adding
+    /// to it, which is what bounds us to a single frame in flight.
+    fn offered(&mut self) {
+        self.0 = Some(Instant::now());
+    }
+
+    /// Spend the invitation if it is still live. An expired one is discarded —
+    /// the board has moved on and the next announcement is a board loop away.
+    fn take(&mut self) -> bool {
+        match self.0.take() {
+            Some(at) => at.elapsed() < READY_LIFETIME,
+            None => false,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.0 = None;
+    }
 }
 
 impl SerialLink {
@@ -58,7 +113,7 @@ impl SerialLink {
             baud,
             scratch: Vec::with_capacity(protocol::MAX_PAYLOAD + protocol::OVERHEAD),
             read_buf: [0; 512],
-            credits: 0,
+            ready: Readiness::default(),
         };
 
         link.hello = link.handshake()?;
@@ -99,14 +154,8 @@ impl SerialLink {
                 last_probe = Instant::now();
             }
 
-            self.pump()?;
-            while let Some(event) = self.decoder.next_event() {
-                match event {
-                    Event::Hello(h) => return Ok(h),
-                    // Expected while the sketch is already running and looping.
-                    Event::Ready => self.credits += 1,
-                    Event::BadCrc | Event::Unknown(_) => {}
-                }
+            if self.drain()? {
+                return Ok(self.hello);
             }
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -134,36 +183,69 @@ impl SerialLink {
         }
     }
 
-    /// Consume one READY credit, waiting for one if none is banked.
-    fn await_ready(&mut self, timeout: Duration) -> Result<bool> {
-        if self.credits > 0 {
-            self.credits -= 1;
-            return Ok(true);
+    /// Fold everything the decoder has into state. Reports whether a HELLO
+    /// arrived, which is the one event a caller has to react to.
+    fn consume_events(&mut self) -> bool {
+        let mut hello = false;
+        while let Some(event) = self.decoder.next_event() {
+            match event {
+                Event::Ready => self.ready.offered(),
+                Event::Hello(h) => {
+                    self.hello = h;
+                    hello = true;
+                }
+                Event::BadCrc | Event::Unknown(_) => {}
+            }
+        }
+        hello
+    }
+
+    /// Read the port empty, not merely once.
+    ///
+    /// Draining to the end is what keeps READY meaningful: only the newest one
+    /// describes the board *now*, and stopping at one bufferful would leave
+    /// older bytes to be mistaken for it on the next pass.
+    fn drain(&mut self) -> Result<bool> {
+        // Nothing reads this port while the source is silent — the loop never
+        // reaches `send` — so the driver's input queue can be holding minutes
+        // of readiness by the time audio comes back. Decoding that pile is
+        // pointless and treating the end of it as fresh is wrong, so it goes in
+        // the bin and we wait for the next announcement, one board loop away.
+        if self.port.bytes_to_read().unwrap_or(0) as usize > STALE_INPUT {
+            let _ = self.port.clear(serialport::ClearBuffer::Input);
+            self.decoder.clear();
+            self.ready.clear();
+            return Ok(false);
         }
 
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
+        let mut hello = false;
+        for _ in 0..MAX_DRAIN_READS {
             self.pump()?;
-            let mut got = false;
-            while let Some(event) = self.decoder.next_event() {
-                match event {
-                    Event::Ready => {
-                        if got {
-                            self.credits += 1;
-                        } else {
-                            got = true;
-                        }
-                    }
-                    Event::Hello(h) => self.hello = h,
-                    Event::BadCrc | Event::Unknown(_) => {}
-                }
+            hello |= self.consume_events();
+            if self.port.bytes_to_read().unwrap_or(0) == 0 {
+                break;
             }
-            if got {
+        }
+        Ok(hello)
+    }
+
+    /// Wait for the board to say it can receive, and spend that invitation.
+    ///
+    /// Returns false on timeout, which the caller counts as a dropped frame.
+    /// Dropping is the right answer: the alternative is writing into a deaf
+    /// UART, which costs the next frame as well as this one.
+    fn await_ready(&mut self, timeout: Duration) -> Result<bool> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.drain()?;
+            if self.ready.take() {
                 return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
             }
             std::thread::sleep(Duration::from_micros(200));
         }
-        Ok(false)
     }
 
     fn write_frame(&mut self) -> Result<()> {
@@ -213,5 +295,43 @@ impl Link for SerialLink {
         self.await_ready(READY_TIMEOUT)?;
         protocol::encode_blackout(&mut self.scratch);
         self.write_frame()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_invitation_is_spent_once() {
+        let mut ready = Readiness::default();
+        ready.offered();
+        assert!(ready.take());
+        assert!(!ready.take(), "the same READY was spent twice");
+    }
+
+    /// The regression this file exists for: a board that announces itself all
+    /// through a silent stretch must not leave a bank of frames to be fired off
+    /// the moment the music comes back. One READY on the wire is one frame.
+    #[test]
+    fn readiness_does_not_bank_up_while_nobody_is_sending() {
+        let mut ready = Readiness::default();
+        for _ in 0..500 {
+            ready.offered();
+        }
+        assert!(ready.take(), "the most recent invitation still stands");
+        assert!(!ready.take(), "the other 499 were banked");
+    }
+
+    #[test]
+    fn an_invitation_older_than_the_boards_listening_window_is_not_spent() {
+        let mut ready = Readiness(Some(Instant::now() - READY_LIFETIME - Duration::from_millis(1)));
+        assert!(!ready.take(), "the board stopped listening 25 ms after it asked");
+        assert!(!ready.take(), "and the expired token was not left behind");
+    }
+
+    #[test]
+    fn nothing_is_spendable_before_the_board_speaks() {
+        assert!(!Readiness::default().take());
     }
 }
