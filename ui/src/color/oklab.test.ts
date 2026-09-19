@@ -21,6 +21,7 @@ import {
   oklabToLinearRgb,
   over,
   srgbToLinear,
+  tint,
   type LinearRgb,
 } from "./oklab";
 
@@ -111,5 +112,47 @@ describe("colour conversion", () => {
       expect(linearRgbToOklab(rgb).alpha).toBe(alpha);
       expect(oklabToLinearRgb(linearRgbToOklab(rgb)).alpha).toBe(alpha);
     }
+  });
+});
+
+describe("tint", () => {
+  const field = hexToOklab("#ff2000");
+  const channel = hexToOklab("#0040ff");
+
+  /**
+   * The two ends of the opacity slider, which are the two claims a channel
+   * colour makes: at full it *is* the colour, at none it was never there.
+   */
+  it("replaces the colour at full opacity and does nothing at none", () => {
+    expect(tint(field, { ...channel, alpha: 1 })).toEqual({ ...channel, alpha: field.alpha });
+    expect(tint(field, { ...channel, alpha: 0 })).toEqual(field);
+  });
+
+  /** Halfway is the Oklab midpoint — not a midpoint in RGB, and not a
+   *  composite. */
+  it("mixes in Oklab, linearly in the overlay's opacity", () => {
+    const mid = tint(field, { ...channel, alpha: 0.5 });
+    expect(close(mid.l, (field.l + channel.l) / 2)).toBe(true);
+    expect(close(mid.a, (field.a + channel.a) / 2)).toBe(true);
+    expect(close(mid.b, (field.b + channel.b) / 2)).toBe(true);
+  });
+
+  /**
+   * Opacity here is how much of the colour to take, never coverage. The base
+   * keeps its own alpha whatever the overlay's is, which is what stops a
+   * palette from changing what the layers underneath contribute.
+   */
+  it("keeps the base's alpha, whatever the overlay's", () => {
+    const faded = { ...field, alpha: 0.25 };
+    for (const alpha of [0, 0.5, 1]) {
+      expect(tint(faded, { ...channel, alpha }).alpha).toBe(0.25);
+    }
+  });
+
+  /** A hostile alpha is clamped rather than extrapolated past the two
+   *  colours. */
+  it("clamps an out-of-range opacity", () => {
+    expect(tint(field, { ...channel, alpha: 2 })).toEqual({ ...channel, alpha: field.alpha });
+    expect(tint(field, { ...channel, alpha: -1 })).toEqual(field);
   });
 });

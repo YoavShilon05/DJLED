@@ -13,7 +13,9 @@
 
 use djled_engine::color::intensity::IntensityConfig;
 use djled_engine::color::surface::Keyframe;
-use djled_engine::color::{Geometry, LayoutConfig, RenderConfig, Renderer, SurfaceConfig};
+use djled_engine::color::{
+    Geometry, LayerVisual, LayoutConfig, RenderConfig, Renderer, SurfaceConfig,
+};
 use djled_engine::link::protocol::max_bands;
 use djled_engine::link::{expand_bands_to_leds, Link, MockLink};
 use djled_engine::midi::notes::{DEFAULT_HIGH, DEFAULT_LOW};
@@ -52,17 +54,35 @@ impl Pipeline {
         link: MockLink,
         surface: SurfaceConfig,
     ) -> Self {
+        Self::coloring(cfg, layout, link, surface, Vec::new())
+    }
+
+    /// The same, with a colour per MIDI channel over the field. Built through
+    /// `Renderer::stacked` because that is the only way into a `LayerVisual`,
+    /// which is where a palette lives — and a one-layer stack is byte-identical
+    /// to `Renderer::new`, which the rest of this file leans on.
+    fn coloring(
+        cfg: MidiConfig,
+        layout: LayoutConfig,
+        link: MockLink,
+        surface: SurfaceConfig,
+        channel_colors: Vec<String>,
+    ) -> Self {
         let notes = NoteEngine::new(&cfg, None, ShowConfig::default().base().decay());
-        let renderer = Renderer::new(
+        let visual = LayerVisual {
+            channel_colors,
+            ..LayerVisual::new(
+                surface,
+                layout,
+                IntensityConfig::pass_through(),
+                notes.centers().to_vec(),
+            )
+        };
+        let renderer = Renderer::stacked(
             RenderConfig::default(),
-            &surface,
-            layout,
-            IntensityConfig::pass_through(),
-            Geometry {
-                centers: notes.centers().to_vec(),
-                points: notes.centers().len().min(link.max_points()),
-                leds: LEDS,
-            },
+            std::slice::from_ref(&visual),
+            notes.centers().len().min(link.max_points()),
+            LEDS,
         )
         .unwrap();
         Self { notes, renderer, link, leds: vec![[0; 3]; LEDS] }
@@ -76,6 +96,11 @@ impl Pipeline {
         self.send(Message { status: 0x90, data1: note, data2: velocity });
     }
 
+    /// The same note, played on a given channel — 0-based, as the wire has it.
+    fn note_on_channel(&mut self, channel: u8, note: u8, velocity: u8) {
+        self.send(Message { status: 0x90 | channel, data1: note, data2: velocity });
+    }
+
     fn note_off(&mut self, note: u8) {
         self.send(Message { status: 0x80, data1: note, data2: 0 });
     }
@@ -84,7 +109,12 @@ impl Pipeline {
     fn run(&mut self, secs: f32) {
         for _ in 0..(secs / DT) as usize {
             self.notes.advance(DT);
-            let pixels = self.renderer.render(self.notes.levels());
+            // Levels and channels together, as the run loop sends them: they
+            // are one answer about one grid point and looking either up without
+            // the other is how a note ends up the wrong colour.
+            let pixels = self
+                .renderer
+                .render_stack_with(&[self.notes.levels()], &[self.notes.channels()]);
             self.link.send(pixels).unwrap();
         }
         expand_bands_to_leds(self.renderer.pixels(), &mut self.leds);
@@ -371,4 +401,82 @@ fn a_narrower_range_respreads_the_same_notes() {
         led.abs_diff(middle) < LEDS / 10,
         "C4 in a C3-C5 range should sit near the middle, not at LED {led}"
     );
+}
+
+/// The channel palette, end to end: a note played on channel 6 reaches the LED
+/// bytes in channel 6's colour, and one played on channel 1 does not.
+///
+/// The row this file owes the "every editor control reaches the wire" rule. It
+/// is a real claim about wiring and not about colour maths — the note engine,
+/// the strip map and the renderer each have to carry the channel, and any one
+/// of them dropping it leaves a grid that is perfectly lit in the wrong colour.
+#[test]
+fn a_note_reaches_the_leds_in_its_channel_colour() {
+    // A field that paints white everywhere, so anything else on the wire came
+    // from the palette rather than from the surface.
+    let white = SurfaceConfig {
+        keyframes: vec![Keyframe::new(0.0, 0.0, "#ffffff"), Keyframe::new(1.0, 1.0, "#ffffff")],
+        sigma: 0.5,
+    };
+    let mut palette = vec!["#00000000".to_string(); 16];
+    palette[5] = "#0000ffff".to_string();
+
+    let mut p = Pipeline::coloring(
+        MidiConfig::default(),
+        LayoutConfig::spanning(LEDS),
+        MockLink::new(LEDS),
+        white.clone(),
+        palette,
+    );
+    p.note_on_channel(5, 60, 127);
+    p.run(0.4);
+    let px = p.brightest_point();
+    assert!(px[2] > px[0] && px[2] > px[1], "channel 6 should be blue, got {px:?}");
+
+    // The same note on a channel whose colour is transparent is left to the
+    // field — which is the compatibility half of the same claim.
+    let mut q = Pipeline::coloring(
+        MidiConfig::default(),
+        LayoutConfig::spanning(LEDS),
+        MockLink::new(LEDS),
+        white,
+        vec!["#00000000".to_string(); 16],
+    );
+    q.note_on_channel(0, 60, 127);
+    q.run(0.4);
+    let px = q.brightest_point();
+    assert!(
+        px[0].abs_diff(px[2]) < 4 && px[0] > 128,
+        "an untinted note keeps the field's white, got {px:?}"
+    );
+}
+
+/// Two hands at once, on one layer. A chord split across two channels comes out
+/// as two colours in two places, which is the thing the whole feature is for.
+#[test]
+fn two_channels_reach_the_strip_in_two_colours() {
+    let white = SurfaceConfig {
+        keyframes: vec![Keyframe::new(0.0, 0.0, "#ffffff"), Keyframe::new(1.0, 1.0, "#ffffff")],
+        sigma: 0.5,
+    };
+    let mut palette = vec!["#00000000".to_string(); 16];
+    palette[0] = "#ff0000ff".to_string();
+    palette[1] = "#0000ffff".to_string();
+
+    let mut p = Pipeline::coloring(
+        MidiConfig::default(),
+        LayoutConfig::spanning(LEDS),
+        MockLink::new(LEDS),
+        white,
+        palette,
+    );
+    p.note_on_channel(0, 36, 127);
+    p.note_on_channel(1, 96, 127);
+    p.run(0.4);
+
+    let led_of = |note: u8| (note - DEFAULT_LOW) as usize * (LEDS - 1) / 87;
+    let low = p.leds[led_of(36)];
+    let high = p.leds[led_of(96)];
+    assert!(low[0] > low[2], "the left hand should be red, got {low:?}");
+    assert!(high[2] > high[0], "the right hand should be blue, got {high:?}");
 }

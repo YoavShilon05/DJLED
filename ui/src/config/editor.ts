@@ -28,7 +28,12 @@ import { flattenTimeline, type Timeline } from "../color/timeline";
 import type { InputSource, LayerConfig, MidiConfig, ShowConfig } from "../engine";
 import type { CurveConfig } from "./curve";
 import type { EqBand } from "./eq";
-import { DEFAULT_HIGH_NOTE, DEFAULT_LOW_NOTE, noteRange } from "./notes";
+import {
+  DEFAULT_CHANNEL_COLORS,
+  DEFAULT_HIGH_NOTE,
+  DEFAULT_LOW_NOTE,
+  noteRange,
+} from "./notes";
 import { DB_MAX, DB_MIN, dbToNorm, hzToNorm, normToDb, normToHz } from "./scales";
 import {
   clampKey,
@@ -271,7 +276,13 @@ export function defaultLayer(name: string): EditorLayer {
     sampleLength: 256,
     // An 88-key piano, stretched across the whole strip, with a semitone of glow
     // either side of each note. Matches the engine's own defaults.
-    midi: { lowNote: DEFAULT_LOW_NOTE, highNote: DEFAULT_HIGH_NOTE, spread: 1, sustain: true },
+    midi: {
+      lowNote: DEFAULT_LOW_NOTE,
+      highNote: DEFAULT_HIGH_NOTE,
+      spread: 1,
+      sustain: true,
+      channelColors: [...DEFAULT_CHANNEL_COLORS],
+    },
     blend: DEFAULT_SURFACE.sigma,
     // No keys: a fresh layer is a still one, and renders byte for byte as a
     // show that predates timelines does.
@@ -408,7 +419,7 @@ function toEngineLayer(layer: EditorLayer): LayerConfig {
     name: layer.name,
     enabled: layer.enabled,
     opacity: layer.opacity,
-    source: layer.source,
+    source: normaliseSource(layer.source),
     // Derived from the first key rather than stored beside it, so the mirror an
     // older peer reads can never disagree with the keys it does not know about.
     // See `LayerConfig.surface`.
@@ -460,7 +471,7 @@ function fromEngineLayer(layer: LayerConfig): EditorLayer {
     name: layer.name || base.name,
     enabled: layer.enabled !== false,
     opacity: typeof layer.opacity === "number" ? layer.opacity : 1,
-    source: layer.source ?? { ...DEFAULT_SOURCE },
+    source: normaliseSource(layer.source ?? { ...DEFAULT_SOURCE }),
     blend: fields[0].sigma,
     colorKeyframes: toKeyframes(fields[0]),
     timeline: {
@@ -634,14 +645,46 @@ function sanitiseTimeline(
 
 function sanitiseSource(stored: InputSource | undefined): InputSource {
   const kind = stored?.kind;
-  return {
+  return normaliseSource({
     id: typeof stored?.id === "string" ? stored.id : null,
     kind:
       kind === "input" || kind === "midi" || kind === "none" || kind === "loopback"
         ? kind
         : "loopback",
     channel: typeof stored?.channel === "number" ? stored.channel : null,
-  };
+  });
+}
+
+/**
+ * A selection the editor can act on.
+ *
+ * One rule, and it only concerns MIDI: a MIDI layer listens to every channel.
+ * They are told apart by colour now rather than by being filtered out — see
+ * `MidiConfig.channelColors` — so there is no control that could set this and
+ * nothing on screen that would explain a layer quietly ignoring fifteen
+ * sixteenths of what arrives. Applied on the way in *and* on the way out, so a
+ * show authored before the palette existed stops filtering the moment it is
+ * opened rather than the next time it is saved.
+ *
+ * An audio channel is untouched: there a channel really is a different stream.
+ */
+export function normaliseSource(source: InputSource): InputSource {
+  if (source.kind !== "midi" || source.channel === null) return source;
+  return { ...source, channel: null };
+}
+
+/**
+ * Whether a show the engine is running still filters a MIDI layer down to one
+ * channel — that is, whether {@link normaliseSource} would change it.
+ *
+ * Worth asking because adopting is not sending: the editor takes the engine's
+ * show as read and pushes nothing back until something is edited. A layer left
+ * filtering would render sixteen channels in the preview and one on the wall
+ * for as long as nobody touched it, which is the exact failure the preview
+ * exists to make impossible.
+ */
+export function filtersMidiChannel(show: ShowConfig): boolean {
+  return (show.layers ?? []).some((l) => l.source?.kind === "midi" && l.source.channel !== null);
 }
 
 export function saveConfig(config: EditorConfig): void {
@@ -672,7 +715,33 @@ function sanitiseMidi(stored: Partial<MidiConfig> | undefined, fallback: MidiCon
   const merged = { ...fallback, ...stored };
   const [lowNote, highNote] = noteRange(merged.lowNote, merged.highNote);
   const spread = Number.isFinite(merged.spread) ? Math.min(12, Math.max(0, merged.spread)) : 1;
-  return { lowNote, highNote, spread, sustain: merged.sustain !== false };
+  return {
+    lowNote,
+    highNote,
+    spread,
+    sustain: merged.sustain !== false,
+    channelColors: sanitiseChannelColors(merged.channelColors),
+  };
+}
+
+/**
+ * Sixteen colours, whatever was stored.
+ *
+ * Always exactly sixteen, because the grid draws one square per channel and a
+ * short list would be four missing squares rather than four channels nobody
+ * coloured. A missing or malformed entry falls back to that channel's default
+ * rather than to nothing — the palette is an identity per channel, and a blank
+ * square would say "this channel has no colour" when what happened is that a
+ * file was hand-edited.
+ */
+export function sanitiseChannelColors(stored: unknown): string[] {
+  const list = Array.isArray(stored) ? stored : [];
+  return DEFAULT_CHANNEL_COLORS.map((fallback, i) => {
+    const value = list[i];
+    return typeof value === "string" && /^#?[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$/.test(value.trim())
+      ? value.trim()
+      : fallback;
+  });
 }
 
 function clampDb(value: unknown, fallback: number): number {

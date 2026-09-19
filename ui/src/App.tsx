@@ -7,6 +7,7 @@ import {
   DEFAULT_CONFIG,
   activeLayer,
   clearConfig,
+  filtersMidiChannel,
   fromEngineConfig,
   hasStoredConfig,
   isStatic,
@@ -32,6 +33,7 @@ import {
   DEFAULT_URL,
   EngineClient,
   decodeStrip,
+  type EngineState,
   type Frame,
   type InputDevice,
   type LayerStatus,
@@ -131,6 +133,23 @@ export default function App() {
    *  callback and cannot close over a render's state. */
   const configRef = useRef<EditorConfig | null>(null);
 
+  /**
+   * Take the engine's show as the editor's own.
+   *
+   * Almost always that is the whole of it — the engine owns the presets, so
+   * what it is running is what is being edited. The one thing pushed back is a
+   * show the editor cannot represent: a MIDI layer still filtering on a channel
+   * from before the palette existed. Adopting normalises it away here, so
+   * leaving the engine running the old one would have the preview showing
+   * sixteen channels while the wall showed one, with nothing on screen saying
+   * why.
+   */
+  const adopt = useCallback((client: EngineClient, state: EngineState) => {
+    const next = fromEngineConfig(configRef.current ?? loadConfig(), state.config);
+    setConfig(next);
+    if (filtersMidiChannel(state.config)) client.setConfig(toEngineConfig(next));
+  }, []);
+
   useEffect(() => {
     const client = new EngineClient(DEFAULT_URL, {
       onStatus: (next) => {
@@ -166,7 +185,7 @@ export default function App() {
 
         if (switched) {
           // A hotkey, or another tab. Adopt: the wall is already showing this.
-          setConfig((c) => fromEngineConfig(c, state.config));
+          adopt(client, state);
           return;
         }
 
@@ -180,7 +199,7 @@ export default function App() {
           if (HAD_LOCAL_CONFIG && state.presets?.[state.activePreset]?.stored === false) {
             if (configRef.current) client.setConfig(toEngineConfig(configRef.current));
           } else {
-            setConfig((c) => fromEngineConfig(c, state.config));
+            adopt(client, state);
           }
         } else if (wasReconnect && configRef.current) {
           // Same slot, but the socket was away — anything edited during the gap
@@ -321,7 +340,12 @@ export default function App() {
   const spectrumFor = useCallback(
     (target: EditorLayer): SpectrumFrame => {
       const found = framesById?.get(target.id);
-      if (found) return { levels: found.levels, centers: found.centers };
+      // Channels come with the levels or not at all — an audio layer has none,
+      // and the offline demo spectrum has none either, so a preview with
+      // nothing connected shows the colour field rather than guessing at notes
+      // nobody played.
+      if (found)
+        return { levels: found.levels, centers: found.centers, channels: found.channels };
       return applyEq(demo, new EqCurve(target.eq, DEFAULT_SAMPLE_RATE), dbSpan);
     },
     [framesById, demo, dbSpan],

@@ -46,7 +46,16 @@
  */
 
 import { linearRgbToDisplay, type Rgb } from "../color/display";
-import { CLEAR, clampedRgb, oklabToLinearRgb, over, type LinearRgb } from "../color/oklab";
+import {
+  CLEAR,
+  clampedRgb,
+  hexToOklab,
+  oklabToLinearRgb,
+  over,
+  tint,
+  type LinearRgb,
+  type Oklab,
+} from "../color/oklab";
 import { ColorSurface } from "../color/surface";
 import { nowSeconds } from "../color/timeline";
 import { evalCurve } from "../config/curve";
@@ -59,6 +68,7 @@ import {
   type LedKeyframe,
 } from "../config/editor";
 import type { EqCurve } from "../config/eq";
+import { NO_CHANNEL } from "../config/notes";
 import { DB_MAX, DB_MIN, clamp, hzToNorm, normToHz } from "../config/scales";
 import { levelToDb, type SpectrumFrame } from "./paint";
 
@@ -85,6 +95,9 @@ export function applyEq(frame: SpectrumFrame, curve: EqCurve, dbSpan: number): S
   const span = dbSpan > 0 ? dbSpan : DB_SPAN;
   return {
     centers: frame.centers,
+    // Carried through untouched: an EQ shapes how loud a note is and says
+    // nothing about who played it.
+    channels: frame.channels,
     levels: frame.levels.map((level, i) => {
       const hz = frame.centers[i];
       if (hz === undefined || level <= 0) return level;
@@ -139,6 +152,45 @@ export function ledFrequency(keyframes: LedKeyframe[], led: number): number | nu
     return normToHz(hzToNorm(a.hz) + t * (hzToNorm(b.hz) - hzToNorm(a.hz)));
   }
   return sorted[sorted.length - 1].hz;
+}
+
+/**
+ * The grid point nearest a frequency, on the log axis the grid is even on.
+ *
+ * A port of `nearest_index` in `engine/src/color/strip.rs`, and the answer to
+ * "which note is this LED showing" — which is a different question from what
+ * level it is showing, because a level between two grid points interpolates and
+ * a *channel* cannot. Channels are identities, not quantities: halfway between
+ * channel 1 and channel 2 is not a channel, so the nearest note owns the point.
+ */
+export function nearestIndex(centers: number[], hz: number): number {
+  const target = hzToNorm(hz);
+  let best = 0;
+  let bestD = Infinity;
+  for (let i = 0; i < centers.length; i++) {
+    const d = Math.abs(hzToNorm(centers[i]) - target);
+    if (d < bestD) {
+      bestD = d;
+      best = i;
+    }
+  }
+  return best;
+}
+
+/**
+ * The channel palette a layer is painting with, parsed, or null where there is
+ * nothing to paint.
+ *
+ * Both halves have to be there: a MIDI layer with a palette, and a frame that
+ * says which channel each level came from. An audio frame carries no channels
+ * and a still layer has no notes, so both take the same path they always did.
+ */
+function channelPalette(layer: EditorLayer, frame: SpectrumFrame): Oklab[] | null {
+  if (layer.source.kind !== "midi") return null;
+  if (!frame.channels || frame.channels.length === 0) return null;
+  const colors = layer.midi.channelColors;
+  if (!colors || colors.length === 0) return null;
+  return colors.map(hexToOklab);
 }
 
 /** The analyser's level at an arbitrary frequency, interpolated on the log axis. */
@@ -198,6 +250,9 @@ export function layerCoverage(
   surface.seek(now);
   const out: LinearRgb[] = new Array(ledCount);
   const opacity = clamp(layer.opacity, 0, 1);
+  // Null for everything that is not a MIDI layer with notes in flight, which
+  // keeps the fold below exactly what it was for every other layer.
+  const palette = channelPalette(layer, frame);
   // A layer with no source has no spectrum to read; it sits at a flat full
   // level, which is the row its flattened field was projected onto.
   const still = isStatic(layer);
@@ -215,7 +270,16 @@ export function layerCoverage(
     const level = still ? 1 : levelAt(frame, hz);
     // The surface's y is the same normalised level the plot's dB axis shows,
     // so a band is coloured by exactly the field pixel its bar reaches.
-    const rgb = clampedRgb(oklabToLinearRgb(surface.sample(hzToNorm(hz), level)));
+    let lab = surface.sample(hzToNorm(hz), level);
+    if (palette) {
+      // The channel of the nearest note, and the colour it plays in. Mixed in
+      // before anything else touches the sample: it says what colour the note
+      // is, not how bright it is or what it covers.
+      const channel = frame.channels![nearestIndex(frame.centers, hz)] ?? NO_CHANNEL;
+      const color = channel === NO_CHANNEL ? undefined : palette[channel];
+      if (color) lab = tint(lab, color);
+    }
+    const rgb = clampedRgb(oklabToLinearRgb(lab));
     const gain = brightnessFor(layer, level);
 
     // The gain scales light and leaves coverage alone. That is what makes a

@@ -57,6 +57,13 @@ pub struct LayerFrame {
     /// Band centre frequencies, so the UI can label its axis without
     /// reimplementing the band scale.
     pub centers: Vec<f32>,
+    /// Which MIDI channel each level came from, 255 for none. Empty for a layer
+    /// with no channels to report, which is every audio layer.
+    ///
+    /// The editor needs it for the same reason the renderer does: a note is
+    /// painted in its channel's colour, and a preview that did not know which
+    /// channel a bar belonged to would draw the wrong one.
+    pub channels: Vec<u8>,
 }
 
 /// What the UI is shown each frame.

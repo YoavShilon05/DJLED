@@ -13,7 +13,7 @@ that make this directory dangerous.
 ```bash
 npm install
 npm run dev         # vite on 5173
-npm test            # vitest run — 120 tests, 10 files
+npm test            # vitest run — 131 tests, 10 files
 npm run typecheck   # tsc --noEmit
 npm run build       # typecheck + vite build
 npm run smoke       # node scripts/stack-smoke.mjs, against a running engine
@@ -52,6 +52,7 @@ editor's squiggles.
 | `spectrum/GizmoLayer.tsx` | SVG interaction layer over the canvas |
 | `spectrum/render.ts` | Port of the compositing fold in `engine/src/color/render.rs` |
 | `components/` | Mantine panels — see the shell below |
+| `components/ChannelColors.tsx` | The sixteen MIDI channel colours, on a 4×4 grid behind one button |
 | `components/strip.ts` | `paintStrip`, shared by the preview strips and the row thumbnails |
 | `theme.ts` | Every colour, radius and spacing decision, including `theme.other.plot` |
 | `styles.css` | Two rules. Keep it that way |
@@ -90,6 +91,26 @@ line worth having on screen permanently.
 
 ## Rules that are easy to break
 
+- **A MIDI layer has no channel selector, and `normaliseSource` is why.** All
+  sixteen reach it and each paints in its own colour (`ChannelColors`, under
+  Notes), so a stale `source.channel` is dropped on the way in and on the way
+  out. `App.tsx` also pushes a normalised show back when it adopts one that was
+  still filtering — adopting does not send, and the preview would otherwise show
+  sixteen channels while the wall showed one.
+- **`tint` lives in `color/oklab.ts` because two things tint.** The Rust keeps
+  it in `render.rs`; here the compositing fold (`spectrum/render.ts`, the strip
+  preview) and the plot's field raster (`spectrum/paint.ts`, what a bar reveals)
+  both need it, and they must not tint by different maths. The opacity is a mix
+  weight against the layer's field and keeps the field's alpha; a channel that
+  is not sounding is `NO_CHANNEL` and is left to the field. `nearestIndex` in
+  `render.ts` is the other half of the port, from `strip.rs` — the plot does not
+  need it, because a bar is a band and reads its channel at its own index.
+- **`ColorField` caches one raster per tint and throws them all away together.**
+  A MIDI bar reveals the field as its channel paints it, so the plot needs the
+  same picture once per channel colour in play. They are built on demand, so a
+  keyframe drag pays for the channels actually sounding rather than for all
+  sixteen — and `FieldLook` is memoised upstream in `SpectrumEditor` precisely
+  so a new object per frame does not empty that cache thirty times a second.
 - **`config/editor.ts` is the only place the wire shape is known.** A protocol
   change lands in `toEngineConfig` / `fromEngineConfig`, never in a component.
 - **The graph edits a *key*, not the layer.** `App` hands `SpectrumEditor` and
@@ -208,8 +229,8 @@ line worth having on screen permanently.
 | File | What it defends |
 |---|---|
 | `color/reference.test.ts` | Parity with the Rust colour path, against the generated fixture |
-| `color/oklab.test.ts` | The conversions on their own |
-| `spectrum/stack.test.ts` | The browser's copy of the compositing fold, and that `renderLayer` and a one-layer `renderStack` are the same bytes |
+| `color/oklab.test.ts` | The conversions on their own, and `tint` — the mix a channel colour applies |
+| `spectrum/stack.test.ts` | The browser's copy of the compositing fold, the channel palette over it, and that `renderLayer` and a one-layer `renderStack` are the same bytes |
 | `spectrum/render.test.ts` | Spatial mapping — including that an even-length strip's mirror fold lands on one specific index |
 | `spectrum/layout.test.ts` | The plot's geometry, and that a flat plot collapses the dB axis in `yOfDb` / `dbOfY` and nowhere else |
 | `config/eq.test.ts` | Closed-form properties, not captured values |

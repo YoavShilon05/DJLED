@@ -622,7 +622,12 @@ fn edge_taper(t: f32) -> f32 {
 ///
 /// Six digits is fully opaque. That is what lets a preset saved before opacity
 /// existed load with exactly the appearance it had.
-fn parse_color(s: &str) -> Result<LinearRgb, String> {
+/// An authored colour, parsed.
+///
+/// Public because the channel palette is authored in the same notation and has
+/// to mean the same thing there — one parser, one error message, one answer to
+/// what `#ff200080` is.
+pub fn parse_color(s: &str) -> Result<LinearRgb, String> {
     let t = s.trim().trim_start_matches('#');
     let value =
         |t: &str| u32::from_str_radix(t, 16).map_err(|_| format!("colour '{s}' is not valid hex"));

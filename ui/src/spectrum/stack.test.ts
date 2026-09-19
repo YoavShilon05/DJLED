@@ -207,6 +207,87 @@ describe("the layer stack", () => {
   });
 });
 
+describe("the channel palette", () => {
+  /** A MIDI layer, its palette silent except where a test says otherwise. */
+  function midiLayer(colors: Record<number, string>): EditorLayer {
+    const base = flat("#ffffff");
+    return {
+      ...base,
+      source: { id: "midi:x", kind: "midi", channel: null },
+      midi: {
+        ...base.midi,
+        channelColors: base.midi.channelColors.map((_, i) => colors[i] ?? "#00000000"),
+      },
+    };
+  }
+
+  /** Notes on one channel, all the way along. */
+  function notes(channel: number): SpectrumFrame {
+    return {
+      levels: Array.from({ length: 88 }, () => 1),
+      centers: Array.from({ length: 88 }, (_, i) => 20 * Math.pow(1000, i / 87)),
+      channels: Array.from({ length: 88 }, () => channel),
+    };
+  }
+
+  /**
+   * The claim the whole feature is: a note reaches the preview strip in its
+   * channel's colour, over a field that is painting something else entirely.
+   */
+  it("paints a note in its channel's colour", () => {
+    const layer = midiLayer({ 5: "#0000ffff" });
+    const out = renderStack(show(layer), () => notes(5), LEDS);
+    const px = out[Math.floor(LEDS / 2)];
+    expect(px[2]).toBeGreaterThan(px[0]);
+    expect(px[2]).toBeGreaterThan(px[1]);
+  });
+
+  /**
+   * The two ends of one slider. Opacity is a mix weight against the field, so
+   * transparent leaves the field exactly as it was — which is what keeps a
+   * layer that has not been coloured by channel rendering as it always did.
+   */
+  it("replaces the field at full opacity and does nothing at none", () => {
+    const white = renderStack(show(flat("#ffffff")), () => notes(0), LEDS);
+    expect(renderStack(show(midiLayer({ 0: "#0000ff00" })), () => notes(0), LEDS)).toEqual(white);
+
+    const blue = renderStack(show(flat("#0000ff")), () => notes(0), LEDS);
+    expect(renderStack(show(midiLayer({ 0: "#0000ffff" })), () => notes(0), LEDS)).toEqual(blue);
+  });
+
+  /**
+   * Where there is no note there is no channel, so the field is what shows —
+   * otherwise a palette would paint a dark strip in sixteen colours.
+   */
+  it("leaves a point with no channel to the field", () => {
+    const white = renderStack(show(flat("#ffffff")), () => notes(0), LEDS);
+    const none: SpectrumFrame = { ...notes(0), channels: notes(0).channels!.map(() => 255) };
+    expect(renderStack(show(midiLayer({ 0: "#0000ffff" })), () => none, LEDS)).toEqual(white);
+
+    // And an audio frame, which carries no channels at all.
+    expect(renderStack(show(midiLayer({ 0: "#0000ffff" })), () => LOUD, LEDS)).toEqual(
+      renderStack(show(flat("#ffffff")), () => LOUD, LEDS),
+    );
+  });
+
+  /**
+   * Opacity here is a mix weight and not coverage: it says what colour a note
+   * is, never how much of the layer below shows through. A tint the same colour
+   * as the field must therefore change nothing at all over a stack.
+   */
+  it("never changes what shows through from below", () => {
+    const under = flat("#00ff00");
+    const top = (colors: Record<number, string>): EditorLayer => ({
+      ...midiLayer(colors),
+      opacity: 0.5,
+    });
+    const frames = () => notes(0);
+    expect(renderStack(show(under, top({ 0: "#ffffffff" })), frames, LEDS)).toEqual(
+      renderStack(show(under, top({})), frames, LEDS),
+    );
+  });
+});
+
 describe("a layer on its own", () => {
   /**
    * The thumbnail beside each row and the preview strip above have to agree

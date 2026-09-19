@@ -21,6 +21,14 @@ use serde::{Deserialize, Serialize};
 
 use super::intensity::IntensityConfig;
 
+/// No channel owns this point.
+///
+/// MIDI's channels are 0..15, so anything outside that says "nobody" — which is
+/// what every audio level is, and what a MIDI point with nothing sounding on it
+/// is too. It matters that the two are the same answer: a channel tint applies
+/// where a note is, and an unlit point has no note to be that channel's.
+pub const NO_CHANNEL: u8 = 0xFF;
+
 /// The editor's frequency axis. Fixed rather than derived from the band plan so
 /// that a keyframe authored at 250 Hz lands on 250 Hz whatever the plan does.
 pub const F_MIN: f32 = 20.0;
@@ -169,6 +177,20 @@ pub fn level_at(levels: &[f32], centers: &[f32], hz: f32) -> f32 {
 /// neighbours: two notes a semitone apart are two notes, not one of them at
 /// half strength.
 pub fn peak_level_between(levels: &[f32], centers: &[f32], a: f32, b: f32) -> Option<f32> {
+    peak_between(levels, centers, a, b).map(|(_, level)| level)
+}
+
+/// [`peak_level_between`], and *which* grid point the peak came from.
+///
+/// The index is what carries a MIDI note's channel through to the colour: the
+/// level and the channel have to be read off the same note, or a point would be
+/// coloured by one hand and lit by another.
+pub fn peak_between(
+    levels: &[f32],
+    centers: &[f32],
+    a: f32,
+    b: f32,
+) -> Option<(usize, f32)> {
     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
     let n = levels.len().min(centers.len());
     let centers = &centers[..n];
@@ -178,11 +200,38 @@ pub fn peak_level_between(levels: &[f32], centers: &[f32], a: f32, b: f32) -> Op
     if first >= last {
         return None;
     }
-    Some(levels[first..last].iter().copied().fold(f32::NEG_INFINITY, f32::max))
+    levels[first..last]
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(i, &level)| (first + i, level))
+}
+
+/// The grid point nearest a frequency, on the log axis the grid is even on.
+///
+/// The other half of [`peak_between`], for the case where the frame is the
+/// finer of the two grids and a level is interpolated rather than aggregated.
+/// A colour cannot be interpolated between two channels — they are identities,
+/// not quantities — so the nearest note is the one that owns the point.
+pub fn nearest_index(centers: &[f32], hz: f32) -> Option<usize> {
+    if centers.is_empty() {
+        return None;
+    }
+    let target = hz_to_norm(hz);
+    let mut best = 0;
+    let mut best_d = f32::INFINITY;
+    for (i, &c) in centers.iter().enumerate() {
+        let d = (hz_to_norm(c) - target).abs();
+        if d < best_d {
+            best_d = d;
+            best = i;
+        }
+    }
+    Some(best)
 }
 
 /// What one wire colour is sampled from.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ControlPoint {
     /// Surface x — position on the frequency axis, 0..1.
     pub x: f32,
@@ -201,6 +250,20 @@ pub struct ControlPoint {
     /// Over the unlit strip the two are indistinguishable, which is why a
     /// one-layer show behaves exactly as it did before this field existed.
     pub covered: bool,
+    /// The MIDI channel whose note this point is showing, or [`NO_CHANNEL`].
+    ///
+    /// Always `NO_CHANNEL` for audio, which has no channels to report: a band
+    /// is a range of frequency and nobody played it. See
+    /// [`StripMap::map_with`].
+    pub channel: u8,
+}
+
+impl Default for ControlPoint {
+    fn default() -> Self {
+        // Not derived, because a derived `channel` would be zero — which is
+        // channel 1, a real channel with a real colour, rather than nobody.
+        Self { x: 0.0, y: 0.0, gain: 0.0, covered: false, channel: NO_CHANNEL }
+    }
 }
 
 /// Turns band levels into the control points the wire carries.
@@ -268,7 +331,21 @@ impl StripMap {
         &self.intensity
     }
 
+    /// Turn a frame of levels into control points. See [`Self::map_with`] for
+    /// the same thing with a channel per level beside it.
     pub fn map(&mut self, levels: &[f32]) -> &[ControlPoint] {
+        self.map_with(levels, &[])
+    }
+
+    /// The same, carrying each level's MIDI channel through to the point that
+    /// ends up showing it.
+    ///
+    /// `channels` is either empty — audio, or a MIDI frame nobody asked to
+    /// colour — or the same length as `levels`. It is read through *exactly*
+    /// the index the level came from, which is the whole reason it is a second
+    /// slice rather than something derived from frequency afterwards: the two
+    /// halves of one note must not be looked up separately.
+    pub fn map_with(&mut self, levels: &[f32], channels: &[u8]) -> &[ControlPoint] {
         let last_point = self.points.len().saturating_sub(1).max(1) as f32;
         let last_led = self.led_count.saturating_sub(1).max(1) as f32;
 
@@ -278,20 +355,42 @@ impl StripMap {
                 // Outside every sector: the LED is not addressed by this layer,
                 // so it is dark over an unlit strip and transparent over a
                 // layer below. See [`ControlPoint::covered`].
-                None => ControlPoint { x: u, y: 0.0, gain: 0.0, covered: false },
+                None => ControlPoint {
+                    x: u,
+                    y: 0.0,
+                    gain: 0.0,
+                    covered: false,
+                    channel: NO_CHANNEL,
+                },
                 Some(hz) => {
                     // A frame coarser than the grid has to aggregate rather
                     // than sample, or it slides off the peaks. See
-                    // [`peak_level_between`].
-                    let level = self
-                        .span_peak(levels, i, last_point, last_led)
+                    // [`peak_between`].
+                    let peak = self.span_peak(levels, i, last_point, last_led);
+                    let level = peak
+                        .map(|(_, level)| level)
                         .unwrap_or_else(|| level_at(levels, &self.centers, hz))
                         .clamp(0.0, 1.0);
+                    // Whichever grid point that level came from is the one
+                    // whose channel this point is showing. Where the level was
+                    // interpolated there is no such point, so the nearest one
+                    // answers — a colour cannot be halfway between two
+                    // channels, because channels are identities rather than
+                    // quantities.
+                    let channel = if channels.is_empty() {
+                        NO_CHANNEL
+                    } else {
+                        peak.map(|(index, _)| index)
+                            .or_else(|| nearest_index(&self.centers, hz))
+                            .and_then(|index| channels.get(index).copied())
+                            .unwrap_or(NO_CHANNEL)
+                    };
                     ControlPoint {
                         x: hz_to_norm(hz),
                         y: level,
                         gain: self.intensity.brightness(level),
                         covered: true,
+                        channel,
                     }
                 }
             };
@@ -315,7 +414,7 @@ impl StripMap {
         i: usize,
         last_point: f32,
         last_led: f32,
-    ) -> Option<f32> {
+    ) -> Option<(usize, f32)> {
         if !self.dense {
             return None;
         }
@@ -327,7 +426,7 @@ impl StripMap {
             );
             led_frequency(&self.sorted, u * last_led)
         };
-        peak_level_between(levels, &self.centers, edge(-0.5)?, edge(0.5)?)
+        peak_between(levels, &self.centers, edge(-0.5)?, edge(0.5)?)
     }
 }
 

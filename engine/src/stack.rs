@@ -152,6 +152,18 @@ impl LiveStack {
         self.layers.iter().map(|l| l.analysis.levels()).collect()
     }
 
+    /// Every layer's channels, bottom first, to be read beside
+    /// [`Self::all_levels`] — see [`crate::color::Renderer::render_stack_with`].
+    /// Empty for every layer that is not listening to MIDI.
+    pub fn all_channels(&self) -> Vec<&[u8]> {
+        self.layers.iter().map(|l| l.analysis.channels()).collect()
+    }
+
+    /// Which MIDI channel each of one layer's levels came from.
+    pub fn channels(&self, index: usize) -> &[u8] {
+        self.layers.get(index).map(|l| l.analysis.channels()).unwrap_or(&[])
+    }
+
     /// The widest grid any layer produces — 48 audio bands, or 88 semitones of
     /// MIDI. The stack is rendered at this resolution so no layer is resampled
     /// down to something coarser than what it has.
@@ -235,6 +247,14 @@ impl LiveStack {
                 },
                 cycle: l.config.cycle,
                 layout: l.config.layout(),
+                // Only where there are channels to colour. An audio layer
+                // carrying sixteen colours it can never apply would be a
+                // palette the editor never shows and the renderer never reads.
+                channel_colors: if l.config.source.kind == SourceKind::Midi {
+                    l.config.midi.channel_colors.clone()
+                } else {
+                    Vec::new()
+                },
                 intensity: if l.analysis.is_static() {
                     IntensityConfig::pass_through()
                 } else {

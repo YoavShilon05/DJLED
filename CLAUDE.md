@@ -44,8 +44,8 @@ cargo run --manifest-path engine/Cargo.toml --release -- --port COM3
 cd ui && npm install && npm run dev
 
 # Tests
-cargo test --manifest-path engine/Cargo.toml        # 319 pass (257 lib + 62 integration)
-cd ui && npm test                                   # 120 pass across 10 files
+cargo test --manifest-path engine/Cargo.toml        # 330 pass (266 lib + 64 integration)
+cd ui && npm test                                   # 131 pass across 10 files
 cd ui && npm run typecheck                          # tsc --noEmit, clean
 
 # End-to-end over the real socket, against a running engine
@@ -179,9 +179,30 @@ trip.
   terminal preview and the editor stayed perfect, because neither crosses the
   wire.
 - **A MIDI input opens once, per process.** Windows hands a port to one
-  application at a time. Two layers on two channels of one keyboard share the
-  handle and filter per layer (`Layer::feed_key` drops the channel for MIDI,
-  keeps it for audio). Never open a MIDI port per layer.
+  application at a time. Two layers on one keyboard share the handle
+  (`Layer::feed_key` drops the channel for MIDI, keeps it for audio). Never open
+  a MIDI port per layer.
+- **A MIDI channel is a colour, not a filter.** Every channel reaches every MIDI
+  layer and is told apart by `MidiConfig::channel_colors` — sixteen sRGB hex
+  strings, authored on the 4×4 grid in `ChannelColors.tsx` under Notes. Three
+  things follow. The channel travels *beside* the level, from `NoteEngine`
+  (`channels()`, filled from the same note the level came from) through
+  `StripMap::map_with` to `Renderer::render_stack_with`, because a point's level
+  and its colour must come from one note — looking either up separately is how a
+  note ends up the wrong colour. A channel colour's opacity is a **mix weight
+  against the layer's own colour field**, never coverage: `tint` keeps the
+  field's alpha, so a palette can never change what shows through from the
+  layers below. And `NO_CHANNEL` (255) is both "this is audio" and "nothing is
+  sounding here", deliberately — a tint applies where a note is, and an unlit
+  point has no note to be anyone's. Pinned end to end in
+  `tests/midi_pipeline.rs` and `ui/src/spectrum/stack.test.ts`.
+- **The engine can still filter on a MIDI channel; the editor never asks it to.**
+  `Source::channel` and `--channel` survive for `--probe`, but `SourcePanel`
+  shows no selector for MIDI and `normaliseSource` drops a stale one in both
+  directions. The editor also pushes a normalised show back when it *adopts* one
+  that still filters (`filtersMidiChannel` in `App.tsx`) — adopting is not
+  sending, and a layer left filtering would preview sixteen channels while the
+  wall showed one.
 - **Commands are drained before audio is read**, on every pass, not only on
   passes that complete a frame. A dead loopback delivers no samples, and the
   command that most needs through is the one moving off it.
@@ -266,6 +287,18 @@ trip.
   a strip map and a filter chain rather than being sampled per frame, so
   animating them means rebuilding an analyser at frame rate. Only the colour
   field moves.
+- **A bar reveals the field as its channel paints it; the dimmed field behind
+  it is never tinted.** The plot draws the colour field twice — once faint
+  across the whole plot, once at full strength clipped to the bars — and only
+  the second is tinted, once per channel colour in play (`ColorField.tinted`,
+  `paintPlot`). That asymmetry is the same statement the renderer makes: a tint
+  applies where a note *is*, and the quiet parts of the plot have no note to be
+  anyone's. Tinting a raster rather than painting the colour over the bars is
+  deliberate — the mix is in Oklab and a canvas composite is not, so at anything
+  but full opacity the two land on different colours.
+- **A bar reads its channel at its own band index.** No nearest-grid-point
+  lookup, unlike the strip: the bar *is* the grid point, and its level and its
+  channel came from one note.
 - **The editor plot shows one layer; the strip preview shows the stack.** Judge
   composite results on the preview, never on the graph. Each row of the layer
   list also carries a thumbnail of that layer alone — at full opacity and full

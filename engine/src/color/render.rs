@@ -27,9 +27,9 @@
 //! and is pinned by `tests/pipeline.rs`.
 
 use super::intensity::IntensityConfig;
-use super::oklab::LinearRgb;
-use super::strip::{LayoutConfig, StripMap};
-use super::surface::{ColorSurface, SurfaceConfig};
+use super::oklab::{LinearRgb, Oklab};
+use super::strip::{LayoutConfig, StripMap, NO_CHANNEL};
+use super::surface::{parse_color, ColorSurface, SurfaceConfig};
 use super::timeline::Timeline;
 
 #[derive(Clone, Debug)]
@@ -87,6 +87,11 @@ pub struct LayerVisual {
     pub cycle: bool,
     pub layout: LayoutConfig,
     pub intensity: IntensityConfig,
+    /// A colour per MIDI channel, index 0 being channel 1 — see
+    /// [`crate::midi::notes::MidiConfig::channel_colors`]. Empty for a layer
+    /// that is not listening to MIDI, which is every layer whose levels arrive
+    /// without channels beside them.
+    pub channel_colors: Vec<String>,
     /// Master opacity for the layer, multiplied into every sample's own.
     pub opacity: f32,
     /// Band centre frequencies for *this layer's* source.
@@ -108,6 +113,7 @@ impl LayerVisual {
             cycle: false,
             layout,
             intensity,
+            channel_colors: Vec::new(),
             opacity: 1.0,
             centers,
         }
@@ -117,6 +123,10 @@ impl LayerVisual {
 struct CompiledLayer {
     surface: ColorSurface,
     map: StripMap,
+    /// The channel palette, parsed. Empty where there is none, and an entry is
+    /// `None` where that channel's colour is missing or blank — both mean the
+    /// field is left to speak for itself there.
+    tints: Vec<Option<Oklab>>,
     opacity: f32,
 }
 
@@ -132,6 +142,7 @@ impl CompiledLayer {
                 points,
                 leds,
             ),
+            tints: compile_tints(&visual.channel_colors)?,
             opacity: visual.opacity.clamp(0.0, 1.0),
         })
     }
@@ -265,18 +276,40 @@ impl Renderer {
     /// which is the difference between a source that has not delivered a frame
     /// yet and one that is delivering silence.
     pub fn render_stack(&mut self, levels: &[&[f32]]) -> &[[u8; 3]] {
+        self.render_stack_with(levels, &[])
+    }
+
+    /// The stack, with each layer's MIDI channels beside its levels.
+    ///
+    /// `channels` is indexed like `levels` and may be shorter, or hold an empty
+    /// slice for a layer that has none — which is every audio layer, and a MIDI
+    /// layer is free to be read without them. Where a layer has both a channel
+    /// at a point and a colour for that channel, the field's colour at that
+    /// point is pulled toward the channel's by the channel colour's own
+    /// opacity; where it has either and not the other, the field is what
+    /// reaches the strip. That is the whole of it — see [`tint`].
+    pub fn render_stack_with(
+        &mut self,
+        levels: &[&[f32]],
+        channels: &[&[u8]],
+    ) -> &[[u8; 3]] {
         let trim = (self.cfg.gamma - 1.0).abs() > 1e-6;
         let master = self.cfg.brightness.clamp(0.0, 1.0);
         let gamma = self.cfg.gamma;
 
         self.stack.fill(LinearRgb::CLEAR);
 
-        for (layer, band_levels) in self.layers.iter_mut().zip(levels) {
+        for (index, (layer, band_levels)) in self.layers.iter_mut().zip(levels).enumerate() {
             if band_levels.is_empty() {
                 continue;
             }
+            // Channels only travel with a MIDI layer, and only as far as the
+            // level they belong to: a palette with nothing to apply it to costs
+            // the strip map nothing to carry.
+            let band_channels =
+                if layer.tints.is_empty() { &[][..] } else { channels.get(index).copied().unwrap_or(&[]) };
             // Borrowed separately from `layer.surface`, which the loop needs too.
-            let points = layer.map.map(band_levels);
+            let points = layer.map.map_with(band_levels, band_channels);
 
             for (i, point) in points.iter().enumerate() {
                 // Not addressed by this layer at all: leave the stack alone.
@@ -287,6 +320,13 @@ impl Renderer {
                 }
 
                 let lab = layer.surface.sample(point.x, point.y);
+                // The channel's colour, mixed in before anything else touches
+                // this sample: it is a statement about what colour the note is,
+                // not about how bright it is or what it covers.
+                let lab = match channel_tint(&layer.tints, point.channel) {
+                    Some(over) => tint(lab, over),
+                    None => lab,
+                };
                 let mut rgb = lab.to_linear_rgb().clamped();
 
                 if trim {
@@ -373,6 +413,53 @@ impl Renderer {
         }
     }
 }
+
+/// The authored channel palette, parsed once at compile time.
+///
+/// All or nothing, like every other colour a layer carries: a palette with one
+/// bad entry rejects the edit rather than silently dropping a channel. An
+/// *empty* entry is not a bad one — it is a channel deliberately left to the
+/// field, which is how a palette says "colour these four and nothing else".
+fn compile_tints(colors: &[String]) -> Result<Vec<Option<Oklab>>, String> {
+    colors
+        .iter()
+        .map(|c| {
+            if c.trim().is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(parse_color(c)?.to_oklab()))
+        })
+        .collect()
+}
+
+/// The colour a point's channel paints with, if it has one.
+fn channel_tint(tints: &[Option<Oklab>], channel: u8) -> Option<Oklab> {
+    if channel == NO_CHANNEL {
+        return None;
+    }
+    tints.get(channel as usize).copied().flatten()
+}
+
+/// A note's colour: the field's, pulled toward its channel's.
+///
+/// The mix happens in Oklab, where the surface's own blending happens, so a
+/// half-opacity tint lands on the colour halfway between the two rather than
+/// somewhere along a curve in RGB. Opacity here is the mix weight and *only*
+/// that: the sample keeps the field's alpha, because how much of the layer
+/// below shows through is a property of the field and has nothing to do with
+/// which hand played the note. A fully transparent channel colour therefore
+/// changes nothing, and a fully opaque one replaces the colour without ever
+/// blanking what is underneath.
+fn tint(base: Oklab, over: Oklab) -> Oklab {
+    let w = over.alpha.clamp(0.0, 1.0);
+    Oklab::with_alpha(
+        base.l + w * (over.l - base.l),
+        base.a + w * (over.a - base.a),
+        base.b + w * (over.b - base.b),
+        base.alpha,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +503,149 @@ mod tests {
             keyframes: vec![Keyframe::new(0.0, 0.0, color), Keyframe::new(1.0, 1.0, color)],
             sigma: 0.5,
         }
+    }
+
+    /// A renderer whose one layer paints `color` everywhere and carries a
+    /// channel palette. Levels are flat and full, so what comes out is the
+    /// colour pipeline's answer and nothing about the shape of the field.
+    fn tinting(color: &str, tints: &[&str]) -> Renderer {
+        let centers: Vec<f32> =
+            (0..BANDS).map(|i| norm_to_hz(i as f32 / (BANDS - 1) as f32)).collect();
+        let visual = LayerVisual {
+            channel_colors: tints.iter().map(|s| s.to_string()).collect(),
+            ..LayerVisual::new(
+                flat_surface(color),
+                LayoutConfig::spanning(150),
+                IntensityConfig::pass_through(),
+                centers,
+            )
+        };
+        Renderer::stacked(
+            RenderConfig { dither: false, ..Default::default() },
+            std::slice::from_ref(&visual),
+            BANDS,
+            150,
+        )
+        .unwrap()
+    }
+
+    /// A fully opaque channel colour replaces the field's, and a fully
+    /// transparent one changes nothing. The two ends of the same slider.
+    #[test]
+    fn a_channel_colour_replaces_the_field_and_a_transparent_one_does_not() {
+        let plain = tinting("#ff2000", &[]).render(&[1.0; BANDS]).to_vec();
+
+        let mut blue = tinting("#ff2000", &["#0040ffff"]);
+        let tinted = blue.render_stack_with(&[&[1.0; BANDS]], &[&[0u8; BANDS]]).to_vec();
+        let mut reference = tinting("#0040ff", &[]);
+        let expected = reference.render(&[1.0; BANDS]).to_vec();
+        assert_eq!(tinted, expected, "an opaque channel colour is the colour");
+
+        let mut clear = tinting("#ff2000", &["#0040ff00"]);
+        let untouched = clear.render_stack_with(&[&[1.0; BANDS]], &[&[0u8; BANDS]]).to_vec();
+        assert_eq!(untouched, plain, "a transparent channel colour must do nothing");
+    }
+
+    /// Only where a channel is. An audio layer has none, a silent MIDI point
+    /// has none, and both must come out as the field authored them — otherwise
+    /// a palette would paint a dark strip.
+    #[test]
+    fn a_point_with_no_channel_is_left_to_the_field() {
+        let plain = tinting("#ff2000", &[]).render(&[1.0; BANDS]).to_vec();
+        let mut tinted = tinting("#ff2000", &["#0040ffff"]);
+        let none = tinted
+            .render_stack_with(&[&[1.0; BANDS]], &[&[NO_CHANNEL; BANDS]])
+            .to_vec();
+        assert_eq!(none, plain);
+
+        // And with no channels beside the levels at all — the audio path.
+        let audio = tinted.render(&[1.0; BANDS]).to_vec();
+        assert_eq!(audio, plain);
+    }
+
+    /// Each channel paints its own colour, on one frame, on one layer. This is
+    /// the whole feature: sixteen hands, sixteen colours.
+    #[test]
+    fn two_channels_light_two_colours_at_once() {
+        let mut r = tinting("#ff2000", &["#ff0000ff", "#0000ffff"]);
+        let mut channels = [0u8; BANDS];
+        for (i, c) in channels.iter_mut().enumerate() {
+            *c = if i < BANDS / 2 { 0 } else { 1 };
+        }
+        let out = r.render_stack_with(&[&[1.0; BANDS]], &[&channels]).to_vec();
+        let low = out[BANDS / 4];
+        let high = out[BANDS * 3 / 4];
+        assert!(low[0] > low[2], "channel 1 should be red, got {low:?}");
+        assert!(high[2] > high[0], "channel 2 should be blue, got {high:?}");
+    }
+
+    /// Opacity is a mix weight, not coverage: the tint decides what colour a
+    /// note is and never what shows through from below. A half-opaque channel
+    /// colour over a layer must leave that layer exactly as covered as the
+    /// field left it.
+    #[test]
+    fn a_channel_colour_never_changes_what_shows_through() {
+        let centers: Vec<f32> =
+            (0..BANDS).map(|i| norm_to_hz(i as f32 / (BANDS - 1) as f32)).collect();
+        let under = visual(&flat_surface("#00ff00"), 1.0);
+        let top = |tints: &[&str]| LayerVisual {
+            channel_colors: tints.iter().map(|s| s.to_string()).collect(),
+            ..LayerVisual::new(
+                // Half-opaque, so the layer below is genuinely part of what
+                // reaches the wire.
+                flat_surface("#ff000080"),
+                LayoutConfig::spanning(150),
+                IntensityConfig::pass_through(),
+                centers.clone(),
+            )
+        };
+        let levels = [&[1.0; BANDS][..], &[1.0; BANDS][..]];
+        let channels = [&[][..], &[0u8; BANDS][..]];
+
+        let mut plain = Renderer::stacked(
+            RenderConfig { dither: false, ..Default::default() },
+            &[under.clone(), top(&[])],
+            BANDS,
+            150,
+        )
+        .unwrap();
+        let untinted = plain.render_stack_with(&levels, &channels).to_vec();
+
+        let mut mixed = Renderer::stacked(
+            RenderConfig { dither: false, ..Default::default() },
+            &[under, top(&["#ff0000ff"])],
+            BANDS,
+            150,
+        )
+        .unwrap();
+        // The same colour as the field, so only the *compositing* is being
+        // compared and any change would be the tint touching coverage.
+        let tinted = mixed.render_stack_with(&levels, &channels).to_vec();
+        assert_eq!(tinted, untinted);
+    }
+
+    /// All or nothing, like every other colour a layer carries: one bad entry
+    /// rejects the edit rather than quietly dropping a channel.
+    #[test]
+    fn an_unparseable_channel_colour_is_rejected() {
+        let centers: Vec<f32> =
+            (0..BANDS).map(|i| norm_to_hz(i as f32 / (BANDS - 1) as f32)).collect();
+        let visual = LayerVisual {
+            channel_colors: vec!["not a colour".to_string()],
+            ..LayerVisual::new(
+                SurfaceConfig::default(),
+                LayoutConfig::spanning(150),
+                IntensityConfig::pass_through(),
+                centers,
+            )
+        };
+        assert!(Renderer::stacked(
+            RenderConfig::default(),
+            std::slice::from_ref(&visual),
+            BANDS,
+            150
+        )
+        .is_err());
     }
 
     #[test]
@@ -642,6 +872,7 @@ mod tests {
             cycle: false,
             layout: LayoutConfig::spanning(150),
             intensity: IntensityConfig::pass_through(),
+            channel_colors: Vec::new(),
             opacity,
             centers,
         }

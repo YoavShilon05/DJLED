@@ -142,6 +142,24 @@ export function SpectrumEditor({
   // field is flattened onto the one row that is ever sampled, so the lane shows
   // the colour the wall will show. See `toRenderSurface`.
   const surface = useMemo(() => toRenderSurface(layer), [layer]);
+
+  /**
+   * What the raster is drawn from.
+   *
+   * The channel palette rides with the field because a MIDI bar does not reveal
+   * the authored field — it reveals the field as the channel that played the
+   * note paints it, which is what that note will do on the strip. Undefined for
+   * anything not listening to MIDI, so every other layer draws exactly what it
+   * drew before.
+   */
+  const look = useMemo(
+    () => ({
+      surface,
+      cycle: layer.cycle,
+      channelColors: layer.source.kind === "midi" ? layer.midi.channelColors : undefined,
+    }),
+    [surface, layer.cycle, layer.source.kind, layer.midi.channelColors],
+  );
   const clearSelection = useCallback(() => setSelected(null), []);
 
   const localPoint = useCallback((event: { clientX: number; clientY: number }) => {
@@ -306,13 +324,7 @@ export function SpectrumEditor({
       ref={containerRef}
       style={{ position: "relative", width: "100%", height: layout.height }}
     >
-      <SpectrumCanvas
-        layout={layout}
-        surface={surface}
-        cycle={layer.cycle}
-        frame={frame}
-        axis={axis}
-      />
+      <SpectrumCanvas layout={layout} look={look} frame={frame} axis={axis} />
       <GizmoLayer
         layout={layout}
         layer={layer}

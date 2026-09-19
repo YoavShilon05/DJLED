@@ -8,6 +8,8 @@ import {
   fromEngineConfig,
   loadConfig,
   nextId,
+  normaliseSource,
+  sanitiseChannelColors,
   saveConfig,
   toEngineConfig,
   toRenderSurface,
@@ -15,6 +17,7 @@ import {
   withLayer,
   type EditorConfig,
 } from "./editor";
+import { DEFAULT_CHANNEL_COLORS } from "./notes";
 
 const STORAGE_KEY = "djled.editor";
 
@@ -161,6 +164,51 @@ describe("stored configs", () => {
   });
 });
 
+describe("a MIDI layer's channel", () => {
+  it("is dropped in both directions, and an audio channel is not", () => {
+    const stale = { id: "midi:x", kind: "midi" as const, channel: 3 };
+    expect(normaliseSource(stale).channel).toBeNull();
+
+    // An audio channel really is a different stream, so it survives.
+    const audio = { id: "wasapi:x", kind: "input" as const, channel: 1 };
+    expect(normaliseSource(audio)).toEqual(audio);
+
+    // And the same rule on the way in, so opening an old show stops it
+    // filtering rather than waiting for the next save.
+    const layer = { ...defaultLayer("Keys"), source: stale };
+    const adopted = fromEngineConfig(DEFAULT_CONFIG, toEngineConfig({
+      ...DEFAULT_CONFIG,
+      layers: [layer],
+      activeLayerId: layer.id,
+    }));
+    expect(adopted.layers[0].source.channel).toBeNull();
+  });
+});
+
+describe("the channel palette", () => {
+  it("is always sixteen colours, whatever was stored", () => {
+    expect(defaultLayer("L").midi.channelColors).toHaveLength(16);
+    // Short, malformed and missing entries each fall back to that channel's
+    // own default rather than to nothing: a blank square would claim a channel
+    // has no colour, when what happened is that a file was hand-edited.
+    const patched = sanitiseChannelColors(["#123456", 7, "nope"]);
+    expect(patched).toHaveLength(16);
+    expect(patched[0]).toBe("#123456");
+    expect(patched[1]).toBe(DEFAULT_CHANNEL_COLORS[1]);
+    expect(patched[2]).toBe(DEFAULT_CHANNEL_COLORS[2]);
+    expect(sanitiseChannelColors(undefined)).toEqual(DEFAULT_CHANNEL_COLORS);
+  });
+
+  it("survives a round trip through the wire format", () => {
+    const layer = { ...defaultLayer("Keys") };
+    layer.midi = { ...layer.midi, channelColors: layer.midi.channelColors.map(() => "#00ff0080") };
+    const show = toEngineConfig({ ...DEFAULT_CONFIG, layers: [layer], activeLayerId: layer.id });
+    expect(show.layers[0].midi.channelColors[5]).toBe("#00ff0080");
+    const back = fromEngineConfig(DEFAULT_CONFIG, show);
+    expect(back.layers[0].midi.channelColors[5]).toBe("#00ff0080");
+  });
+});
+
 describe("the wire format", () => {
   it("sends the stack in order, sources and all", () => {
     const a = { ...defaultLayer("Bass"), id: nextId("layer") };
@@ -174,7 +222,10 @@ describe("the wire format", () => {
 
     expect(show.layers.map((l) => l.id)).toEqual([a.id, b.id]);
     expect(show.layers[1].opacity).toBe(0.5);
-    expect(show.layers[1].source).toEqual({ id: "midi:x", kind: "midi", channel: 3 });
+    // The channel is dropped on the way out: a MIDI layer listens to all
+    // sixteen and tells them apart by colour. A stale 3 from a show authored
+    // before the palette existed must not quietly filter fifteen of them.
+    expect(show.layers[1].source).toEqual({ id: "midi:x", kind: "midi", channel: null });
     // Colour keyframes go as the normalised surface, which is the form the
     // renderer samples.
     expect(show.layers[0].surface.keyframes[0].x).toBeGreaterThanOrEqual(0);

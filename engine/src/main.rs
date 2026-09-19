@@ -699,7 +699,7 @@ fn run(
             renderer.seek(epoch_seconds());
         }
 
-        let pixels = renderer.render_stack(&stack.all_levels());
+        let pixels = renderer.render_stack_with(&stack.all_levels(), &stack.all_channels());
         if !link.send(pixels)? {
             dropped += 1;
         }
@@ -719,6 +719,7 @@ fn run(
                         id: layer.id.clone(),
                         levels: stack.levels(i).to_vec(),
                         centers: stack.centers(i).to_vec(),
+                        channels: stack.channels(i).to_vec(),
                     })
                     .collect();
                 server.publish(|snap| {

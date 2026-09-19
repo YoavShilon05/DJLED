@@ -10,6 +10,7 @@ import {
   noteName,
   noteRange,
 } from "../config/notes";
+import { ChannelColors } from "./ChannelColors";
 import { Field } from "./Field";
 
 interface Props {
@@ -82,6 +83,17 @@ export const MidiPanel = memo(function MidiPanel({ layer, onChange, live }: Prop
           value={midi.spread}
           onChange={(spread) => onChange({ ...layer, midi: { ...midi, spread } })}
           label={(v) => (v === 0 ? "off" : `${v.toFixed(1)} st`)}
+        />
+      </Field>
+
+      <Field
+        label="Channel colour"
+        hint="Sixteen channels, sixteen colours."
+        info="Every note is painted in the colour of the MIDI channel it arrived on, so a stack of parts down one cable reads as a stack of colours on one layer. Each colour carries an opacity: at full it is the note's colour outright, and below it the layer's own colour field shows through underneath. A channel is no longer something the layer filters on — all sixteen reach it, and what tells them apart is what they look like."
+      >
+        <ChannelColors
+          colors={midi.channelColors}
+          onChange={(channelColors) => onChange({ ...layer, midi: { ...midi, channelColors } })}
         />
       </Field>
 

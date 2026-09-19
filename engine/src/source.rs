@@ -507,6 +507,20 @@ impl Analysis {
         }
     }
 
+    /// Which MIDI channel each level came from, empty for anything that has
+    /// no channels to report.
+    ///
+    /// Read beside [`Self::levels`] and indexed the same way — the pair is one
+    /// answer about one grid point. Empty rather than a slice of
+    /// [`crate::color::strip::NO_CHANNEL`] because "this source has no
+    /// channels" is worth saying once instead of 48 times a frame.
+    pub fn channels(&self) -> &[u8] {
+        match self {
+            Self::Audio(_) | Self::Static(_) => &[],
+            Self::Midi(m) => m.notes.channels(),
+        }
+    }
+
     /// Where those levels sit on the editor's frequency axis.
     ///
     /// For audio these are band centre frequencies. For MIDI they are the

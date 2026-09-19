@@ -70,6 +70,7 @@ fn render(show: &ShowConfig) -> Vec<[u8; 3]> {
             cycle: l.cycle,
             layout: l.layout(),
             intensity: l.intensity(),
+            channel_colors: Vec::new(),
             opacity: if l.enabled { l.opacity() } else { 0.0 },
             centers: engine.centers().to_vec(),
         })

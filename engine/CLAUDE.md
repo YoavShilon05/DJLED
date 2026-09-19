@@ -86,7 +86,19 @@ the primary documentation and are usually more current than any summary here.
 - **`Layer::feed_key` drops the channel for MIDI and keeps it for audio.** That
   asymmetry is the whole pooling scheme: a WASAPI endpoint's channel is chosen
   when the stream is built (two channels really are two streams), a MIDI channel
-  is a per-layer filter (Windows won't open the port twice).
+  is not a stream at all.
+- **A MIDI channel travels beside its level, never separately.** `NoteEngine`
+  fills `channels()` from the same note that won each grid point, `StripMap::
+  map_with` carries that index through the aggregation (`peak_between`) or the
+  nearest grid point where the level was interpolated, and
+  `Renderer::render_stack_with` looks the colour up from it. Deriving the
+  channel from frequency afterwards would look right and be wrong at every
+  boundary. `NO_CHANNEL` means audio *and* silence, which is why
+  `ControlPoint::default` is hand-written — a derived zero is channel 1.
+- **A channel colour's opacity is a mix weight, not coverage.** `render::tint`
+  interpolates in Oklab and keeps the *field's* alpha. A palette therefore never
+  changes what the layers below contribute, which is what lets a MIDI layer be
+  coloured by channel and still compose.
 - **Never have bytes in flight while the board is deaf.** One READY buys exactly
   one frame, and `Readiness` in `link/serial.rs` expires it after the sketch's
   own 25 ms listening window. That single-token discipline is what keeps the
@@ -152,13 +164,13 @@ the primary documentation and are usually more current than any summary here.
 
 ## Tests
 
-319 total: 257 unit (in-module `#[cfg(test)]`) + 62 integration.
+330 total: 266 unit (in-module `#[cfg(test)]`) + 64 integration.
 
 | File | What it defends |
 |---|---|
 | `tests/artifacts.rs` (8) | The reported bugs stay fixed. One independently computes what a naive analyser would produce, so the suppression tests aren't just asserting nothing happens |
 | `tests/pipeline.rs` (30) | Every editor control's effect reaches the LED bytes, including a show of still layers driven through `LiveStack` with no device in the chain. **Add a row here for any new control** |
-| `tests/midi_pipeline.rs` (12) | The note path end to end, delivered as bytes — the only MIDI coverage that runs without a port |
+| `tests/midi_pipeline.rs` (14) | The note path end to end, delivered as bytes — the only MIDI coverage that runs without a port. Includes the channel palette reaching the LEDs |
 | `tests/color_reference.rs` (6) | The Rust side of the TS parity fixture, stills and loops |
 | `tests/presets.rs` (4) | A preset stored, reloaded from disk, and rendered — the bytes have to match the show it was saved from |
 

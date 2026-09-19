@@ -112,6 +112,17 @@ export interface MidiConfig {
   spread: number;
   /** Honour the sustain pedal (CC64). */
   sustain: boolean;
+  /**
+   * A colour per MIDI channel, index 0 being channel 1. Sixteen of them, as
+   * `#rrggbb` or `#rrggbbaa`.
+   *
+   * The opacity byte means something different here than on a keyframe: it is
+   * how far a note's colour is pulled from the layer's own field toward its
+   * channel's, not how much it covers what is beneath. Coverage stays the
+   * field's, because which hand played a note says nothing about whether the
+   * layers under it show through.
+   */
+  channelColors: string[];
 }
 
 /**
@@ -198,6 +209,10 @@ export interface LayerFrame {
   levels: number[];
   /** Band centre frequencies in Hz, so the axis can be labelled correctly. */
   centers: number[];
+  /** Which MIDI channel each level came from, 255 for none. Empty for a layer
+   *  with no channels to report, which is every audio layer. The preview needs
+   *  it to paint a note in the colour the wall is painting it. */
+  channels: number[];
 }
 
 export interface Frame {

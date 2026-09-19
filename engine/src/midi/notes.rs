@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 
 use super::Message;
 use crate::color::intensity::{DISPLAY_DB_MAX, DISPLAY_DB_MIN};
-use crate::color::strip::norm_to_hz;
+use crate::color::strip::{norm_to_hz, NO_CHANNEL};
 use crate::dsp::biquad::coefficient;
 use crate::dsp::eq::{EqBand, EqCurve};
 use crate::dsp::post::decay_scale;
@@ -80,11 +80,38 @@ const DISPLAY_SPAN: f32 = DISPLAY_DB_MAX - DISPLAY_DB_MIN;
 /// rate high enough not to warp the top of the range.
 const NOMINAL_SAMPLE_RATE: f32 = 48_000.0;
 
+/// MIDI's sixteen channels, and that is not a number that will ever change
+/// either.
+pub const CHANNEL_COUNT: usize = 16;
+
+/// A colour per channel, index 0 being channel 1.
+///
+/// sRGB hex with an optional opacity byte, in the same notation every keyframe
+/// uses, so a preset stays one readable value per channel. The opacity means
+/// something different here though: it is how far a note's colour is pulled
+/// from the layer's own field toward its channel's, *not* how much it covers
+/// what is beneath. Coverage stays the field's, because a channel colour says
+/// what a note looks like — not whether the layers under it show through.
+///
+/// Sixteen distinct hues at full opacity: a MIDI layer reads by channel out of
+/// the box, and blending it back into the colour field is a slider away on each
+/// square.
+pub fn default_channel_colors() -> Vec<String> {
+    [
+        "#ff0000ff", "#ff6000ff", "#ffbf00ff", "#dfff00ff", "#80ff00ff", "#20ff00ff",
+        "#00ff40ff", "#00ff9fff", "#00ffffff", "#009fffff", "#0040ffff", "#2000ffff",
+        "#8000ffff", "#df00ffff", "#ff00bfff", "#ff0060ff",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 /// What the editor can change about MIDI.
 ///
 /// Every field defaults, so an editor that predates one still produces a valid
 /// config rather than a parse error that would drop the whole edit.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MidiConfig {
     /// Note at the left end of the axis.
@@ -98,11 +125,21 @@ pub struct MidiConfig {
     /// Honour the sustain pedal (CC64). Off makes a held pedal do nothing,
     /// which is what you want when a controller sends one by accident.
     pub sustain: bool,
+    /// One colour per channel — see [`default_channel_colors`]. A short list is
+    /// legal and a missing entry simply does not tint, which is what keeps a
+    /// hand-edited preset naming two channels from being an error.
+    pub channel_colors: Vec<String>,
 }
 
 impl Default for MidiConfig {
     fn default() -> Self {
-        Self { low_note: DEFAULT_LOW, high_note: DEFAULT_HIGH, spread: 1.0, sustain: true }
+        Self {
+            low_note: DEFAULT_LOW,
+            high_note: DEFAULT_HIGH,
+            spread: 1.0,
+            sustain: true,
+            channel_colors: default_channel_colors(),
+        }
     }
 }
 
@@ -155,6 +192,12 @@ pub struct NoteEngine {
 
     /// Velocity a note is holding at, 0 when released.
     gate: [f32; NOTE_COUNT],
+    /// Which channel struck each note, so it can be coloured by the hand that
+    /// played it. Kept for as long as the envelope lasts rather than cleared on
+    /// release — a note fading out is still that channel's note, and a fade
+    /// that changed colour halfway down would be the one artefact nobody could
+    /// explain. Re-struck on another channel, the newest wins.
+    chan: [u8; NOTE_COUNT],
     /// Key is physically down.
     held: [bool; NOTE_COUNT],
     /// Key is up but the pedal is holding the note.
@@ -164,6 +207,11 @@ pub struct NoteEngine {
 
     centers: Vec<f32>,
     levels: Vec<f32>,
+    /// The channel that owns each grid point: whichever note is loudest there,
+    /// which is the same note the level came from. [`NO_CHANNEL`] where nothing
+    /// is sounding, because an unlit point belongs to nobody and tinting it
+    /// would paint a channel's colour across a silent strip.
+    channels: Vec<u8>,
     /// EQ gain per grid point, already divided into the level's units.
     eq: Vec<f32>,
     eq_bands: Vec<EqBand>,
@@ -179,17 +227,19 @@ impl NoteEngine {
         let (low, high) = cfg.range();
         let points = cfg.points();
         let mut engine = Self {
-            cfg: *cfg,
+            cfg: cfg.clone(),
             low,
             high,
             channel: sanitise_channel(channel),
             gate: [0.0; NOTE_COUNT],
+            chan: [0; NOTE_COUNT],
             held: [false; NOTE_COUNT],
             latched: [false; NOTE_COUNT],
             pedal: false,
             env: [0.0; NOTE_COUNT],
             centers: grid_centers(points),
             levels: vec![0.0; points],
+            channels: vec![NO_CHANNEL; points],
             eq: vec![0.0; points],
             eq_bands: Vec::new(),
             weights: kernel(cfg.spread()),
@@ -209,6 +259,13 @@ impl NoteEngine {
     /// Bar brightness per grid point, 0..1.
     pub fn levels(&self) -> &[f32] {
         &self.levels
+    }
+
+    /// Which channel each grid point's level came from, [`NO_CHANNEL`] where
+    /// nothing is sounding. Same length as [`Self::levels`], and read beside it
+    /// — the two are one answer about one point.
+    pub fn channels(&self) -> &[u8] {
+        &self.channels
     }
 
     pub fn config(&self) -> &MidiConfig {
@@ -240,7 +297,9 @@ impl NoteEngine {
             // A note-on at velocity 0 is a note-off. Every sequencer including
             // FL's MIDI Out uses this, so treating it as a silent note-on would
             // leave notes stuck on forever.
-            Message::NOTE_ON if msg.data2 > 0 => self.note_on(msg.data1, msg.data2),
+            Message::NOTE_ON if msg.data2 > 0 => {
+                self.note_on(msg.data1, msg.data2, msg.channel())
+            }
             Message::NOTE_ON | Message::NOTE_OFF => self.note_off(msg.data1),
             Message::CONTROL_CHANGE => match msg.data1 {
                 Message::CC_SUSTAIN => self.set_pedal(msg.data2 >= 64),
@@ -284,7 +343,7 @@ impl NoteEngine {
     pub fn set_config(&mut self, cfg: &MidiConfig) -> bool {
         let (low, high) = cfg.range();
         let moved = (low, high) != (self.low, self.high);
-        self.cfg = *cfg;
+        self.cfg = cfg.clone();
         self.weights = kernel(cfg.spread());
 
         if moved {
@@ -293,6 +352,7 @@ impl NoteEngine {
             self.high = high;
             self.centers = grid_centers(points);
             self.levels = vec![0.0; points];
+            self.channels = vec![NO_CHANNEL; points];
             self.eq = vec![0.0; points];
             self.out_of_range = 0;
             self.resample_eq();
@@ -335,16 +395,18 @@ impl NoteEngine {
         self.silence();
         self.env = [0.0; NOTE_COUNT];
         self.levels.fill(0.0);
+        self.channels.fill(NO_CHANNEL);
         self.out_of_range = 0;
     }
 
-    fn note_on(&mut self, note: u8, velocity: u8) {
+    fn note_on(&mut self, note: u8, velocity: u8, channel: u8) {
         if note < self.low || note > self.high {
             self.out_of_range = self.out_of_range.saturating_add(1);
             return;
         }
         let n = note as usize;
         self.gate[n] = velocity as f32 / 127.0;
+        self.chan[n] = channel.min((CHANNEL_COUNT - 1) as u8);
         self.held[n] = true;
         self.latched[n] = false;
     }
@@ -402,6 +464,7 @@ impl NoteEngine {
     /// as one twice as bright.
     fn render(&mut self) {
         self.levels.fill(0.0);
+        self.channels.fill(NO_CHANNEL);
         let radius = self.weights.len() - 1;
         let last = self.levels.len() - 1;
 
@@ -415,6 +478,10 @@ impl NoteEngine {
                 let lit = level * self.weights[j.abs_diff(i)];
                 if lit > self.levels[j] {
                     self.levels[j] = lit;
+                    // The level and the channel are taken from the same note,
+                    // so a point lit by two overlapping glows is coloured by
+                    // the one it is actually showing.
+                    self.channels[j] = self.chan[note as usize];
                 }
             }
         }
@@ -630,6 +697,65 @@ mod tests {
         settle(&mut e, 40);
         assert!(e.levels()[at(60)] > 0.9);
         assert_eq!(e.levels()[at(64)], 0.0);
+    }
+
+    /// Which hand played a note travels with it, because that is what decides
+    /// its colour. Two notes on two channels at once are two colours.
+    #[test]
+    fn a_note_carries_the_channel_that_played_it() {
+        let mut e = engine();
+        e.handle(Message { status: 0x90, data1: 60, data2: 127 });
+        e.handle(Message { status: 0x94, data1: 72, data2: 127 });
+        settle(&mut e, 40);
+        assert_eq!(e.channels()[at(60)], 0);
+        assert_eq!(e.channels()[at(72)], 4);
+    }
+
+    /// An unlit point belongs to nobody. Anything else would paint a channel's
+    /// colour across a silent strip, which is the one place a tint must not
+    /// reach.
+    #[test]
+    fn silence_belongs_to_no_channel() {
+        let mut e = engine();
+        settle(&mut e, 10);
+        assert!(e.channels().iter().all(|&c| c == NO_CHANNEL));
+
+        e.handle(Message { status: 0x93, data1: 60, data2: 127 });
+        settle(&mut e, 40);
+        assert_eq!(e.channels()[at(60)], 3);
+        assert_eq!(e.channels()[at(30)], NO_CHANNEL, "nothing is sounding down here");
+
+        e.handle(off(60));
+        settle(&mut e, 500);
+        assert_eq!(e.channels()[at(60)], NO_CHANNEL, "and the note is gone");
+    }
+
+    /// The level and the channel are read off the same note, so a point lit by
+    /// two overlapping glows is coloured by the one it is actually showing.
+    #[test]
+    fn a_point_is_coloured_by_the_note_it_is_showing() {
+        let wide = MidiConfig { spread: 2.0, ..Default::default() };
+        let mut e = NoteEngine::new(&wide, None, REFERENCE_DECAY);
+        e.handle(Message { status: 0x90, data1: 60, data2: 127 });
+        e.handle(Message { status: 0x92, data1: 64, data2: 40 });
+        settle(&mut e, 60);
+        assert_eq!(e.channels()[at(60)], 0);
+        assert_eq!(e.channels()[at(64)], 2);
+        // Between them, whichever is louder there — the quiet note's own glow
+        // is beaten by the loud one two semitones out.
+        assert_eq!(e.channels()[at(62)], 0);
+    }
+
+    /// Re-struck on another channel, the newest wins: the note that is sounding
+    /// is the one that was just played.
+    #[test]
+    fn restriking_a_note_moves_it_to_the_new_channel() {
+        let mut e = engine();
+        e.handle(Message { status: 0x90, data1: 60, data2: 127 });
+        settle(&mut e, 40);
+        e.handle(Message { status: 0x97, data1: 60, data2: 127 });
+        settle(&mut e, 40);
+        assert_eq!(e.channels()[at(60)], 7);
     }
 
     /// A hostile or inverted range must not panic or produce an empty grid.

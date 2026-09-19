@@ -15,7 +15,9 @@
  */
 
 import { oklabToDisplayRgba } from "../color/display";
+import { hexToOklab, tint, type Oklab } from "../color/oklab";
 import { ColorSurface, type SurfaceConfig } from "../color/surface";
+import { NO_CHANNEL } from "../config/notes";
 import { DB_MAX, DB_MIN, DB_TICKS } from "../config/scales";
 import type { PlotPalette } from "../theme";
 import type { AxisScale } from "./axis";
@@ -33,6 +35,14 @@ export interface SpectrumFrame {
   levels: number[];
   /** Band centre frequencies in Hz, same length as `levels`. */
   centers: number[];
+  /**
+   * Which MIDI channel each level came from, 255 (`NO_CHANNEL`) for none.
+   *
+   * Absent or empty for anything with no channels to report, which is every
+   * audio source and the offline demo spectrum. Read beside `levels` and
+   * indexed the same way: the pair is one answer about one grid point.
+   */
+  channels?: number[];
 }
 
 /**
@@ -54,7 +64,16 @@ export function dbToLevel(db: number): number {
  * cost anything.
  */
 export class ColorField {
-  private canvas = document.createElement("canvas");
+  /**
+   * One raster per tint, the untinted field under the empty key.
+   *
+   * A MIDI bar does not reveal the authored field — it reveals the field as its
+   * channel paints it — so the plot needs the same picture once per channel
+   * colour in play. They are built on demand and thrown away together whenever
+   * the field changes, which keeps a drag paying for the channels actually
+   * sounding rather than for all sixteen.
+   */
+  private rasters = new Map<string, HTMLCanvasElement>();
   private key = "";
   /** The object the cached key was taken from, so a repaint that was not caused
    *  by an edit costs one reference comparison instead of a serialisation. */
@@ -64,29 +83,44 @@ export class ColorField {
    *  layer — and a flip of it changes every pixel near the two edges. */
   private cycle = false;
 
-  constructor() {
-    this.canvas.width = FIELD_W;
-    this.canvas.height = FIELD_H;
+  /** The authored field. */
+  render(surface: SurfaceConfig, cycle = false): HTMLCanvasElement {
+    return this.raster(surface, cycle, null);
   }
 
-  render(surface: SurfaceConfig, cycle = false): HTMLCanvasElement {
-    // The plot repaints on every frame the engine sends, and the surface it is
-    // handed is rebuilt only when the layer changes — so the common case is the
-    // same object twice and never needs stringifying at all. The key stays for
-    // the case that is not: a config adopted from the engine is a new object
-    // holding what was already on screen.
-    if (surface === this.source && cycle === this.cycle) return this.canvas;
-    this.source = surface;
-    this.cycle = cycle;
+  /**
+   * The same field, every pixel pulled toward `color` by its own opacity — what
+   * a note on that channel reveals.
+   *
+   * Tinted here rather than by drawing the colour over the bars, because the
+   * mix is in Oklab and a canvas composite is not: at anything but full opacity
+   * the two land on different colours, and this is the plot whose whole claim
+   * is that a bar shows what the strip will do.
+   */
+  tinted(surface: SurfaceConfig, cycle: boolean, color: string): HTMLCanvasElement {
+    return this.raster(surface, cycle, color);
+  }
 
-    const key = `${cycle}:${JSON.stringify(surface)}`;
-    if (key === this.key) return this.canvas;
-    this.key = key;
+  private raster(
+    surface: SurfaceConfig,
+    cycle: boolean,
+    color: string | null,
+  ): HTMLCanvasElement {
+    this.sync(surface, cycle);
+    const slot = color ?? "";
+    const cached = this.rasters.get(slot);
+    if (cached) return cached;
 
-    const ctx = this.canvas.getContext("2d");
-    if (!ctx) return this.canvas;
+    const canvas = document.createElement("canvas");
+    canvas.width = FIELD_W;
+    canvas.height = FIELD_H;
+    this.rasters.set(slot, canvas);
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return canvas;
 
     const compiled = new ColorSurface(surface).cycling(cycle);
+    const over: Oklab | null = color === null ? null : hexToOklab(color);
     const image = ctx.createImageData(FIELD_W, FIELD_H);
     const data = image.data;
 
@@ -94,10 +128,13 @@ export class ColorField {
       // Image rows run top-down; the surface's y runs bottom-up.
       const y = 1 - py / (FIELD_H - 1);
       for (let px = 0; px < FIELD_W; px++) {
+        const sample = compiled.sample(px / (FIELD_W - 1), y);
         // Kept translucent rather than composited onto black: the field is drawn
         // over the plot, so a faded region should read as the plot showing
-        // through, which is what it will do over a layer below it.
-        const [r, g, b, a] = oklabToDisplayRgba(compiled.sample(px / (FIELD_W - 1), y));
+        // through, which is what it will do over a layer below it. The tint
+        // keeps that alpha untouched — a channel colour says what a note looks
+        // like, not what it covers.
+        const [r, g, b, a] = oklabToDisplayRgba(over ? tint(sample, over) : sample);
         const i = (py * FIELD_W + px) * 4;
         data[i] = r;
         data[i + 1] = g;
@@ -107,19 +144,54 @@ export class ColorField {
     }
 
     ctx.putImageData(image, 0, 0);
-    return this.canvas;
+    return canvas;
   }
+
+  /** Drop every raster if the field they were drawn from has changed. */
+  private sync(surface: SurfaceConfig, cycle: boolean): void {
+    // The plot repaints on every frame the engine sends, and the surface it is
+    // handed is rebuilt only when the layer changes — so the common case is the
+    // same object twice and never needs stringifying at all. The key stays for
+    // the case that is not: a config adopted from the engine is a new object
+    // holding what was already on screen.
+    if (surface === this.source && cycle === this.cycle) return;
+    this.source = surface;
+    this.cycle = cycle;
+
+    const key = `${cycle}:${JSON.stringify(surface)}`;
+    if (key === this.key) return;
+    this.key = key;
+    this.rasters.clear();
+  }
+}
+
+/**
+ * The field this plot is drawing, and how a note on it is coloured.
+ *
+ * One object rather than three arguments because the three are one question —
+ * what a bar of this layer looks like — and because it is memoised upstream to
+ * keep the raster cache from being asked a new question thirty times a second.
+ */
+export interface FieldLook {
+  surface: SurfaceConfig;
+  /** Whether this layer's position axis is joined end to end. */
+  cycle: boolean;
+  /** One colour per MIDI channel, or undefined for a layer that is not
+   *  listening to MIDI — see `MidiConfig.channelColors`. */
+  channelColors?: string[];
 }
 
 export function paintPlot(
   ctx: CanvasRenderingContext2D,
   l: PlotLayout,
-  field: HTMLCanvasElement,
+  field: ColorField,
+  look: FieldLook,
   frame: SpectrumFrame,
   palette: PlotPalette,
   axis: AxisScale,
 ): void {
   const { plot } = l;
+  const base = field.render(look.surface, look.cycle);
   ctx.clearRect(0, 0, l.width, l.height);
 
   ctx.save();
@@ -128,17 +200,31 @@ export function paintPlot(
   ctx.clip();
 
   // Nothing is being revealed on a flat plot, so nothing is dimmed: the lane
-  // *is* the colour, at the strength the strip will show it.
+  // *is* the colour, at the strength the strip will show it. The dimmed field
+  // is never tinted — where no note is sounding there is no channel, and the
+  // quiet parts of the plot are exactly that.
   ctx.globalAlpha = l.flat ? 1 : FIELD_DIM;
-  ctx.drawImage(field, plot.x, plot.y, plot.w, plot.h);
+  ctx.drawImage(base, plot.x, plot.y, plot.w, plot.h);
   ctx.globalAlpha = 1;
 
-  const bars = l.flat ? null : spectrumPath(l, frame);
+  const bars = l.flat ? null : spectrumPath(l, frame, look.channelColors);
   if (bars) {
-    ctx.save();
-    ctx.clip(bars.area);
-    ctx.drawImage(field, plot.x, plot.y, plot.w, plot.h);
-    ctx.restore();
+    // One reveal per tint rather than one for all the bars: a bar shows the
+    // field as *its* channel paints it, which is what the strip will do with
+    // that note. Drawn once each and never over one another, because the field
+    // carries opacity and a second pass over the same pixels would double it.
+    for (const [color, area] of bars.areas) {
+      ctx.save();
+      ctx.clip(area);
+      ctx.drawImage(
+        color === "" ? base : field.tinted(look.surface, look.cycle, color),
+        plot.x,
+        plot.y,
+        plot.w,
+        plot.h,
+      );
+      ctx.restore();
+    }
 
     ctx.fillStyle = palette.barCap;
     ctx.fill(bars.caps);
@@ -153,19 +239,27 @@ export function paintPlot(
 }
 
 interface Bars {
-  /** Filled region under each band. */
-  area: Path2D;
+  /**
+   * The filled region under the bands, grouped by the tint they reveal the
+   * field through. The empty key is the untinted field: an audio band, or a
+   * note on a channel with no colour of its own.
+   */
+  areas: Map<string, Path2D>;
   /** Bright line along the top of each band. */
   caps: Path2D;
 }
 
-function spectrumPath(l: PlotLayout, frame: SpectrumFrame): Bars | null {
+function spectrumPath(
+  l: PlotLayout,
+  frame: SpectrumFrame,
+  channelColors?: string[],
+): Bars | null {
   const { levels, centers } = frame;
   if (levels.length === 0 || centers.length !== levels.length) return null;
 
   const edges = bandEdges(centers);
   const floor = l.plot.y + l.plot.h;
-  const area = new Path2D();
+  const areas = new Map<string, Path2D>();
   const caps = new Path2D();
 
   for (let i = 0; i < levels.length; i++) {
@@ -174,10 +268,28 @@ function spectrumPath(l: PlotLayout, frame: SpectrumFrame): Bars | null {
     const w = Math.max(1, xOfHz(l, edges[i + 1]) - x0 - 1);
     const y = yOfDb(l, levelToDb(levels[i]));
     if (y >= floor) continue;
-    area.rect(x0, y, w, floor - y);
+
+    // The channel is read at the band's own index rather than looked up by
+    // frequency: the level and the channel came from one note, and the bar is
+    // that note. This is the one place in the editor that does not have to
+    // find the nearest grid point, because it *is* the grid point.
+    const area = tintOf(channelColors, frame.channels?.[i]);
+    let path = areas.get(area);
+    if (!path) {
+      path = new Path2D();
+      areas.set(area, path);
+    }
+    path.rect(x0, y, w, floor - y);
     caps.rect(x0, y, w, 2);
   }
-  return { area, caps };
+  return { areas, caps };
+}
+
+/** The colour a band's bar reveals the field through, or `""` for the field
+ *  itself. */
+function tintOf(channelColors: string[] | undefined, channel: number | undefined): string {
+  if (!channelColors || channel === undefined || channel === NO_CHANNEL) return "";
+  return channelColors[channel] ?? "";
 }
 
 function paintGrid(

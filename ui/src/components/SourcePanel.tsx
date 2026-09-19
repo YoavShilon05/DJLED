@@ -108,22 +108,24 @@ export const SourcePanel = memo(function SourcePanel({
         />
       </Field>
 
-      {/* Only worth showing where there is a choice to make: a mono
-          microphone has nothing to pick between. */}
-      {channels > 1 && (
+      {/*
+        Only worth showing where there is a choice to make: a mono microphone
+        has nothing to pick between, and a MIDI port no longer has anything to
+        pick *with*. All sixteen channels reach a MIDI layer and each paints in
+        its own colour — the choice moved from which channel to listen to, to
+        what each one looks like, and it lives under Notes with the rest of what
+        a note looks like.
+      */}
+      {channels > 1 && !midi && (
         <Field
-          label={midi ? "MIDI channel" : "Channel"}
-          info={
-            midi
-              ? "A DAW can send several parts down one cable. Pick one to light this layer from that part alone — another layer can take a different one, and they share the port."
-              : "An instrument in input 1 only exists on one channel — mixing it with a silent neighbour costs 6 dB and adds that neighbour's noise."
-          }
+          label="Channel"
+          info="An instrument in input 1 only exists on one channel — mixing it with a silent neighbour costs 6 dB and adds that neighbour's noise."
         >
           <Select
             data={[
               {
                 value: "mix",
-                label: midi ? `All ${channels} channels` : `Mix all ${channels}`,
+                label: `Mix all ${channels}`,
               },
               ...Array.from({ length: channels }, (_, i) => ({
                 value: String(i),
@@ -298,11 +300,9 @@ function resolved(layer: EditorLayer, status: LayerStatus | null, connected: boo
   if (!status) return "Waiting for the engine to report on this layer.";
 
   if (status.kind === "midi") {
-    const channel =
-      layer.source.channel === null
-        ? "all channels"
-        : `channel ${layer.source.channel + 1} of ${status.channels}`;
-    return `${status.deviceName} · midi · ${channel}`;
+    // Always all sixteen. They are told apart by colour rather than by being
+    // filtered out — see the channel palette under Notes.
+    return `${status.deviceName} · midi · all ${status.channels} channels, by colour`;
   }
 
   return [

@@ -143,6 +143,31 @@ export function hexToOklab(hex: string): Oklab {
   return linearRgbToOklab(hexToLinearRgb(hex));
 }
 
+/**
+ * One colour pulled toward another by the second's opacity.
+ *
+ * A port of `tint` in `engine/src/color/render.rs` — it lives here rather than
+ * beside the rest of that port because two things need it: the compositing fold
+ * in `spectrum/render.ts`, which is what the strip preview draws, and the
+ * plot's field raster in `spectrum/paint.ts`, which is what a bar reveals. The
+ * two must not tint by different maths.
+ *
+ * The mix is in Oklab, where the colour surface's own blending happens, and the
+ * weight is the *overlay's* opacity and only that: the result keeps `base`'s
+ * alpha, because opacity here says how much of the colour to take and nothing
+ * about coverage. So a fully transparent overlay changes nothing, and a fully
+ * opaque one replaces the colour without changing what shows through.
+ */
+export function tint(base: Oklab, over: Oklab): Oklab {
+  const w = over.alpha < 0 ? 0 : over.alpha > 1 ? 1 : over.alpha;
+  return {
+    l: base.l + w * (over.l - base.l),
+    a: base.a + w * (over.a - base.a),
+    b: base.b + w * (over.b - base.b),
+    alpha: base.alpha,
+  };
+}
+
 const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
 
 /**

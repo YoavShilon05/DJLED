@@ -441,6 +441,7 @@ fn layer(color: &str, opacity: f32, centers: &[f32]) -> LayerVisual {
         cycle: false,
         layout: LayoutConfig::spanning(LEDS),
         intensity: IntensityConfig::pass_through(),
+        channel_colors: Vec::new(),
         opacity,
         centers: centers.to_vec(),
     }

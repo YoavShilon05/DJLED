@@ -207,10 +207,38 @@ is the same pair of axes audio uses — so the colour surface, the LED sectors,
 reverse, mirror, the EQ and the intensity curve all work on notes without
 knowing anything has changed.
 
-Two layers can take two *channels* of one port, which is the natural way to
-drive a wall from a DAW: one part per layer, each with its own colours and its
-own decay. The port is opened once and the channel filter applied per layer,
-because Windows would refuse the second open.
+### Channels are a colour, not a filter
+
+A DAW sends several parts down one cable, and the obvious thing to do with that
+is to let a layer pick one. That is what this did: a channel selector under the
+source, one part per layer, and the port opened once with the filter applied per
+layer because Windows would refuse the second open.
+
+It is the wrong shape for what a MIDI set actually looks like. Parts arrive
+together and are *read* together — the bass, the pad and the lead are one
+picture, not three layers of one — and splitting them across layers meant three
+copies of every other decision (the note range, the glow, the sectors, the
+sustain) kept in step by hand, for the one thing that differed: what each part
+looked like.
+
+So the filter is gone. Every channel reaches every MIDI layer, and each one
+carries a **colour**: sixteen of them, authored on a 4×4 grid under Notes. A
+note is painted in its channel's colour, so a three-part arrangement reads as
+three colours on one layer with one of everything else.
+
+The colour carries an opacity, and it is a *mix weight* rather than coverage —
+how far the note's colour is pulled from the layer's own field toward the
+channel's, not how much of the layer below shows through. That distinction is
+what lets the two work together instead of one replacing the other: at full
+opacity the note is the channel's colour outright, and below it the colour
+field's gradient shows through underneath, so the wall can read as "bass, low
+on the strip, in blue" with both halves of that sentence doing work. Coverage
+stays the field's, because which hand played a note says nothing about whether
+the layers beneath it are visible.
+
+The channel still rides on `Source` and the CLI's `--channel` still filters on
+it, for `--probe`; the editor simply never sets it, and normalises a stale one
+away when it opens a show from before the palette existed.
 
 ### Getting FL Studio into it
 
@@ -234,7 +262,7 @@ So, once:
 The loopMIDI port then shows up here like any other input. No MIDI hardware is
 involved at any point. `--midi --probe 3` is the flag to reach for when nothing
 appears to arrive: it separates "the port is wrong" from "the notes are landing
-on a channel or in an octave that is being filtered out".
+in an octave that is being filtered out".
 
 ### The note range is stretched, not placed
 
@@ -257,6 +285,7 @@ editor relabels the axis with note names so it is not quietly lying about it.
 | Note range | which notes fill the strip. Notes outside it are dropped, and counted — the editor says how many rather than leaving a dark strip unexplained |
 | Note glow | how far a note bleeds into its neighbours, in semitones. 0 is one hard bar per note |
 | Sustain pedal | whether CC64 holds released notes lit, as it holds them sounding |
+| Channel colour | the sixteen channel colours, on a 4×4 grid. Each one's opacity blends it with the layer's colour field rather than with what is underneath |
 | Decay | the release time after a note is let go — the same control, and the same mapping, as the audio ballistics |
 
 The grid is one point per semitone, which is finer than any audio band plan and
@@ -396,9 +425,9 @@ capture is the scarce half:
   cost.
 - A MIDI input opened twice is an outright failure. Windows hands a port to one
   application at a time, and that application is already this one. So the MIDI
-  *channel* is a filter applied per layer by the note engine rather than a
-  property of the port — which is what lets two layers take two channels of one
-  keyboard.
+  *channel* was never a property of the port; it is now not a filter either —
+  every channel reaches every layer bound to that port and is told apart by its
+  colour.
 
 Audio is the other way round: which channel of an interface is analysed is
 chosen when the stream is built, so two channels genuinely are two streams.

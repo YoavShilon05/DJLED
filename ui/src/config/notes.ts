@@ -27,6 +27,64 @@ export const DEFAULT_HIGH_NOTE = 108;
  *  pitch at all. */
 export const MIN_NOTE_SPAN = 12;
 
+/** MIDI's sixteen channels, which the protocol fixes as firmly as its notes. */
+export const CHANNEL_COUNT = 16;
+
+/**
+ * No channel owns this level — the engine's `NO_CHANNEL`.
+ *
+ * Channels are 0..15, so anything outside that says "nobody": every audio
+ * level, and every MIDI point with nothing sounding on it. It matters that
+ * those are the same answer, because a channel colour paints where a note is
+ * and an unlit point has no note to be anyone's.
+ */
+export const NO_CHANNEL = 255;
+
+/**
+ * The engine's `default_channel_colors`, verbatim.
+ *
+ * Sixteen distinct hues at full opacity, so a MIDI layer reads by channel out
+ * of the box and blending a channel back into the colour field is a slider away
+ * on its square. Kept in step with the Rust by hand — it is a default rather
+ * than a computation, and a drift shows up as a layer whose colours change when
+ * the engine adopts the editor's config.
+ */
+export const DEFAULT_CHANNEL_COLORS = [
+  "#ff0000ff",
+  "#ff6000ff",
+  "#ffbf00ff",
+  "#dfff00ff",
+  "#80ff00ff",
+  "#20ff00ff",
+  "#00ff40ff",
+  "#00ff9fff",
+  "#00ffffff",
+  "#009fffff",
+  "#0040ffff",
+  "#2000ffff",
+  "#8000ffff",
+  "#df00ffff",
+  "#ff00bfff",
+  "#ff0060ff",
+];
+
+/**
+ * The grid the editor lays the sixteen out on: four columns of four, numbered
+ * down each column.
+ *
+ *     1  5   9  13
+ *     2  6  10  14
+ *     3  7  11  15
+ *     4  8  12  16
+ *
+ * A DAW's channels are read as a list, so the columns are what stays stable as
+ * the eye moves — 1..4 together is the first instrument, not the first row of a
+ * table nobody is reading across.
+ */
+export const CHANNEL_GRID: number[] = [
+  0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
+];
+
 const NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
 /** The range as the engine will actually use it: ordered, in range, and at
