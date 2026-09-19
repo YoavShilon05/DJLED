@@ -170,6 +170,28 @@ export function nextId(prefix: string): string {
 export const DEFAULT_SOURCE: InputSource = { id: null, kind: "loopback", channel: null };
 
 /**
+ * Whether this layer paints a still colour rather than a spectrum.
+ *
+ * A layer listening to nothing has no level, so it has no second axis: its
+ * colour field is one dimensional, the intensity stage has nothing to act on,
+ * and the analysis settings have no signal to shape. Three panels and half the
+ * graph ask this, so it is one named question rather than a comparison spelled
+ * out in each of them.
+ */
+export function isStatic(layer: EditorLayer): boolean {
+  return layer.source.kind === "none";
+}
+
+/**
+ * Where a still layer's field is read, on the editor's dB axis.
+ *
+ * The engine samples such a layer at a flat full level, so the top of the axis
+ * is the one row that is ever seen. Keyframes authored on a still layer land
+ * here, and the plot draws the field along it.
+ */
+export const STATIC_DB = DB_MAX;
+
+/**
  * A layer seeded from the surface the engine ships with, so a fresh editor
  * previews what the strip is already doing rather than a blank field.
  */
@@ -278,6 +300,32 @@ export function toSurface(layer: EditorLayer): SurfaceConfig {
       // the same JSON rather than differing by a field full of nulls.
       ...(k.radius === null ? {} : { radius: k.radius }),
     })),
+  };
+}
+
+/**
+ * The surface as it is actually *read*, which for a still layer is not the one
+ * that is stored.
+ *
+ * A layer with no source is sampled at a flat full level, so only the top row
+ * of its field is ever seen. Projecting every keyframe onto that row is what
+ * makes "the field is one dimensional" literally true rather than nearly so:
+ * the colour drawn on a handle is the colour that reaches the wall, instead of
+ * whatever a two dimensional field happens to hold along its top edge.
+ *
+ * A port of `SurfaceConfig::flattened` in `engine/src/color/surface.rs`, and it
+ * has to stay one — the Preview strip and the graph are both drawn from this.
+ *
+ * Deliberately *not* what {@link toSurface} sends: the authored dB is not
+ * wrong, it is simply not being read, and rewriting it on the wire would mean a
+ * layer switched to no source and back had lost the field it was authored with.
+ */
+export function toRenderSurface(layer: EditorLayer): SurfaceConfig {
+  const surface = toSurface(layer);
+  if (!isStatic(layer)) return surface;
+  return {
+    sigma: surface.sigma,
+    keyframes: surface.keyframes.map((k) => ({ ...k, y: 1 })),
   };
 }
 
@@ -448,7 +496,10 @@ function sanitiseSource(stored: InputSource | undefined): InputSource {
   const kind = stored?.kind;
   return {
     id: typeof stored?.id === "string" ? stored.id : null,
-    kind: kind === "input" || kind === "midi" || kind === "loopback" ? kind : "loopback",
+    kind:
+      kind === "input" || kind === "midi" || kind === "none" || kind === "loopback"
+        ? kind
+        : "loopback",
     channel: typeof stored?.channel === "number" ? stored.channel : null,
   };
 }

@@ -25,13 +25,25 @@
  * With one layer both reduce to what this module did before the stack existed,
  * because the backdrop is an unlit strip and over black the two are
  * indistinguishable.
+ *
+ * A layer listening to nothing takes the same path with two of its stages taken
+ * out of the way: its level is a flat full one and its field is read along the
+ * single row that implies, so there is nothing for a threshold, a clamp or a
+ * curve to do. That mirrors what `LiveStack::visuals` hands the engine's
+ * renderer, and has to — this is the strip preview and that is the wall.
  */
 
 import { linearRgbToDisplay, type Rgb } from "../color/display";
 import { CLEAR, clampedRgb, oklabToLinearRgb, over, type LinearRgb } from "../color/oklab";
 import { ColorSurface } from "../color/surface";
 import { evalCurve } from "../config/curve";
-import { toSurface, type EditorConfig, type EditorLayer, type LedKeyframe } from "../config/editor";
+import {
+  isStatic,
+  toRenderSurface,
+  type EditorConfig,
+  type EditorLayer,
+  type LedKeyframe,
+} from "../config/editor";
 import type { EqCurve } from "../config/eq";
 import { DB_MAX, DB_MIN, clamp, hzToNorm, normToHz } from "../config/scales";
 import { levelToDb, type SpectrumFrame } from "./paint";
@@ -133,8 +145,16 @@ export function levelAt(frame: SpectrumFrame, hz: number): number {
   return levels[n - 1];
 }
 
-/** Brightness for a level, after the threshold, the clamp and the curve. */
+/**
+ * Brightness for a level, after the threshold, the clamp and the curve.
+ *
+ * Full for a layer with no source, whatever its stored window says. Those
+ * controls are not shown for such a layer and do not act on it in the engine
+ * either — reading them here would let a threshold left at the top of the axis
+ * black out a layer whose whole point is that it does not react.
+ */
 export function brightnessFor(layer: EditorLayer, level: number): number {
+  if (isStatic(layer)) return 1;
   const db = levelToDb(level);
   if (db <= layer.threshold) return 0;
   const window = layer.clamp - layer.threshold;
@@ -154,9 +174,12 @@ export function layerCoverage(
   frame: SpectrumFrame,
   ledCount: number,
 ): LinearRgb[] {
-  const surface = new ColorSurface(toSurface(layer));
+  const surface = new ColorSurface(toRenderSurface(layer));
   const out: LinearRgb[] = new Array(ledCount);
   const opacity = clamp(layer.opacity, 0, 1);
+  // A layer with no source has no spectrum to read; it sits at a flat full
+  // level, which is the row its flattened field was projected onto.
+  const still = isStatic(layer);
 
   for (let i = 0; i < ledCount; i++) {
     const led = sourceIndex(i, ledCount, layer.mirror, layer.reverse);
@@ -168,7 +191,7 @@ export function layerCoverage(
       continue;
     }
 
-    const level = levelAt(frame, hz);
+    const level = still ? 1 : levelAt(frame, hz);
     // The surface's y is the same normalised level the plot's dB axis shows,
     // so a band is coloured by exactly the field pixel its bar reaches.
     const rgb = clampedRgb(oklabToLinearRgb(surface.sample(hzToNorm(hz), level)));

@@ -40,8 +40,8 @@ cargo run --manifest-path engine/Cargo.toml --release -- --port COM3
 cd ui && npm install && npm run dev
 
 # Tests
-cargo test --manifest-path engine/Cargo.toml        # 263 pass (217 lib + 46 integration)
-cd ui && npm test                                   # 65 pass across 8 files
+cargo test --manifest-path engine/Cargo.toml        # 281 pass (228 lib + 53 integration)
+cd ui && npm test                                   # 86 pass across 9 files
 cd ui && npm run typecheck                          # tsc --noEmit, clean
 
 # End-to-end over the real socket, against a running engine
@@ -159,6 +159,29 @@ trip.
 - **Commands are drained before audio is read**, on every pass, not only on
   passes that complete a frame. A dead loopback delivers no samples, and the
   command that most needs through is the one moving off it.
+- **A layer can listen to *nothing*, and that is a source kind rather than a
+  mode.** `SourceKind::None` opens no device, builds no analyser, and sits at a
+  flat full level — a still colour along the strip. Three things follow and each
+  is load-bearing. Its colour field is one dimensional, because a flat level
+  reads exactly one row of the surface: the field is *projected* onto that row
+  (`SurfaceConfig::flattened`, `toRenderSurface`) rather than sampled along it,
+  or the editor would draw handles whose colour never reaches the wall. The
+  intensity stage is replaced by `pass_through`, explicitly, because full level
+  *is* the top of the axis and a threshold left at 0 dB would otherwise black
+  out the one layer that is supposed to be unconditional. And it reports frames
+  on its own clock (`Analysis::tick`), because the run loop renders only when a
+  layer says it has something new — without it a show of still layers alone
+  leaves the strip dark while every preview in the editor looks right.
+- **A still layer's authored dB crosses the wire untouched.** The flattening is
+  a property of how the field is read, not how it is stored. The engine keeps
+  every config it is sent, so flattening on the way out would make a layer
+  switched to no source and back permanently lose its 2D field one preset switch
+  later. `dbOfY` on a flat plot is a constant for the same reason, and the drag
+  handler discards the vertical rather than writing that constant back.
+- **`feed: None` in the stack means two different things.** A device that would
+  not open, and a layer that has none by design. The `error` beside it is what
+  tells them apart — one is a fault with a red badge, the other is a choice.
+  `retry_failed` tests for the error, not for the missing feed.
 - **MIDI mode's x axis is positions, not pitches.** The note range is stretched
   across 20 Hz–20 kHz. A keyframe "at 250 Hz" means a fifth of the way along.
 - **A frame narrower than the level grid aggregates; one at least as wide

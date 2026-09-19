@@ -2,7 +2,7 @@ import { memo } from "react";
 import { Divider, Select, Slider, Stack } from "@mantine/core";
 
 import { CURVE_OPTIONS, type CurveType } from "../config/curve";
-import { SAMPLE_LENGTHS, type EditorLayer } from "../config/editor";
+import { isStatic, SAMPLE_LENGTHS, type EditorLayer } from "../config/editor";
 import { Field } from "./Field";
 
 interface Props {
@@ -24,70 +24,83 @@ interface Props {
  * master brightness at the bottom of it, which put the only control that
  * touches the whole wall inside the panel for one layer.
  *
+ * A layer listening to nothing gets the second group only. There is no signal
+ * for a decay, a hop or an intensity curve to shape, and leaving them on screen
+ * to do nothing is the mistake the MIDI panel used to make — a full-height
+ * panel whose only message was that it did not apply. Where the layer lands on
+ * the strip still matters, so that half stays.
+ *
  * Memoised: nothing in here is driven by a frame, and a frame arrives thirty
  * times a second. See the note on `frame` in `App.tsx`.
  */
 export const ShapePanel = memo(function ShapePanel({ layer, onChange, sampleRate }: Props) {
   const rate = sampleRate || 48_000;
+  const still = isStatic(layer);
 
   return (
     <Stack gap="md">
-      <Divider label="Response" labelPosition="left" />
+      {/* Everything above the divider acts on a signal, and a still layer has
+          none. */}
+      {!still && (
+        <>
+          <Divider label="Response" labelPosition="left" />
 
-      <Field
-        label="Decay"
-        value={layer.decay.toFixed(2)}
-        hint="How much of the previous frame a band keeps."
-        info="Higher falls away more slowly, so a kick leaves a tail instead of a flash. Zero snaps to whatever the last frame measured; one never falls at all."
-      >
-        <Slider
-          min={0}
-          max={0.99}
-          step={0.01}
-          value={layer.decay}
-          onChange={(decay) => onChange({ ...layer, decay })}
-          label={(v) => v.toFixed(2)}
-        />
-      </Field>
+          <Field
+            label="Decay"
+            value={layer.decay.toFixed(2)}
+            hint="How much of the previous frame a band keeps."
+            info="Higher falls away more slowly, so a kick leaves a tail instead of a flash. Zero snaps to whatever the last frame measured; one never falls at all."
+          >
+            <Slider
+              min={0}
+              max={0.99}
+              step={0.01}
+              value={layer.decay}
+              onChange={(decay) => onChange({ ...layer, decay })}
+              label={(v) => v.toFixed(2)}
+            />
+          </Field>
 
-      <Field
-        label="Frame hop"
-        value={`${((layer.sampleLength / rate) * 1000).toFixed(1)} ms`}
-        info="New samples between analysis frames. Shorter reacts faster and costs more CPU. This is not an FFT window length — the engine draws every band from the smallest transform that can still resolve it, five tiers from 8192 down to 128, so there is no single window to set."
-      >
-        <Select
-          data={SAMPLE_LENGTHS.map((n) => ({ value: String(n), label: `${n} samples` }))}
-          value={String(layer.sampleLength)}
-          onChange={(value) =>
-            onChange({ ...layer, sampleLength: Number(value) || layer.sampleLength })
-          }
-          allowDeselect={false}
-          comboboxProps={{ withinPortal: true }}
-        />
-      </Field>
+          <Field
+            label="Frame hop"
+            value={`${((layer.sampleLength / rate) * 1000).toFixed(1)} ms`}
+            info="New samples between analysis frames. Shorter reacts faster and costs more CPU. This is not an FFT window length — the engine draws every band from the smallest transform that can still resolve it, five tiers from 8192 down to 128, so there is no single window to set."
+          >
+            <Select
+              data={SAMPLE_LENGTHS.map((n) => ({ value: String(n), label: `${n} samples` }))}
+              value={String(layer.sampleLength)}
+              onChange={(value) =>
+                onChange({ ...layer, sampleLength: Number(value) || layer.sampleLength })
+              }
+              allowDeselect={false}
+              comboboxProps={{ withinPortal: true }}
+            />
+          </Field>
 
-      <Field
-        label="Intensity curve"
-        hint={
-          layer.curve.type === "bezier"
-            ? "Drag the two handles in the curve box on the graph."
-            : "Fixed shape — switch to Bézier for handles."
-        }
-        info="Maps a level between the threshold and the clamp onto brightness. The two rail handles beside the graph set that window; this sets what happens inside it."
-      >
-        <Select
-          data={CURVE_OPTIONS}
-          value={layer.curve.type}
-          onChange={(value) =>
-            onChange({
-              ...layer,
-              curve: { ...layer.curve, type: (value as CurveType) ?? layer.curve.type },
-            })
-          }
-          allowDeselect={false}
-          comboboxProps={{ withinPortal: true }}
-        />
-      </Field>
+          <Field
+            label="Intensity curve"
+            hint={
+              layer.curve.type === "bezier"
+                ? "Drag the two handles in the curve box on the graph."
+                : "Fixed shape — switch to Bézier for handles."
+            }
+            info="Maps a level between the threshold and the clamp onto brightness. The two rail handles beside the graph set that window; this sets what happens inside it."
+          >
+            <Select
+              data={CURVE_OPTIONS}
+              value={layer.curve.type}
+              onChange={(value) =>
+                onChange({
+                  ...layer,
+                  curve: { ...layer.curve, type: (value as CurveType) ?? layer.curve.type },
+                })
+              }
+              allowDeselect={false}
+              comboboxProps={{ withinPortal: true }}
+            />
+          </Field>
+        </>
+      )}
 
       <Divider label="On the strip" labelPosition="left" />
 

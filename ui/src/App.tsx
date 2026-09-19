@@ -9,6 +9,7 @@ import {
   clearConfig,
   fromEngineConfig,
   hasStoredConfig,
+  isStatic,
   loadConfig,
   saveConfig,
   toEngineConfig,
@@ -449,7 +450,11 @@ export default function App() {
                 sampleRate={sampleRate}
               />
               <Text size="xs" c="dimmed">
-                Right-click the graph for a colour keyframe · double-click for an EQ band ·
+                Right-click the graph for a colour keyframe ·{" "}
+                {/* A still layer has no signal, so there is no EQ band to add
+                    and no gesture for one — saying otherwise would be the
+                    caption describing a different graph. */}
+                {!isStatic(layer) && "double-click for an EQ band · "}
                 right-click the LED track for a sector · click to select,{" "}
                 <Kbd size="xs">Del</Kbd> to remove
               </Text>
@@ -471,9 +476,13 @@ export default function App() {
 function layerSummary(layer: EditorLayer, total: number, enabled: number): string {
   if (!layer.enabled) return "hidden — not composited, not analysed";
   if (layer.opacity <= 0) return "fully transparent — nothing of it reaches the strip";
-  if (total === 1) return "the only layer";
   const opacity = layer.opacity < 1 ? `${Math.round(layer.opacity * 100)}% opacity · ` : "";
-  return `${opacity}one of ${enabled} showing`;
+  // Said before anything about the stack, because it is the thing that explains
+  // the shape of the graph underneath — a lane rather than a plot, with no
+  // level axis, no bars and no thresholds.
+  const still = isStatic(layer) ? "no source · a still colour · " : "";
+  if (total === 1) return `${still}${opacity}the only layer`;
+  return `${still}${opacity}one of ${enabled} showing`;
 }
 
 const DEMO_BANDS = 48;

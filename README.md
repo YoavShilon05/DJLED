@@ -106,7 +106,8 @@ puts the same show back on the wall.
 
 Three ways in, picked from the **Source** dropdown in the editor or the flags
 above, and switchable while running. Two of them are audio; MIDI is the third,
-and has a section of its own below.
+and has a section of its own below. A fourth entry in the same dropdown is
+*nothing at all* — see [A layer that listens to nothing](#a-layer-that-listens-to-nothing).
 
 The choice is made **per layer**, so a show can be listening to all three at
 once. Layers naming the same device share one open handle — see
@@ -146,6 +147,57 @@ Switching rebuilds the analyser only when the sample rate actually changes. Band
 edges come from the scale config alone, so a rate change moves which FFT tier
 each band draws from, never the centre frequencies the strip is mapped against —
 which is why the renderer survives untouched.
+
+### A layer that listens to nothing
+
+The fourth entry in the dropdown is **Nothing**, and it is a kind of source
+rather than a switch beside one: the question "what drives this layer" has four
+answers, not three answers and a mode. A layer with no source paints a **still
+colour** — a wash along the strip that does not react. That is how you get a lit
+wall between tracks, a warm base for reactive layers to sit on, or a single
+coloured region under a spectrum confined to somewhere else.
+
+It costs nothing to run. No device is opened, no analyser is built, and the
+layer is never a failure to be retried — which matters, because `feed: None`
+inside the engine already means "this layer's device would not open" and the
+editor draws a red indicator on that. One is a choice and the other is a fault,
+and the error beside them is what tells them apart.
+
+**The interesting consequence is what it does to the colour surface.** The
+surface is a field over (position × *level*), and a still layer has no level: it
+sits at a flat full one forever. So exactly one row of that field is ever read,
+and the editor says so by collapsing the graph to a **lane** — one dimension,
+the position along the strip, with no dB axis, no bars, no threshold, no clamp
+and no intensity curve. Those are not hidden; a still layer does not have them.
+
+Two decisions inside that are worth writing down, because the obvious version of
+each is wrong:
+
+- **The field is projected onto the row that is read, not merely sampled
+  along it.** Sampling a two-dimensional field along its top edge would leave
+  colours authored low in the field showing on the graph as handles and
+  contributing almost nothing to the strip — the editor drawing a red dot beside
+  a lane with no red in it. Projecting puts every keyframe in the conversation
+  at the one row there is, so the handle and the wall agree.
+- **The projection happens where the field is *read*, not where it is stored.**
+  The authored dB still crosses the wire and is still what a preset keeps. It is
+  not wrong, it is simply not being looked at — and the engine keeps every
+  config it is sent, so flattening on the way out would mean a layer switched to
+  no source and back had permanently lost the two-dimensional field it was
+  authored with, one preset switch later. Dragging a handle sideways in the lane
+  leaves the dB alone for the same reason.
+
+The intensity stage is taken out of the way explicitly rather than left to work
+out to a no-op. A flat full level *is* the top of the axis, so a threshold left
+at 0 dB would close the band — blacking out the one kind of layer whose whole
+point is that it is unconditional, for a control it no longer has.
+
+One last thing the engine needs: a still layer reports a frame on its own clock,
+about every 8 ms. The run loop renders when a layer says it has something new,
+and a show made only of still layers would otherwise never say so — a strip that
+stays dark while every preview in the editor shows the colour it is supposed to
+be. Clocked rather than rendered once, so temporal dithering still has
+successive frames to spread its quantisation error across.
 
 ## MIDI
 
@@ -399,6 +451,11 @@ Everything else hangs off those two axes:
 | Threshold / clamp | rail to the right | the dB window: dark below, full brightness above |
 | Intensity curve | between those two handles | brightness against level inside that window |
 
+A layer listening to nothing has the first three and none of the last two: with
+no level there is no window to set and no curve to set inside it, so the plot
+collapses to a lane and the rail goes away with them. See
+[A layer that listens to nothing](#a-layer-that-listens-to-nothing).
+
 The curve box is deliberately bounded by the two handles: its top edge *is* the
 clamp line and its bottom edge *is* the threshold line, so the mapping can be
 read straight across from a band rather than mentally rescaled.
@@ -581,8 +638,8 @@ next during the blackout.
 ## Tests
 
 ```bash
-cargo test --manifest-path engine/Cargo.toml   # 255
-cd ui && npm test && npm run typecheck         # 65
+cargo test --manifest-path engine/Cargo.toml   # 281
+cd ui && npm test && npm run typecheck         # 86
 ```
 
 The ones worth knowing about live in `engine/tests/artifacts.rs`: they assert the
@@ -607,6 +664,16 @@ the same reason: a preset that reloads with every field intact and still lights
 the wall differently would look like a save bug and would not be one. So the
 tests render — a show is stored, the file is reloaded, and the LED bytes have to
 match those of the show it was saved from.
+
+A layer with no source is pinned the same way and in the same places, because
+its whole risk is that it is a special case: `pipeline.rs` drives a show of
+still layers through `LiveStack` with no device anywhere in the chain and checks
+that the strip lights, that moving every keyframe down the intensity axis
+changes nothing, and that a threshold shut at 0 dB does not blank it;
+`stack.rs` checks that such a layer opens nothing, reports no error for it, and
+releases the device it was moved off; `ui/src/spectrum/stack.test.ts` makes the
+same claims of the browser's fold, and `layout.test.ts` pins the one piece of
+geometry the collapsed graph is built out of.
 
 The layer tests are in three places, because there are three ways a stack can be
 wrong. `color/render.rs` pins the fold itself, including that a one-layer stack

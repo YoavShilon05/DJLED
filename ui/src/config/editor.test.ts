@@ -10,6 +10,8 @@ import {
   nextId,
   saveConfig,
   toEngineConfig,
+  toRenderSurface,
+  toSurface,
   withLayer,
   type EditorConfig,
 } from "./editor";
@@ -229,5 +231,47 @@ describe("the wire format", () => {
     const next = withLayer(config, { ...a, name: "renamed" });
     expect(next.layers.map((l) => l.name)).toEqual(["renamed", "B"]);
     expect(next.layers[1]).toBe(b);
+  });
+});
+
+describe("a layer with no source", () => {
+  const still = () => ({
+    ...defaultLayer("still"),
+    source: { id: null, kind: "none" as const, channel: null },
+    colorKeyframes: [
+      { id: "ck-1", hz: 100, db: -70, color: "#ff2000", radius: null },
+      { id: "ck-2", hz: 5000, db: -10, color: "#40c0ff", radius: null },
+    ],
+  });
+
+  /**
+   * The flattening is a property of how the field is *read*, not of how it is
+   * stored. Writing it to the wire instead would mean a layer switched to no
+   * source and back had lost the two dimensional field it was authored with —
+   * and the engine keeps every config it is sent, so one preset switch would
+   * make that permanent.
+   */
+  it("sends the authored keyframes and reads a flattened field", () => {
+    const layer = still();
+    expect(toSurface(layer).keyframes.map((k) => k.y)).not.toEqual([1, 1]);
+    expect(toRenderSurface(layer).keyframes.map((k) => k.y)).toEqual([1, 1]);
+    // The positions along the strip, and the colours, are untouched by it.
+    expect(toRenderSurface(layer).keyframes.map((k) => k.x)).toEqual(
+      toSurface(layer).keyframes.map((k) => k.x),
+    );
+  });
+
+  it("leaves a layer with a device two dimensional", () => {
+    const layer = { ...still(), source: { id: null, kind: "loopback" as const, channel: null } };
+    expect(toRenderSurface(layer)).toEqual(toSurface(layer));
+  });
+
+  it("survives a round trip to the engine and back", () => {
+    const layer = still();
+    const config: EditorConfig = { ...DEFAULT_CONFIG, layers: [layer], activeLayerId: layer.id };
+    const back = fromEngineConfig(config, toEngineConfig(config));
+    expect(back.layers[0].source.kind).toBe("none");
+    // Including the dB the wire carried but nothing read.
+    expect(back.layers[0].colorKeyframes.map((k) => Math.round(k.db))).toEqual([-70, -10]);
   });
 });

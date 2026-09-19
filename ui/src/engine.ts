@@ -106,8 +106,13 @@ export interface MidiConfig {
  * the user picks alongside it; it only matters on its own when no device is
  * named. MIDI ports are a third kind, listed alongside them because choosing
  * what drives a layer is one choice, not two.
+ *
+ * `"none"` is the fourth and is not a device at all: a layer that listens to
+ * nothing paints a still colour. It is a kind rather than a flag beside the
+ * selection because that is exactly what it is — one more answer to "what is
+ * driving this layer", chosen from the same dropdown as the other three.
  */
-export type SourceKind = "loopback" | "input" | "midi";
+export type SourceKind = "loopback" | "input" | "midi" | "none";
 
 /** The engine's `source::Source`, verbatim. */
 export interface InputSource {

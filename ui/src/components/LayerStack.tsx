@@ -332,7 +332,14 @@ function LayerRow({
               color={status?.error ? "red" : status ? "teal" : "gray"}
               style={{ cursor: "help" }}
             >
-              {status?.error ? "no source" : (status?.kind ?? layer.source.kind)}
+              {/* "still" rather than the kind's own name, which is "none" and
+                  one word away from the "no source" a dead device gets. The two
+                  could not be less alike: one is a choice, the other a fault. */}
+              {status?.error
+                ? "no source"
+                : layer.source.kind === "none"
+                  ? "still"
+                  : (status?.kind ?? layer.source.kind)}
             </Badge>
           </Tooltip>
 
@@ -407,6 +414,10 @@ function LayerRow({
  */
 function describe(layer: EditorLayer, status: LayerStatus | null): string {
   if (status?.error) return status.error;
+  // Before the offline case: this row resolves to the same thing either way,
+  // because it resolves to nothing. It is also the one row whose description
+  // would otherwise read "system default", which names a device it has not got.
+  if (layer.source.kind === "none") return "no source · a still colour";
   if (!status) return layer.source.id ? "offline" : "system default · offline";
 
   const channel =

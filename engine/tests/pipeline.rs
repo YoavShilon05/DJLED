@@ -628,3 +628,154 @@ fn an_empty_colour_field_paints_nothing() {
 
     assert_eq!(stacked.link.leds(), alone.link.leds(), "an empty field changed the strip");
 }
+
+// ---------------------------------------------------------------------------
+// A layer that listens to nothing
+// ---------------------------------------------------------------------------
+
+/// A show driven through `LiveStack` rather than through an analyser the test
+/// holds itself.
+///
+/// That is not incidental. A still layer has no device and no signal, so the
+/// levels it paints with are invented by the stack — testing it any other way
+/// would be testing a constant this file wrote down, which is exactly the class
+/// of test `pipeline.rs` exists to be the opposite of. Nothing here opens a
+/// device: a show of still layers alone is the one show that runs on a machine
+/// with no audio hardware at all.
+struct StillShow {
+    stack: djled_engine::LiveStack,
+    renderer: Renderer,
+    link: MockLink,
+}
+
+impl StillShow {
+    fn new(layers: Vec<djled_engine::Layer>) -> Self {
+        // Through JSON, because normalising a show — filling the blank ids the
+        // stack matches telemetry by — happens on the way in.
+        let json = serde_json::to_string(&djled_engine::ShowConfig { layers }).unwrap();
+        let show: djled_engine::ShowConfig = serde_json::from_str(&json).unwrap();
+
+        let base = EngineConfig::default();
+        let stack = djled_engine::LiveStack::open(&show, &base, 0.25);
+        let renderer = Renderer::stacked(
+            RenderConfig { dither: false, ..Default::default() },
+            &stack.visuals(),
+            stack.points().max(1),
+            LEDS,
+        )
+        .unwrap();
+        Self { stack, renderer, link: MockLink::new(LEDS) }
+    }
+
+    /// Render frames until `count` of them have reached the wire, or give up.
+    ///
+    /// A still layer reports on a clock rather than on arriving samples, so
+    /// this waits the way the run loop does instead of assuming a poll produces
+    /// a frame.
+    fn run(&mut self, count: usize) -> usize {
+        let mut frames = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while frames < count && std::time::Instant::now() < deadline {
+            if !self.stack.poll() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            let pixels = self.renderer.render_stack(&self.stack.all_levels());
+            self.link.send(pixels).unwrap();
+            frames += 1;
+        }
+        frames
+    }
+}
+
+/// A still layer spanning the strip, painted with one colour authored at `db`
+/// on the editor's axis — 0 is the top of the field, -80 the bottom.
+fn still_layer(color: &str, db: f32) -> djled_engine::Layer {
+    let y = djled_engine::color::intensity::db_to_level(db);
+    djled_engine::Layer {
+        source: djled_engine::Source::nothing(),
+        surface: SurfaceConfig {
+            keyframes: vec![
+                djled_engine::color::Keyframe::new(0.0, y, color),
+                djled_engine::color::Keyframe::new(1.0, y, color),
+            ],
+            sigma: 0.5,
+        },
+        ..djled_engine::Layer::spanning(LEDS)
+    }
+}
+
+/// The claim the feature was asked for, all the way to the LED bytes: a layer
+/// listening to nothing lights the whole strip with the colour it was given,
+/// with no audio anywhere in the chain.
+#[test]
+fn a_layer_with_no_source_lights_the_strip_on_its_own() {
+    let mut show = StillShow::new(vec![still_layer("#ff2000", 0.0)]);
+    assert!(show.run(3) > 0, "a show of still layers alone never reported a frame");
+
+    let leds = show.link.leds();
+    assert!(
+        leds.iter().all(|px| light(*px) > 0),
+        "a still layer left part of the strip dark: {:?}",
+        leds.iter().position(|px| light(*px) == 0),
+    );
+    // Red, not merely lit: the authored colour is what reached the wire.
+    assert!(
+        leds.iter().all(|px| px[0] > px[1] && px[0] > px[2]),
+        "the still layer is not the colour it was authored",
+    );
+}
+
+/// The field is read along *one* row, so where a colour was authored on the
+/// intensity axis cannot change what the strip does. A layer whose whole field
+/// sits at the bottom of the plot paints exactly what the same field at the top
+/// paints — which is what "the graph is one dimensional" has to mean once it
+/// reaches the wall.
+#[test]
+fn a_still_layer_reads_its_field_along_one_row() {
+    let mut low = StillShow::new(vec![still_layer("#40c0ff", -80.0)]);
+    let mut high = StillShow::new(vec![still_layer("#40c0ff", 0.0)]);
+    assert!(low.run(3) > 0 && high.run(3) > 0);
+
+    assert_eq!(
+        low.link.leds(),
+        high.link.leds(),
+        "a still layer's colour moved when its keyframes moved up the intensity axis",
+    );
+}
+
+/// The intensity stage is taken out of a still layer's way, rather than left to
+/// happen to agree. A threshold dragged to the top of the axis would close a
+/// band that is *at* the top of the axis, so without this a layer whose whole
+/// point is that it does not react would go black for a setting it does not
+/// have a control for any more.
+#[test]
+fn a_still_layer_ignores_a_threshold_that_would_blank_it() {
+    let closed = djled_engine::Layer { threshold: 0.0, clamp: 0.0, ..still_layer("#ffffff", 0.0) };
+    let mut show = StillShow::new(vec![closed]);
+    assert!(show.run(3) > 0);
+
+    assert!(
+        show.link.leds().iter().all(|px| light(*px) > 0),
+        "a threshold blanked a layer with no signal to threshold",
+    );
+}
+
+/// Still under reactive: the two compose like any other pair, so a still wash
+/// is something to put a spectrum on top of rather than a mode the show is in.
+#[test]
+fn a_still_layer_sits_under_a_layer_that_paints_nothing() {
+    let empty = djled_engine::Layer {
+        surface: SurfaceConfig { keyframes: Vec::new(), sigma: 0.5 },
+        ..still_layer("#ffffff", 0.0)
+    };
+    let mut stacked = StillShow::new(vec![still_layer("#ff2000", 0.0), empty]);
+    let mut alone = StillShow::new(vec![still_layer("#ff2000", 0.0)]);
+    assert!(stacked.run(3) > 0 && alone.run(3) > 0);
+
+    assert_eq!(
+        stacked.link.leds(),
+        alone.link.leds(),
+        "an empty field over a still one changed the strip",
+    );
+}

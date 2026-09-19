@@ -408,6 +408,10 @@ fn list_devices() {
                 SourceKind::Loopback => "loopback — what the PC is playing",
                 SourceKind::Input => "input — microphones, line in, interface inputs",
                 SourceKind::Midi => "midi — keyboards, and virtual cables from a DAW",
+                // Unreachable: nothing enumerates as a device you could pick.
+                // Selecting no source at all is offered by the editor, not
+                // here, because it is not one of the machine's endpoints.
+                SourceKind::None => "none",
             });
             kind = Some(device.kind);
         }
@@ -863,6 +867,9 @@ fn print_header(stack: &LiveStack, link: &dyn Link, led_count: usize, point_cap:
                     ""
                 );
             }
+        }
+        None if stack.source_kind(0) == SourceKind::None => {
+            println!("  colour   still, {} points across {led_count} LEDs", stack.centers(0).len());
         }
         None => {
             println!("  notes    {} semitones across {led_count} LEDs", stack.centers(0).len());

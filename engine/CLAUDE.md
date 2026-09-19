@@ -19,7 +19,7 @@ the primary documentation and are usually more current than any summary here.
 | `main.rs` | CLI, the 60 fps loop, terminal preview, device listing, probe and test patterns |
 | `stack.rs` | The running stack: one analyser per layer, one open device per *selection* |
 | `show.rs` | `ShowConfig` / `Layer` — everything the editor can change, in one struct |
-| `source.rs` | `Source` (what to listen to) and `LiveSource` (the open thing + its analyser) |
+| `source.rs` | `Source` (what to listen to, including nothing) and `LiveSource` (the open thing + its analyser) |
 | `capture.rs` | WASAPI via cpal: loopback of a render endpoint, or a capture endpoint |
 | `midi/mod.rs` | WinMM port open, callback → SPSC ring, message parsing |
 | `midi/notes.rs` | Notes → levels on the frequency axis. Envelope, sustain, note range |
@@ -84,6 +84,13 @@ the primary documentation and are usually more current than any summary here.
   own 25 ms listening window. That single-token discipline is what keeps the
   write path from queueing: the moment the PC can get ahead, the strip runs
   seconds late and the sketch resynchronises on garbage.
+- **A layer with no source is not a layer that failed.** `SourceKind::None`
+  binds no feed, so `feed: None` means either that or a device that would not
+  open; `error` is the only thing distinguishing them, and `retry_failed` tests
+  for *that* rather than for a missing feed — otherwise every rescan rebuilds
+  the whole stack and restarts every capture. `LiveStack::visuals` gives such a
+  layer a flattened surface and `IntensityConfig::pass_through`, and
+  `LiveStack::poll` advances it with `Analysis::tick` instead of a feed.
 - **A device that won't open is not fatal.** The layer keeps its place, sits at
   silence, and carries the reason in `LayerStatus`. `ListSources` retries them,
   because a rescan is exactly what someone does after plugging the interface
@@ -120,14 +127,14 @@ the primary documentation and are usually more current than any summary here.
 
 ## Tests
 
-263 total: 217 unit (in-module `#[cfg(test)]`) + 46 integration.
+281 total: 228 unit (in-module `#[cfg(test)]`) + 53 integration.
 
 | File | What it defends |
 |---|---|
 | `tests/artifacts.rs` (8) | The reported bugs stay fixed. One independently computes what a naive analyser would produce, so the suppression tests aren't just asserting nothing happens |
-| `tests/pipeline.rs` (19) | Every editor control's effect reaches the LED bytes. **Add a row here for any new control** |
-| `tests/midi_pipeline.rs` (11) | The note path end to end, delivered as bytes — the only MIDI coverage that runs without a port |
-| `tests/color_reference.rs` (3) | The Rust side of the TS parity fixture |
+| `tests/pipeline.rs` (25) | Every editor control's effect reaches the LED bytes, including a show of still layers driven through `LiveStack` with no device in the chain. **Add a row here for any new control** |
+| `tests/midi_pipeline.rs` (12) | The note path end to end, delivered as bytes — the only MIDI coverage that runs without a port |
+| `tests/color_reference.rs` (4) | The Rust side of the TS parity fixture |
 | `tests/presets.rs` (4) | A preset stored, reloaded from disk, and rendered — the bytes have to match the show it was saved from |
 
 Layer behaviour is pinned in three places on purpose: `color/render.rs` (the

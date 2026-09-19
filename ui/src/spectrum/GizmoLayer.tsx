@@ -66,6 +66,12 @@ const MONO = "var(--mantine-font-family-monospace)";
  * The layer itself is transparent to the pointer; only the marks and the two
  * background rects opt back in.
  *
+ * On a flat plot — a layer listening to nothing — the marks that belong to the
+ * intensity axis are not drawn at all: the threshold, the clamp, the curve and
+ * the dB labels have no axis to sit on, and the EQ has no signal to shape. That
+ * is not the overlay checkboxes being overridden; those say what to draw of
+ * what a layer *has*, and a still layer has none of these.
+ *
  * Memoised because the canvas beneath it repaints at frame rate and none of
  * this changes unless an edit or a resize happens.
  */
@@ -91,6 +97,9 @@ export const GizmoLayer = memo(function GizmoLayer({
   const thresholdY = yOfDb(layout, layer.threshold);
   const clampY = yOfDb(layout, layer.clamp);
   const laneX = railLaneX(layout);
+  // Everything gated on this is a statement about level, and a flat plot has no
+  // level. Read once so the eight places that ask agree by construction.
+  const levels = !layout.flat;
 
   return (
     <svg
@@ -111,11 +120,11 @@ export const GizmoLayer = memo(function GizmoLayer({
         fill="transparent"
         style={{ pointerEvents: "all", cursor: "crosshair" }}
         onContextMenu={onAddColor}
-        onDoubleClick={onAddEq}
+        onDoubleClick={levels ? onAddEq : undefined}
         onPointerDown={onClearSelection}
       />
 
-      {gizmos.thresholds && (
+      {levels && gizmos.thresholds && (
         <rect
           x={plot.x + 1}
           y={thresholdY}
@@ -145,7 +154,7 @@ export const GizmoLayer = memo(function GizmoLayer({
 
       {/* Under the threshold lines: the EQ fills an area, and a filled shape
           drawn last would bury them. */}
-      {gizmos.eq && (
+      {levels && gizmos.eq && (
         <EqGizmo
           layout={layout}
           bands={layer.eq}
@@ -157,7 +166,7 @@ export const GizmoLayer = memo(function GizmoLayer({
         />
       )}
 
-      {gizmos.thresholds && (
+      {levels && gizmos.thresholds && (
         <>
           <LevelLine
             y={clampY}
@@ -178,7 +187,7 @@ export const GizmoLayer = memo(function GizmoLayer({
         </>
       )}
 
-      {gizmos.curve && (
+      {levels && gizmos.curve && (
         <CurveGizmo
           box={curveBox(layout, layer.clamp, layer.threshold)}
           curve={layer.curve}
@@ -188,7 +197,7 @@ export const GizmoLayer = memo(function GizmoLayer({
         />
       )}
 
-      {gizmos.thresholds && (
+      {levels && gizmos.thresholds && (
         <>
           <RailHandle
             cx={laneX}
@@ -220,27 +229,47 @@ export const GizmoLayer = memo(function GizmoLayer({
         the frequency axis that the strip does not have.
       */}
       {gizmos.colorKeyframes &&
-        layer.colorKeyframes.map((k) =>
-          k.radius === null ? null : (
+        layer.colorKeyframes.map((k) => {
+          if (k.radius === null) return null;
+          const cx = xOfHz(layout, k.hz);
+          const cy = yOfDb(layout, k.db);
+          const rx = k.radius * plot.w;
+          const opacity =
+            sameTarget(selected, { kind: "color", id: k.id }) ||
+            sameTarget(active, { kind: "color", id: k.id })
+              ? 0.9
+              : 0.3;
+          // On a flat plot every keyframe is on the one row, so the reach is
+          // purely horizontal and the honest mark is the span it covers. An
+          // ellipse there would claim a vertical extent the field does not have.
+          return layout.flat ? (
+            <rect
+              key={`aoe-${k.id}`}
+              x={cx - rx}
+              y={plot.y + 1}
+              width={rx * 2}
+              height={plot.h - 2}
+              fill="none"
+              stroke={palette.gizmo}
+              strokeWidth={1}
+              strokeDasharray="3 4"
+              strokeOpacity={opacity}
+            />
+          ) : (
             <ellipse
               key={`aoe-${k.id}`}
-              cx={xOfHz(layout, k.hz)}
-              cy={yOfDb(layout, k.db)}
-              rx={k.radius * plot.w}
+              cx={cx}
+              cy={cy}
+              rx={rx}
               ry={k.radius * plot.h}
               fill="none"
               stroke={palette.gizmo}
               strokeWidth={1}
               strokeDasharray="3 4"
-              strokeOpacity={
-                sameTarget(selected, { kind: "color", id: k.id }) ||
-                sameTarget(active, { kind: "color", id: k.id })
-                  ? 0.9
-                  : 0.3
-              }
+              strokeOpacity={opacity}
             />
-          ),
-        )}
+          );
+        })}
 
       {gizmos.colorKeyframes &&
         layer.colorKeyframes.map((k) => {
@@ -294,22 +323,26 @@ export const GizmoLayer = memo(function GizmoLayer({
         corners are exactly where the default keyframes sit, so a caption at the
         end of either axis would spend its life underneath one.
       */}
-      <text x={gutter.w - 9} y={plot.y - 5} textAnchor="end" fontSize={9} fill={palette.tick} fontFamily={MONO}>
-        dB
-      </text>
-      {DB_TICKS.map((db) => (
-        <text
-          key={db}
-          x={gutter.w - 9}
-          y={clampText(yOfDb(layout, db), plot.y, plot.h)}
-          textAnchor="end"
-          fontSize={10}
-          fill={palette.tick}
-          fontFamily={MONO}
-        >
-          {db}
-        </text>
-      ))}
+      {levels && (
+        <>
+          <text x={gutter.w - 9} y={plot.y - 5} textAnchor="end" fontSize={9} fill={palette.tick} fontFamily={MONO}>
+            dB
+          </text>
+          {DB_TICKS.map((db) => (
+            <text
+              key={db}
+              x={gutter.w - 9}
+              y={clampText(yOfDb(layout, db), plot.y, plot.h)}
+              textAnchor="end"
+              fontSize={10}
+              fill={palette.tick}
+              fontFamily={MONO}
+            >
+              {db}
+            </text>
+          ))}
+        </>
+      )}
 
       <text
         x={gutter.w - 9}

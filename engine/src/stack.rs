@@ -25,10 +25,19 @@
 //! whose device will not open still has its place in the stack: it analyses
 //! nothing, sits at silence, and carries the reason. Every other layer runs.
 //! The strip stays lit and the editor says which row is dark and why.
+//!
+//! # A layer with no source at all
+//!
+//! [`SourceKind::None`] is not a failure and must not be reported as one. Such
+//! a layer is *still*: it opens nothing, is bound to no feed, and paints a
+//! colour that does not react. So `feed: None` means two different things here
+//! and the error beside it is what tells them apart — a dark row with a reason,
+//! or a deliberate one with none.
 
 use anyhow::Result;
 use serde::Serialize;
 
+use crate::color::intensity::IntensityConfig;
 use crate::color::LayerVisual;
 use crate::engine::EngineConfig;
 use crate::show::{Layer, ShowConfig};
@@ -150,6 +159,13 @@ impl LiveStack {
         self.layers.iter().map(|l| l.analysis.points()).max().unwrap_or(0)
     }
 
+    /// What one layer is listening to, as authored. The startup header asks,
+    /// because "no analyser" is true of a MIDI layer and a still one alike and
+    /// they have nothing in common to report.
+    pub fn source_kind(&self, index: usize) -> SourceKind {
+        self.layers.get(index).map(|l| l.config.source.kind).unwrap_or_default()
+    }
+
     /// The audio analyser behind one layer, for the diagnostics that only
     /// apply to one — the band plan and its FFT tiers.
     pub fn engine(&self, index: usize) -> Option<&crate::engine::Engine> {
@@ -161,6 +177,7 @@ impl LiveStack {
         let Some(layer) = self.layers.get(index) else { return String::new() };
         match layer.feed.and_then(|i| self.feeds.get(i)) {
             Some(slot) => slot.feed.describe(),
+            None if layer.analysis.is_static() => "nothing — a still colour".to_string(),
             None => layer
                 .error
                 .clone()
@@ -194,9 +211,25 @@ impl LiveStack {
         self.layers
             .iter()
             .map(|l| LayerVisual {
-                surface: l.config.surface.clone(),
+                // A still layer's field is read along one row, and its levels
+                // never move off full — so the surface is flattened onto that
+                // row and the intensity stage is taken out of the way. Both are
+                // the same statement: with no signal there is no second axis,
+                // and a threshold, a clamp and a curve have nothing to act on.
+                // Doing it here rather than trusting the numbers to work out is
+                // what keeps a threshold left at 0 dB from blacking out a layer
+                // whose whole point is that it does not react.
+                surface: if l.analysis.is_static() {
+                    l.config.surface.flattened()
+                } else {
+                    l.config.surface.clone()
+                },
                 layout: l.config.layout(),
-                intensity: l.config.intensity(),
+                intensity: if l.analysis.is_static() {
+                    IntensityConfig::pass_through()
+                } else {
+                    l.config.intensity()
+                },
                 // A layer that has been switched off contributes nothing rather
                 // than being dropped from the stack, so the renderer and the
                 // editor keep agreeing about which row is which.
@@ -242,14 +275,21 @@ impl LiveStack {
 
         let mut advanced = false;
         for layer in &mut self.layers {
-            let Some(index) = layer.feed else { continue };
             // A layer nobody can see is not analysed at all, so muting one is a
             // real saving rather than a cosmetic one — which matters when the
             // stack is how ideas get auditioned.
             if !layer.config.contributes() {
                 continue;
             }
-            advanced |= layer.analysis.advance(&self.feeds[index].feed);
+            advanced |= match layer.feed {
+                Some(index) => layer.analysis.advance(&self.feeds[index].feed),
+                // No feed to read. A still layer reports a frame on its own
+                // clock, which is the only reason a show made entirely of them
+                // ever reaches the strip; anything else with no device sits at
+                // silence and says so by advancing nothing. See
+                // [`Analysis::tick`].
+                None => layer.analysis.tick(),
+            };
         }
         advanced
     }
@@ -316,6 +356,25 @@ impl LiveStack {
         let mut layers: Vec<LiveLayer> = Vec::new();
 
         for cfg in &show.layers {
+            // Nothing to open, and nothing to fail. Handled before `bind` so a
+            // still layer never enumerates the machine's endpoints looking for
+            // a device it does not want.
+            if !cfg.source.kind.is_device() {
+                spare_layers.retain(|l| l.config.id != cfg.id);
+                layers.push(LiveLayer {
+                    analysis: Analysis::new(
+                        cfg,
+                        &self.base,
+                        SourceKind::None,
+                        ORPHAN_SAMPLE_RATE,
+                    ),
+                    config: cfg.clone(),
+                    feed: None,
+                    error: None,
+                });
+                continue;
+            }
+
             let key = cfg.feed_key();
             let bound =
                 bind(&mut feeds, &mut spare_feeds, &key, &cfg.source, self.buffer_secs);
@@ -377,6 +436,20 @@ impl LiveStack {
     /// be opened leaves the layer where it was rather than trading a working
     /// layer for an error message.
     fn rebind(&mut self, index: usize, cfg: &Layer) {
+        // Moving *off* every device. There is nothing to open, so the usual
+        // open-before-release dance has no failure to protect against — and
+        // running it anyway would hand the layer the error `Feed::open` raises
+        // for a source that names nothing, which is the one edit here that
+        // cannot go wrong being reported as though it had.
+        if !cfg.source.kind.is_device() {
+            self.layers[index].analysis =
+                Analysis::new(cfg, &self.base, SourceKind::None, ORPHAN_SAMPLE_RATE);
+            self.layers[index].feed = None;
+            self.layers[index].config = cfg.clone();
+            self.layers[index].error = None;
+            return;
+        }
+
         let key = cfg.feed_key();
 
         let bound = if let Some(i) = self.feeds.iter().position(|s| s.key == key) {
@@ -448,7 +521,11 @@ impl LiveStack {
     /// reason a layer is dark. Returns false when there is nothing to retry, so
     /// the caller can skip announcing a change that did not happen.
     pub fn retry_failed(&mut self, show: &ShowConfig) -> bool {
-        if self.layers.iter().all(|l| l.feed.is_some()) {
+        // A still layer has no feed and never will, so it is not a failure to
+        // retry — testing for that rather than for a missing feed is what keeps
+        // one from rebuilding the whole stack, and restarting every capture in
+        // it, on every rescan.
+        if self.layers.iter().all(|l| l.feed.is_some() || !l.config.source.kind.is_device()) {
             return false;
         }
         self.rebuild(show);
@@ -543,6 +620,59 @@ mod tests {
         assert_eq!(stack.len(), 4);
         assert_eq!(stack.feed_count(), 1, "one endpoint was opened more than once");
         assert!(stack.status().iter().all(|s| s.error.is_none()));
+    }
+
+    /// A layer listening to nothing opens nothing, and — the half that is easy
+    /// to get wrong — reports no error for it. `feed: None` is how a dead
+    /// device looks too, and the editor draws a red indicator on one of them.
+    #[test]
+    fn a_layer_with_no_source_opens_nothing_and_is_not_a_failure() {
+        let show = show(vec![layer("still", Source::nothing())]);
+        let stack = LiveStack::open(&show, &EngineConfig::default(), BUFFER);
+
+        assert_eq!(stack.feed_count(), 0, "a layer with no source opened a device");
+        let status = &stack.status()[0];
+        assert!(status.error.is_none(), "no source was reported as a failure: {status:?}");
+        assert!(status.points > 0, "a still layer put nothing on the wire");
+        assert_eq!(status.kind, SourceKind::None);
+    }
+
+    /// A still layer reports frames on its own clock. Without that a show made
+    /// only of them never renders at all — the run loop has nothing else that
+    /// says there is something new to send.
+    #[test]
+    fn a_show_of_still_layers_alone_still_reports_frames() {
+        let show = show(vec![layer("still", Source::nothing())]);
+        let mut stack = LiveStack::open(&show, &EngineConfig::default(), BUFFER);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            if stack.poll() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("a still layer never reported a frame");
+    }
+
+    /// Moving a layer off its device releases it. The editor's "listening to
+    /// nothing" must not be an open capture nobody reads, and `rebind` is the
+    /// path an edit takes — the one that has no device to open and so nothing
+    /// to protect the old one against.
+    #[test]
+    fn switching_a_layer_to_no_source_releases_its_device() {
+        if !can_capture() {
+            return;
+        }
+        let before = show(vec![layer("a", Source::default_output())]);
+        let mut stack = LiveStack::open(&before, &EngineConfig::default(), BUFFER);
+        assert_eq!(stack.feed_count(), 1);
+
+        let after = show(vec![layer("a", Source::nothing())]);
+        stack.apply(&after);
+
+        assert_eq!(stack.feed_count(), 0, "the device stayed open with nothing listening");
+        assert!(stack.status()[0].error.is_none(), "moving off a device reported a failure");
     }
 
     /// Two layers filtering two MIDI channels of one keyboard must resolve to

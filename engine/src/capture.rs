@@ -71,7 +71,7 @@ pub fn endpoints() -> Vec<DeviceInfo> {
                 SourceKind::Loopback => &default_output,
                 SourceKind::Input => &default_input,
                 // Unreachable: `direction` only ever names an audio endpoint.
-                SourceKind::Midi => &None,
+                SourceKind::Midi | SourceKind::None => &None,
             };
 
             Some(DeviceInfo {
@@ -241,10 +241,10 @@ fn default_config(
 ) -> Result<cpal::SupportedStreamConfig, cpal::Error> {
     match kind {
         SourceKind::Loopback => device.default_output_config(),
-        // A MIDI selection never reaches here — `Capture::open` rejects it
-        // first — and asking cpal for an input config is the harmless answer
-        // if that ever stops being true.
-        SourceKind::Input | SourceKind::Midi => device.default_input_config(),
+        // Neither a MIDI selection nor an absent one reaches here — `resolve`
+        // rejects both by name first — and asking cpal for an input config is
+        // the harmless answer if that ever stops being true.
+        SourceKind::Input | SourceKind::Midi | SourceKind::None => device.default_input_config(),
     }
 }
 
@@ -261,6 +261,11 @@ fn resolve(host: &cpal::Host, source: &Source) -> Result<(cpal::Device, SourceKi
     // reads it looking in the wrong place entirely.
     if source.kind == SourceKind::Midi || source.id.as_deref().is_some_and(is_midi_id) {
         anyhow::bail!("'{}' is a MIDI port, not an audio device", source.id.as_deref().unwrap_or("midi"));
+    }
+    // The other selection this module cannot serve, and for the opposite
+    // reason: there is no endpoint to name at all.
+    if source.kind == SourceKind::None {
+        anyhow::bail!("this layer has no source, so there is no audio device to open");
     }
 
     let Some(id) = &source.id else {

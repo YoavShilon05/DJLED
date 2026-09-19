@@ -13,15 +13,19 @@ that make this directory dangerous.
 ```bash
 npm install
 npm run dev         # vite on 5173
-npm test            # vitest run — 65 tests, 8 files
+npm test            # vitest run — 86 tests, 9 files
 npm run typecheck   # tsc --noEmit
 npm run build       # typecheck + vite build
 npm run smoke       # node scripts/stack-smoke.mjs, against a running engine
 npm run preset-smoke  # node scripts/preset-smoke.mjs, same
 ```
 
-No linter and no lint script. `tsconfig.json` is strict, with `noUnusedLocals`
-and `noUnusedParameters` on — an unused import fails the build, not just the
+No linter and no lint script, and no prettier config either. The files are
+written at about 100 columns; running `npx prettier` on one reflows it at
+prettier's default 80 and rewrites the whole file, which buries a real diff
+exactly the way `cargo fmt` does on the Rust side. Match the surrounding style
+by hand. `tsconfig.json` is strict, with `noUnusedLocals` and
+`noUnusedParameters` on — an unused import fails the build, not just the
 editor's squiggles.
 
 ## Layout
@@ -30,7 +34,7 @@ editor's squiggles.
 |---|---|
 | `App.tsx` | Wires the client to the panels. Owns `EditorConfig` state and the debounced send |
 | `engine.ts` | `EngineClient` — socket, auto-reconnect, and the engine's wire types *verbatim* |
-| `config/editor.ts` | `EditorConfig`, defaults, localStorage (`djled.editor`), and `toEngineConfig` / `fromEngineConfig` |
+| `config/editor.ts` | `EditorConfig`, defaults, localStorage (`djled.editor`), `toEngineConfig` / `fromEngineConfig`, and `isStatic` / `toRenderSurface` |
 | `config/scales.ts` | The two axes. Every gizmo, tick and hit test goes through here |
 | `config/eq.ts` | RBJ cookbook biquads, verbatim |
 | `config/curve.ts` | Intensity curve — cubic Béziers pinned at (0,0)–(1,1) |
@@ -104,6 +108,23 @@ line worth having on screen permanently.
   two call sites agree.
 - **The axis never changes; only its labels do.** MIDI mode swaps the tick scale
   in `spectrum/axis.ts` — everything else stays written in Hz.
+- **A layer listening to nothing has no vertical axis, and the collapse lives in
+  two functions.** `computeLayout(w, h, flat)` sets `layout.flat`; `yOfDb`
+  returns the lane's centre for every dB and `dbOfY` returns a constant. That is
+  deliberate and is the whole trick: every gizmo, hit test, drag offset and
+  popover anchor already goes through those two, so a flat plot places all of
+  them correctly without any of them knowing there is a second kind of plot. The
+  day one starts doing its own arithmetic is the day handles drift off the lane
+  — `layout.test.ts` is there to fail first.
+- **Drag discards the vertical on a flat plot rather than writing `dbOfY` back.**
+  The stored dB is still what crosses the wire and still what a preset keeps, so
+  nudging a still layer's colours sideways must not flatten the field it was
+  authored with. `toRenderSurface` is the read-side projection; `toSurface` is
+  what is sent.
+- **A still layer's gizmos are absent, not hidden.** `GizmoLayer` drops the
+  thresholds, the curve, the EQ and the dB labels when `layout.flat`. That does
+  not contradict the rule below about visibility: the overlay checkboxes say
+  what to draw of what a layer *has*, and a still layer has none of these.
 - **The plot draws one layer, the strip preview draws the stack.** Six sets of
   gizmos on one graph would be unclickable, which is why the active layer is a
   first-class piece of editor state.
@@ -159,6 +180,7 @@ line worth having on screen permanently.
 | `color/oklab.test.ts` | The conversions on their own |
 | `spectrum/stack.test.ts` | The browser's copy of the compositing fold, and that `renderLayer` and a one-layer `renderStack` are the same bytes |
 | `spectrum/render.test.ts` | Spatial mapping — including that an even-length strip's mirror fold lands on one specific index |
+| `spectrum/layout.test.ts` | The plot's geometry, and that a flat plot collapses the dB axis in `yOfDb` / `dbOfY` and nowhere else |
 | `config/eq.test.ts` | Closed-form properties, not captured values |
 | `config/editor.test.ts`, `config/notes.test.ts` | Round-tripping and the note axis |
 | `config/presets.test.ts` | Slot ↔ function key numbering, and that the bar lists all twelve in hotkey order |

@@ -7,6 +7,11 @@
  * bars, so a bar reads as a *reveal* of the authored surface. That is what the
  * strip will actually do at that frequency and level, which makes the graph a
  * preview rather than a decoration.
+ *
+ * A flat plot — a layer listening to nothing — has nothing to reveal: there is
+ * no level, so there are no bars and no quiet regions for the dimming to stand
+ * for. Its lane is the field at full strength, which is the same promise kept
+ * with the one thing there is to say.
  */
 
 import { oklabToDisplayRgba } from "../color/display";
@@ -117,11 +122,13 @@ export function paintPlot(
   ctx.rect(plot.x, plot.y, plot.w, plot.h);
   ctx.clip();
 
-  ctx.globalAlpha = FIELD_DIM;
+  // Nothing is being revealed on a flat plot, so nothing is dimmed: the lane
+  // *is* the colour, at the strength the strip will show it.
+  ctx.globalAlpha = l.flat ? 1 : FIELD_DIM;
   ctx.drawImage(field, plot.x, plot.y, plot.w, plot.h);
   ctx.globalAlpha = 1;
 
-  const bars = spectrumPath(l, frame);
+  const bars = l.flat ? null : spectrumPath(l, frame);
   if (bars) {
     ctx.save();
     ctx.clip(bars.area);
@@ -193,11 +200,15 @@ function paintGrid(
     ctx.moveTo(x, plot.y);
     ctx.lineTo(x, plot.y + plot.h);
   }
-  for (const db of DB_TICKS) {
-    if (db === DB_MAX || db === DB_MIN) continue; // the frame already draws these
-    const y = Math.round(yOfDb(l, db)) + 0.5;
-    ctx.moveTo(plot.x, y);
-    ctx.lineTo(plot.x + plot.w, y);
+  // No level axis, so no lines across it. Drawn on a flat plot they would all
+  // land on the same row anyway — `yOfDb` collapses them.
+  if (!l.flat) {
+    for (const db of DB_TICKS) {
+      if (db === DB_MAX || db === DB_MIN) continue; // the frame already draws these
+      const y = Math.round(yOfDb(l, db)) + 0.5;
+      ctx.moveTo(plot.x, y);
+      ctx.lineTo(plot.x + plot.w, y);
+    }
   }
   ctx.stroke();
 }

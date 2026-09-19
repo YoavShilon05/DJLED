@@ -116,7 +116,10 @@ function StatusBadge({
     if (failed > 0) {
       return <Badge color="red">{`${failed} of ${statuses.length} layers have no source`}</Badge>;
     }
-    const kinds = new Set(statuses.map((s) => s.kind));
+    // "still" rather than the kind's own name: "3 layers · none · 150 LEDs"
+    // reads as a stack that failed to find anything, which is the opposite of
+    // what it says.
+    const kinds = new Set(statuses.map((s) => (s.kind === "none" ? "still" : s.kind)));
     const label = kinds.size === 1 ? [...kinds][0] : `${kinds.size} kinds`;
     const stack = layers === 1 ? "1 layer" : `${layers} layers`;
     return <Badge color="teal">{`${stack} · ${label} · ${ledCount} LEDs`}</Badge>;

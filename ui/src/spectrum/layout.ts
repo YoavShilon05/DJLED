@@ -16,6 +16,27 @@
  *          ├──────┼───────────────────────────┼───┼────────┤
  *    track │ LED  │   ▽0        ▽50      ▽149 │   │        │
  *          └──────┴───────────────────────────┴───┴────────┘
+ *
+ * # Flat
+ *
+ * A layer listening to nothing has no level, so the plot has no vertical axis
+ * to be: the field is a colour along the strip and nothing else. That layout is
+ * the same one with its height collapsed to a lane and its rail taken away —
+ * there is no threshold, no clamp and no curve to put in it.
+ *
+ *          gutter │                 plot                   │
+ *          ┌──────┼────────────────────────────────────────┐
+ *          │      │  ◉         ◉              ◉            │   the colour
+ *          ├──────┼────────────────────────────────────────┤
+ *    axis  │      │  20  100  1k  10k                      │
+ *          ├──────┼────────────────────────────────────────┤
+ *    track │ LED  │   ▽0        ▽50               ▽149     │
+ *          └──────┴────────────────────────────────────────┘
+ *
+ * {@link yOfDb} and {@link dbOfY} are where that collapse is expressed, and
+ * they are the *only* place: every gizmo, drag and popover anchor already goes
+ * through them, so each one lands in the lane without knowing there is a second
+ * kind of plot.
  */
 
 import { EQ_RANGE_DB } from "../config/eq";
@@ -37,10 +58,18 @@ export interface PlotLayout {
   axis: Rect;
   /** Draggable LED keyframes, under the labels. */
   track: Rect;
-  /** Threshold, clamp and the intensity curve, right of the plot. */
+  /** Threshold, clamp and the intensity curve, right of the plot. Zero width
+   *  when {@link flat}, which has none of the three. */
   rail: Rect;
-  /** dB labels, left of the plot. */
+  /** dB labels, left of the plot. Empty of labels when {@link flat}. */
   gutter: Rect;
+  /**
+   * No intensity axis: the plot is a lane showing one row of the colour field.
+   *
+   * Set for a layer that listens to nothing. Everything that reads a dB out of
+   * this layout, or writes one into it, checks this — see {@link yOfDb}.
+   */
+  flat: boolean;
 }
 
 const GUTTER_W = 46;
@@ -57,8 +86,12 @@ const MIN_PLOT_W = 240;
  */
 const TOP_PAD = 16;
 
-export function computeLayout(width: number, plotHeight: number): PlotLayout {
-  const plotW = Math.max(MIN_PLOT_W, width - GUTTER_W - RAIL_GAP - RAIL_W);
+export function computeLayout(width: number, plotHeight: number, flat = false): PlotLayout {
+  // The rail holds the threshold, the clamp and the curve, and a flat plot has
+  // none of them — so it is not merely emptied, it is given back to the plot.
+  const railW = flat ? 0 : RAIL_W;
+  const railGap = flat ? 0 : RAIL_GAP;
+  const plotW = Math.max(MIN_PLOT_W, width - GUTTER_W - railGap - railW);
   const plot: Rect = { x: GUTTER_W, y: TOP_PAD, w: plotW, h: plotHeight };
   const axisY = TOP_PAD + plotHeight;
   return {
@@ -68,7 +101,8 @@ export function computeLayout(width: number, plotHeight: number): PlotLayout {
     gutter: { x: 0, y: TOP_PAD, w: GUTTER_W, h: plotHeight },
     axis: { x: plot.x, y: axisY, w: plotW, h: AXIS_H },
     track: { x: plot.x, y: axisY + AXIS_H, w: plotW, h: TRACK_H },
-    rail: { x: plot.x + plotW + RAIL_GAP, y: TOP_PAD, w: RAIL_W, h: plotHeight },
+    rail: { x: plot.x + plotW + railGap, y: TOP_PAD, w: railW, h: plotHeight },
+    flat,
   };
 }
 
@@ -100,12 +134,29 @@ export function hzOfX(l: PlotLayout, x: number): number {
   return normToHz((x - l.plot.x) / l.plot.w);
 }
 
+/**
+ * Where a dB sits vertically — or, on a flat plot, the middle of the lane
+ * whatever it is.
+ *
+ * The collapse lives here rather than at each call site on purpose. Keyframe
+ * handles, selection rings, areas of effect, hit tests, drag offsets and the
+ * popover anchor all ask this one function where a keyframe is, so a flat plot
+ * places every one of them correctly without any of them being told there is
+ * such a thing.
+ */
 export function yOfDb(l: PlotLayout, db: number): number {
+  if (l.flat) return l.plot.y + l.plot.h / 2;
   const t = (clamp(db, DB_MIN, DB_MAX) - DB_MIN) / (DB_MAX - DB_MIN);
   return l.plot.y + (1 - t) * l.plot.h;
 }
 
+/**
+ * The dB a vertical position stands for. Constant on a flat plot: there is no
+ * level to read, so dragging up and down cannot mean anything and must not
+ * quietly rewrite what it finds.
+ */
 export function dbOfY(l: PlotLayout, y: number): number {
+  if (l.flat) return DB_MAX;
   const t = 1 - (y - l.plot.y) / l.plot.h;
   return DB_MIN + clamp(t, 0, 1) * (DB_MAX - DB_MIN);
 }

@@ -17,6 +17,9 @@ const DEFAULT_KEYS: Record<SourceKind, string> = {
   loopback: "default:loopback",
   input: "default:input",
   midi: "default:midi",
+  // Not a default so much as the absence of a selection, but it goes through
+  // the same path for the same reason: it names no device either.
+  none: "default:none",
 };
 
 interface Props {
@@ -59,6 +62,7 @@ export const SourcePanel = memo(function SourcePanel({
 }: Props) {
   const selected = layer.source.id ?? DEFAULT_KEYS[layer.source.kind];
   const midi = layer.source.kind === "midi";
+  const still = layer.source.kind === "none";
   const noMidiPorts = connected && !devices.some((d) => d.kind === "midi");
   const channels = status?.channels ?? 0;
   const outOfRange = status?.notesOutOfRange ?? 0;
@@ -153,7 +157,10 @@ export const SourcePanel = memo(function SourcePanel({
         </Alert>
       )}
 
-      {noMidiPorts && <LoopMidiHint />}
+      {/* A still layer has no MIDI to be missing, and the paragraph explaining
+          loopMIDI under one would be three inches of answer to a question
+          nobody asked. */}
+      {noMidiPorts && !still && <LoopMidiHint />}
 
       {status?.error && (
         <Alert color="red" variant="light" title="Source">
@@ -178,7 +185,7 @@ export const SourcePanel = memo(function SourcePanel({
  * time the panel is opened.
  */
 const ADVICE =
-  "Loopback hears anything Windows mixes, but never a DAW on an ASIO driver — ASIO bypasses Windows entirely. Select this interface's input for that, or send it MIDI instead. Layers naming the same device share one open handle, so a five-layer show on one output is still a single capture.";
+  "Loopback hears anything Windows mixes, but never a DAW on an ASIO driver — ASIO bypasses Windows entirely. Select this interface's input for that, or send it MIDI instead. Layers naming the same device share one open handle, so a five-layer show on one output is still a single capture. \"Nothing\" opens no device at all: the layer holds a still colour, which is what a wash under a reactive layer, or a lit wall between tracks, is made of.";
 
 /**
  * The one thing about MIDI on Windows that cannot be discovered by looking.
@@ -232,6 +239,16 @@ function group(devices: InputDevice[]) {
 
   return [
     {
+      group: "No source",
+      items: [
+        // First, and in a group of its own: it is not one of the machine's
+        // endpoints and listing it among them would read as a device that
+        // failed to be named. It is also the one entry that is always
+        // available, offline included.
+        { value: DEFAULT_KEYS.none, label: "Nothing — a still colour" },
+      ],
+    },
+    {
       group: "System default",
       items: [
         { value: DEFAULT_KEYS.loopback, label: "PC audio — whatever is playing" },
@@ -271,6 +288,12 @@ function label(device: InputDevice, all: InputDevice[]): string {
  * glued to the end of it is in {@link ADVICE}.
  */
 function resolved(layer: EditorLayer, status: LayerStatus | null, connected: boolean): string {
+  // Before the connection check: this is the one selection that resolves to the
+  // same thing whether or not anything is running, because it resolves to
+  // nothing. Saying "start the engine to see" of it would be a lie.
+  if (layer.source.kind === "none") {
+    return "Nothing. A still colour along the strip — no level, so no intensity curve.";
+  }
   if (!connected) return "Saved with the layer. Start the engine to see what it resolves to.";
   if (!status) return "Waiting for the engine to report on this layer.";
 

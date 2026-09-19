@@ -214,3 +214,67 @@ describe("a layer on its own", () => {
   });
 
 });
+
+/**
+ * A layer listening to nothing.
+ *
+ * The strip preview is the only ground truth in the editor, so these are the
+ * tests that say the graph collapsing to a lane is not merely a cosmetic
+ * change: the same layer has to reach the wall as a still colour, read along
+ * one row of its field, with the intensity stage out of the way.
+ */
+describe("a layer with no source", () => {
+  /** A still layer of one colour, authored at `db` on the intensity axis. */
+  function still(color: string, db: number): EditorLayer {
+    const base = flat(color);
+    return {
+      ...base,
+      source: { id: null, kind: "none", channel: null },
+      colorKeyframes: [
+        { id: nextId("ck"), hz: 20, db, color, radius: null },
+        { id: nextId("ck"), hz: 20_000, db, color, radius: null },
+      ],
+    };
+  }
+
+  it("lights the whole strip with nothing playing", () => {
+    const strip = render(show(still("#ff2000", DB_MAX)), SILENT);
+    expect(strip.every(([r]) => r > 0)).toBe(true);
+    expect(strip.every(([r, g, b]) => r > g && r > b)).toBe(true);
+  });
+
+  /**
+   * The field is read along one row, so where a colour was authored on the
+   * intensity axis cannot change what the strip does. This is what makes the
+   * plot's collapse to a lane honest rather than a view that hides half the
+   * state it is still editing.
+   */
+  it("reads its field along one row wherever the keyframes sit", () => {
+    const low = render(show(still("#40c0ff", DB_MIN)), SILENT);
+    const high = render(show(still("#40c0ff", DB_MAX)), SILENT);
+    expect(low).toEqual(high);
+  });
+
+  /**
+   * The intensity window is not shown for a still layer and does not act on it.
+   * A threshold at the top of the axis would otherwise close a band that is at
+   * the top of the axis, blacking out the one kind of layer that is supposed to
+   * be unconditional.
+   */
+  it("ignores a threshold that would blank it", () => {
+    const closed: EditorLayer = {
+      ...still("#ffffff", DB_MAX),
+      threshold: DB_MAX,
+      clamp: DB_MAX,
+    };
+    const strip = render(show(closed), SILENT);
+    expect(strip.every((px) => px.some((c) => c > 0))).toBe(true);
+  });
+
+  /** Still is not a mode the show is in: it composes like any other layer. */
+  it("shows through where the layer above it paints nothing", () => {
+    const empty: EditorLayer = { ...flat("#ffffff"), colorKeyframes: [] };
+    const base = still("#ff2000", DB_MAX);
+    expect(render(show(base, empty), SILENT)).toEqual(render(show(base), SILENT));
+  });
+});

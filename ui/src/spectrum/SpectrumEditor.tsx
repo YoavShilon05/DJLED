@@ -23,11 +23,13 @@ import { Field } from "../components/Field";
 import { hexToLinearRgb, oklabToHex } from "../color/oklab";
 import { ColorSurface } from "../color/surface";
 import {
+  isStatic,
   nextId,
-  toSurface,
+  toRenderSurface,
   RADIUS_DEFAULT,
   RADIUS_MAX,
   RADIUS_MIN,
+  STATIC_DB,
   type ColorKeyframe,
   type EditorLayer,
   type GizmoFlags,
@@ -60,6 +62,17 @@ import {
 import { dbToLevel, type SpectrumFrame } from "./paint";
 
 const PLOT_HEIGHT = 400;
+
+/**
+ * The plot's height for a layer that listens to nothing.
+ *
+ * A lane rather than a graph, because there is nothing to graph: no level means
+ * no vertical axis, so the field is a colour along the strip. Tall enough for a
+ * keyframe handle, its selection ring and an area of effect to be readable, and
+ * no taller — the height a still layer does not need is height every other
+ * panel on the screen does.
+ */
+const FLAT_PLOT_HEIGHT = 96;
 
 /** The clamp must stay above the threshold, or the curve has no domain. */
 const MIN_WINDOW_DB = 6;
@@ -120,8 +133,15 @@ export function SpectrumEditor({
   const [selected, setSelected] = useState<GizmoTarget | null>(null);
   const [grab, setGrab] = useState<Grab | null>(null);
 
-  const layout = useMemo(() => computeLayout(sized.width || 900, PLOT_HEIGHT), [sized.width]);
-  const surface = useMemo(() => toSurface(layer), [layer]);
+  const flat = isStatic(layer);
+  const layout = useMemo(
+    () => computeLayout(sized.width || 900, flat ? FLAT_PLOT_HEIGHT : PLOT_HEIGHT, flat),
+    [sized.width, flat],
+  );
+  // The surface as it is read rather than as it is stored: a still layer's
+  // field is flattened onto the one row that is ever sampled, so the lane shows
+  // the colour the wall will show. See `toRenderSurface`.
+  const surface = useMemo(() => toRenderSurface(layer), [layer]);
   const clearSelection = useCallback(() => setSelected(null), []);
 
   const localPoint = useCallback((event: { clientX: number; clientY: number }) => {
@@ -182,10 +202,15 @@ export function SpectrumEditor({
       event.preventDefault();
       const p = localPoint(event);
       const hz = snapHz(hzOfX(layout, p.x));
-      const db = Math.round(dbOfY(layout, p.y));
+      // A flat plot has no height to read a level off, and `dbOfY` says so —
+      // a keyframe dropped on one is authored at the row that is sampled.
+      const db = layout.flat ? STATIC_DB : Math.round(dbOfY(layout, p.y));
       // Seeded with the colour already showing there, so dropping a keyframe
       // never makes the field jump before it has been given a colour.
-      const sampled = new ColorSurface(toSurface(layer)).sample(hzToNorm(hz), dbToLevel(db));
+      const sampled = new ColorSurface(toRenderSurface(layer)).sample(
+        hzToNorm(hz),
+        dbToLevel(db),
+      );
       const keyframe: ColorKeyframe = {
         id: nextId("ck"),
         hz,
@@ -219,6 +244,10 @@ export function SpectrumEditor({
 
   const addEq = useCallback(
     (event: ReactMouseEvent) => {
+      // An EQ shapes a signal, and a still layer has none. The double-click is
+      // already unbound in the gizmo layer; this is the other half, so the
+      // gesture cannot arrive by some other route.
+      if (isStatic(layer)) return;
       event.preventDefault();
       const p = localPoint(event);
       const band: EqBand = {
@@ -320,7 +349,11 @@ export function SpectrumEditor({
                 <Group gap={6}>
                   <ColorSwatch color={selectedColor.color} size={16} />
                   <Text size="xs" ff="monospace">
-                    {axis.format(selectedColor.hz)} · {selectedColor.db.toFixed(0)} dB
+                    {axis.format(selectedColor.hz)}
+                    {/* The dB is not shown on a flat plot because it is not
+                        read there — quoting a level for a layer with none is
+                        the one thing this readout must not do. */}
+                    {!flat && ` · ${selectedColor.db.toFixed(0)} dB`}
                     {/* Only when it is not fully opaque, so the common case
                         stays uncluttered and a faded keyframe stands out. */}
                     {opacityOf(selectedColor.color) < 1 &&
@@ -370,7 +403,11 @@ export function SpectrumEditor({
                 <Field
                   label="Radius"
                   value={selectedColor.radius.toFixed(2)}
-                  info="How far this colour reaches, as a fraction of the plot. Past it the keyframe contributes nothing and the field falls to transparent, so the layers below show through rather than black. This is not the blend radius: that decides how two keyframes that both reach a point share it, and it is one number for the whole layer."
+                  info={
+                    flat
+                      ? "How far along the strip this colour reaches, as a fraction of the plot. Past it the keyframe contributes nothing and the field falls to transparent, so the layers below show through rather than black. This is not the blend radius: that decides how two keyframes that both reach a point share it, and it is one number for the whole layer."
+                      : "How far this colour reaches, as a fraction of the plot. Past it the keyframe contributes nothing and the field falls to transparent, so the layers below show through rather than black. This is not the blend radius: that decides how two keyframes that both reach a point share it, and it is one number for the whole layer."
+                  }
                 >
                   <Slider
                     min={RADIUS_MIN}
@@ -556,10 +593,17 @@ function applyDrag(
     case "color": {
       const id = grab.target.id;
       const hz = snapHz(hzOfX(layout, x));
-      const db = Math.round(dbOfY(layout, y) * 2) / 2;
       return {
         ...layer,
-        colorKeyframes: layer.colorKeyframes.map((k) => (k.id === id ? { ...k, hz, db } : k)),
+        colorKeyframes: layer.colorKeyframes.map((k) => {
+          if (k.id !== id) return k;
+          // Vertical movement is discarded on a flat plot rather than rounded
+          // to the constant `dbOfY` returns there. The dB is not being edited —
+          // it is not being *read* — and rewriting it would quietly flatten a
+          // field the moment a still layer's colours were nudged sideways, so
+          // switching back to a device would find the authoring gone.
+          return layout.flat ? { ...k, hz } : { ...k, hz, db: Math.round(dbOfY(layout, y) * 2) / 2 };
+        }),
       };
     }
     case "led": {

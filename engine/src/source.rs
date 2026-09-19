@@ -33,6 +33,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::capture::Capture;
+use crate::color::strip::norm_to_hz;
 use crate::engine::{Engine, EngineConfig};
 use crate::midi::{self, MidiListener, Message, NoteEngine};
 use crate::show::Layer;
@@ -48,6 +49,13 @@ const MIDI_FRAME: Duration = Duration::from_millis(8);
 /// release into a single frame and snap the strip to black.
 const MAX_MIDI_STEP: f32 = 0.1;
 
+/// How often a layer with no source reports a frame.
+///
+/// A still colour never changes, so this is not a measurement rate — it is the
+/// heartbeat that keeps such a layer on the wire at all. See
+/// [`Analysis::tick`].
+const STATIC_FRAME: Duration = Duration::from_millis(8);
+
 /// Which kind of endpoint is being listened to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,6 +69,14 @@ pub enum SourceKind {
     /// A MIDI input port: a controller, or a virtual cable carrying a DAW's
     /// note output.
     Midi,
+    /// Nothing at all.
+    ///
+    /// A layer listening to no device produces no spectrum, so it is a *still*
+    /// colour: a wash along the strip that composes with the stack without
+    /// reacting to anything. Everything downstream of here still reads
+    /// `(levels, centers)` and never asks what produced them — see
+    /// [`StaticAnalysis`], which answers with a flat full level.
+    None,
 }
 
 impl SourceKind {
@@ -69,11 +85,18 @@ impl SourceKind {
             SourceKind::Loopback => "loopback",
             SourceKind::Input => "input",
             SourceKind::Midi => "midi",
+            SourceKind::None => "none",
         }
     }
 
     pub fn is_audio(self) -> bool {
-        !matches!(self, SourceKind::Midi)
+        matches!(self, SourceKind::Loopback | SourceKind::Input)
+    }
+
+    /// Whether this names a device at all. The one kind that does not is the
+    /// reason [`Feed`] is optional in a running stack.
+    pub fn is_device(self) -> bool {
+        !matches!(self, SourceKind::None)
     }
 }
 
@@ -119,6 +142,11 @@ impl Source {
     /// The first MIDI input port there is.
     pub fn default_midi() -> Self {
         Self { id: None, kind: SourceKind::Midi, channel: None }
+    }
+
+    /// Nothing. A layer that listens to no device and paints a still colour.
+    pub fn nothing() -> Self {
+        Self { id: None, kind: SourceKind::None, channel: None }
     }
 
     /// Look a source up the way a human would name it on the command line: a
@@ -237,6 +265,13 @@ pub struct MidiFeed {
 
 impl Feed {
     pub fn open(source: &Source, buffer_secs: f32) -> Result<Self> {
+        // Defensive: a layer with no source is never bound to a feed at all —
+        // see [`crate::stack::LiveStack`]. Refusing by name here means a future
+        // caller that forgets gets the reason rather than an enumeration of
+        // every endpoint on the machine followed by a confusing miss.
+        if source.kind == SourceKind::None {
+            anyhow::bail!("this layer has no source, so there is no device to open");
+        }
         if source.kind == SourceKind::Midi {
             return Ok(Self::Midi(MidiFeed {
                 listener: MidiListener::open(source)?,
@@ -387,6 +422,7 @@ impl Feed {
 pub enum Analysis {
     Audio(AudioAnalysis),
     Midi(MidiAnalysis),
+    Static(StaticAnalysis),
 }
 
 pub struct AudioAnalysis {
@@ -400,6 +436,41 @@ pub struct MidiAnalysis {
     last: Instant,
 }
 
+/// The analysis half of a layer that listens to nothing.
+///
+/// There is no signal, so there is nothing to analyse — but the pair every
+/// stage downstream reads still has to exist, and it is the *shape* of that
+/// pair that keeps a still layer from being a special case anywhere else. So
+/// this answers with a full level at every point of an even grid: the strip map
+/// finds the same level wherever it looks, the intensity stage passes it
+/// through, and the colour field is read along one row. A one dimensional
+/// colour, expressed in the two dimensional vocabulary the rest of the pipeline
+/// already speaks.
+///
+/// The grid is as wide as an audio layer's band plan for the same reason a
+/// gradient wants spatial resolution at all: these points are what the wire
+/// carries, and a still wash spread over four of them is four stripes.
+pub struct StaticAnalysis {
+    levels: Vec<f32>,
+    centers: Vec<f32>,
+    /// When the last frame was reported. See [`Analysis::tick`].
+    last: Instant,
+}
+
+impl StaticAnalysis {
+    fn new(points: usize) -> Self {
+        // Two is the floor: one point has no span to spread a colour across and
+        // would leave `level_at` with nothing to interpolate between.
+        let points = points.max(2);
+        let last = (points - 1) as f32;
+        Self {
+            levels: vec![1.0; points],
+            centers: (0..points).map(|i| norm_to_hz(i as f32 / last)).collect(),
+            last: Instant::now(),
+        }
+    }
+}
+
 impl Analysis {
     /// Build the analyser a layer needs.
     ///
@@ -411,6 +482,9 @@ impl Analysis {
     /// layer — the band count, chiefly — and is ignored for MIDI, which has no
     /// band plan to configure.
     pub fn new(layer: &Layer, base: &EngineConfig, kind: SourceKind, sample_rate: f64) -> Self {
+        if kind == SourceKind::None {
+            return Self::Static(StaticAnalysis::new(base.scale.band_count));
+        }
         if kind == SourceKind::Midi {
             let mut notes = NoteEngine::new(&layer.midi, layer.source.channel, layer.decay());
             notes.set_eq(&layer.eq);
@@ -429,6 +503,7 @@ impl Analysis {
         match self {
             Self::Audio(a) => a.engine.levels(),
             Self::Midi(m) => m.notes.levels(),
+            Self::Static(s) => &s.levels,
         }
     }
 
@@ -440,6 +515,7 @@ impl Analysis {
         match self {
             Self::Audio(a) => a.engine.centers(),
             Self::Midi(m) => m.notes.centers(),
+            Self::Static(s) => &s.centers,
         }
     }
 
@@ -455,13 +531,14 @@ impl Analysis {
         match self {
             Self::Audio(a) => a.engine.band_count(),
             Self::Midi(m) => m.notes.centers().len(),
+            Self::Static(s) => s.levels.len(),
         }
     }
 
     /// Notes seen outside the configured range, or `None` for audio.
     pub fn out_of_range(&self) -> Option<u32> {
         match self {
-            Self::Audio(_) => None,
+            Self::Audio(_) | Self::Static(_) => None,
             Self::Midi(m) => Some(m.notes.out_of_range()),
         }
     }
@@ -470,8 +547,18 @@ impl Analysis {
     pub fn engine(&self) -> Option<&Engine> {
         match self {
             Self::Audio(a) => Some(&a.engine),
-            Self::Midi(_) => None,
+            Self::Midi(_) | Self::Static(_) => None,
         }
+    }
+
+    /// Whether this layer paints a still colour rather than a spectrum.
+    ///
+    /// Asked by the renderer rather than inferred from the source, because it
+    /// is a statement about the levels — there is exactly one row of the colour
+    /// surface a flat full level can ever read, and the stages that would
+    /// otherwise shape it have nothing to shape.
+    pub fn is_static(&self) -> bool {
+        matches!(self, Self::Static(_))
     }
 
     /// Advance from whatever the feed took in on this pass.
@@ -498,7 +585,34 @@ impl Analysis {
                 m.notes.advance(elapsed.as_secs_f32().min(MAX_MIDI_STEP));
                 true
             }
+            // Never reached: a still layer is never bound to a feed, so nothing
+            // ever has one to hand it. See [`Self::tick`], which is how it
+            // advances instead.
+            Self::Static(_) => false,
         }
+    }
+
+    /// Advance a layer that has no feed to be advanced from.
+    ///
+    /// A still colour never changes, but it still has to *reach* the wire: a
+    /// show made only of still layers would otherwise never report a frame, and
+    /// the run loop renders on nothing else — the strip would stay dark with
+    /// every other part of the editor showing the colour it was supposed to be.
+    ///
+    /// Clocked rather than always true, so an idle stack does not spin a core;
+    /// clocked rather than rendered once, so temporal dithering still has
+    /// successive frames to spread its quantisation error across.
+    ///
+    /// False for the kinds that do have a feed, so the caller can ask this of
+    /// every layer with no device without special-casing why it has none — an
+    /// audio layer whose endpoint would not open is at silence, not still.
+    pub fn tick(&mut self) -> bool {
+        let Self::Static(s) = self else { return false };
+        if s.last.elapsed() < STATIC_FRAME {
+            return false;
+        }
+        s.last = Instant::now();
+        true
     }
 
     /// Push a layer configuration into the stages it touches.
@@ -547,6 +661,9 @@ impl Analysis {
                 }
                 moved
             }
+            // Nothing here comes from the layer: the grid is fixed and there is
+            // no signal for an EQ, a hop or a decay to act on.
+            Self::Static(_) => false,
         }
     }
 
@@ -560,6 +677,7 @@ impl Analysis {
                 m.notes.reset();
                 m.last = Instant::now();
             }
+            Self::Static(s) => s.last = Instant::now(),
         }
     }
 }

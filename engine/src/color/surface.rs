@@ -136,6 +136,34 @@ impl Default for SurfaceConfig {
     }
 }
 
+impl SurfaceConfig {
+    /// The same field with every keyframe moved to the top row.
+    ///
+    /// A layer listening to nothing has no intensity axis — there is no level
+    /// to be the surface's y — so its field is one dimensional: a colour along
+    /// the strip and nothing else. Such a layer is sampled at a flat full
+    /// level, so projecting is what makes that literally true rather than
+    /// merely close: every keyframe is in the conversation at the one row that
+    /// is ever read, and the colour the editor draws on a handle is the colour
+    /// that reaches the wall. Sampling a field authored in two dimensions along
+    /// its top edge instead would show colours on the graph that the strip
+    /// never produces.
+    ///
+    /// A copy rather than an edit of the stored config, because the authored y
+    /// is not wrong — it is simply not being read. A layer switched to no
+    /// source and back is the two dimensional field it was.
+    pub fn flattened(&self) -> Self {
+        Self {
+            keyframes: self
+                .keyframes
+                .iter()
+                .map(|k| Keyframe { y: 1.0, ..k.clone() })
+                .collect(),
+            sigma: self.sigma,
+        }
+    }
+}
+
 struct Compiled {
     x: f32,
     y: f32,
