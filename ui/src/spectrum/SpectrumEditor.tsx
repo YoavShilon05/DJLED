@@ -207,10 +207,9 @@ export function SpectrumEditor({
       const db = layout.flat ? STATIC_DB : Math.round(dbOfY(layout, p.y));
       // Seeded with the colour already showing there, so dropping a keyframe
       // never makes the field jump before it has been given a colour.
-      const sampled = new ColorSurface(toRenderSurface(layer)).sample(
-        hzToNorm(hz),
-        dbToLevel(db),
-      );
+      const sampled = new ColorSurface(toRenderSurface(layer))
+        .cycling(layer.cycle)
+        .sample(hzToNorm(hz), dbToLevel(db));
       const keyframe: ColorKeyframe = {
         id: nextId("ck"),
         hz,
@@ -307,7 +306,13 @@ export function SpectrumEditor({
       ref={containerRef}
       style={{ position: "relative", width: "100%", height: layout.height }}
     >
-      <SpectrumCanvas layout={layout} surface={surface} frame={frame} axis={axis} />
+      <SpectrumCanvas
+        layout={layout}
+        surface={surface}
+        cycle={layer.cycle}
+        frame={frame}
+        axis={axis}
+      />
       <GizmoLayer
         layout={layout}
         layer={layer}

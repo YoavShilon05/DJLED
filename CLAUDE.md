@@ -44,8 +44,8 @@ cargo run --manifest-path engine/Cargo.toml --release -- --port COM3
 cd ui && npm install && npm run dev
 
 # Tests
-cargo test --manifest-path engine/Cargo.toml        # 312 pass (252 lib + 60 integration)
-cd ui && npm test                                   # 113 pass across 10 files
+cargo test --manifest-path engine/Cargo.toml        # 319 pass (257 lib + 62 integration)
+cd ui && npm test                                   # 120 pass across 10 files
 cd ui && npm run typecheck                          # tsc --noEmit, clean
 
 # End-to-end over the real socket, against a running engine
@@ -251,6 +251,17 @@ trip.
   of the editor's slider) stands in for `None` when interpolating, and a lerp
   that reaches it turns the limit off again. Both sides do this; it is in the
   reference fixture.
+- **Colour cycle joins the position axis, and only that axis.** With it on,
+  `x` distance is measured the short way round (`short_way_round` /
+  `shortWayRound`), so the two ends of the strip are one point: an area of
+  effect runs off one and comes back on the other, and a keyframe animated from
+  0 to 1 arrives where it started. Level never wraps — a quiet band is not
+  adjacent to a loud one. It is a `Layer` flag rather than part of
+  `SurfaceConfig`, applied with `ColorSurface::cycling` *after* compiling a
+  config or a timeline: it says how the field is read, not what was authored, so
+  it survives `seek` and turning it off gives back the exact strip that was
+  there before. It is also not mirror or reverse — those decide where a colour
+  lands, this decides what the field considers adjacent.
 - **Sectors, EQ, thresholds and the curve are not on the timeline.** They build
   a strip map and a filter chain rather than being sampled per frame, so
   animating them means rebuilding an analyser at frame rate. Only the colour

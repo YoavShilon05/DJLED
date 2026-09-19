@@ -438,6 +438,7 @@ fn layer(color: &str, opacity: f32, centers: &[f32]) -> LayerVisual {
             sigma: 0.5,
         },
         timeline: Timeline::default(),
+        cycle: false,
         layout: LayoutConfig::spanning(LEDS),
         intensity: IntensityConfig::pass_through(),
         opacity,
@@ -598,6 +599,54 @@ fn a_confined_keyframe_leaves_the_rest_of_the_strip_to_the_layer_below() {
         confined.link.leds()[bass],
         alone.link.leds()[bass],
         "the area of effect swallowed the keyframe where it was supposed to reach"
+    );
+}
+
+/// A layer at the treble end of its field, confined, painting the *bass* end of
+/// the strip — which is only possible because the two ends are the same place
+/// once the axis is joined.
+///
+/// The uncycled half is what makes this a statement about the flag rather than
+/// about the radius: the same layer with cycling off leaves the bass end to the
+/// layer below, exactly as it did before the flag existed.
+#[test]
+fn a_cycling_layer_carries_a_colour_past_the_end_of_the_strip() {
+    let c = centers();
+    let both_ends = |i: usize| 0.5 * (tone(60.0)(i) + tone(8_000.0)(i));
+
+    // Confined to the treble end of the field, tall enough to cover the level
+    // axis there — the radius is Euclidean over (position, level).
+    let top = |cycle: bool| LayerVisual {
+        surface: SurfaceConfig {
+            keyframes: vec![
+                djled_engine::color::Keyframe::within(1.0, 0.0, "#ffffff", 0.6),
+                djled_engine::color::Keyframe::within(1.0, 1.0, "#ffffff", 0.6),
+            ],
+            sigma: 0.5,
+        },
+        cycle,
+        ..layer("#ffffff", 1.0, &c)
+    };
+
+    let mut alone = Stack::new(&[layer("#ff2000", 1.0, &c)]);
+    alone.run(1.5, &both_ends);
+    let bass = brightest_in(alone.link.leds(), 0..LEDS / 3);
+    assert!(light(alone.link.leds()[bass]) > 0, "nothing is lit at the bass end to cover");
+
+    let mut plain = Stack::new(&[layer("#ff2000", 1.0, &c), top(false)]);
+    plain.run(1.5, &both_ends);
+    assert_eq!(
+        plain.link.leds()[bass],
+        alone.link.leds()[bass],
+        "a treble-confined layer reached the bass end without cycling"
+    );
+
+    let mut cycling = Stack::new(&[layer("#ff2000", 1.0, &c), top(true)]);
+    cycling.run(1.5, &both_ends);
+    assert_ne!(
+        cycling.link.leds()[bass],
+        alone.link.leds()[bass],
+        "the area of effect did not wrap around to the bass end"
     );
 }
 

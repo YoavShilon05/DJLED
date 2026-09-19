@@ -1,5 +1,5 @@
 import { memo } from "react";
-import { Divider, Select, Slider, Stack } from "@mantine/core";
+import { Divider, Select, Slider, Stack, Switch } from "@mantine/core";
 
 import { CURVE_OPTIONS, type CurveType } from "../config/curve";
 import { isStatic, SAMPLE_LENGTHS, type EditorLayer } from "../config/editor";
@@ -134,6 +134,18 @@ export const ShapePanel = memo(function ShapePanel({ layer, onChange, sampleRate
           value={layer.blend}
           onChange={(blend) => onChange({ ...layer, blend })}
           label={(v) => v.toFixed(2)}
+        />
+      </Field>
+
+      <Field
+        label="Colour cycle"
+        hint="Join the two ends of this layer's colour field."
+        info="With it on, position is a circle rather than a line: a colour whose area of effect runs off one end of the strip comes back on the other, and one animated from end to end arrives where it started instead of jumping back. That is what makes a chase a loop. Only position wraps — level has no far side. It is a property of this layer's colour field, so it changes nothing about where the layer lands on the wall."
+      >
+        <Switch
+          checked={layer.cycle}
+          onChange={(event) => onChange({ ...layer, cycle: event.currentTarget.checked })}
+          label={layer.cycle ? "Ends joined" : "Ends apart"}
         />
       </Field>
     </Stack>

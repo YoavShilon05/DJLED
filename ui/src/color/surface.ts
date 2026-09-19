@@ -19,6 +19,11 @@
  * reach a point share it. The consequence is that the field need not be
  * covered: where nothing reaches, the sample is transparent black.
  *
+ * With {@link ColorSurface.cycling} on, the position axis is a circle rather
+ * than a segment: distance along it is measured the short way round, so the two
+ * ends of the strip are neighbours and a colour that runs off one comes back on
+ * the other. Only x wraps — level has no far side.
+ *
  * Must stay numerically identical to the Rust, or the editor previews something
  * the strip will not do.
  */
@@ -86,6 +91,18 @@ export const DEFAULT_SURFACE: SurfaceConfig = {
   ],
   sigma: 0.25,
 };
+
+/**
+ * A separation along the position axis, measured the short way round a strip
+ * joined end to end. Matches `short_way_round` in the Rust.
+ *
+ * Only the square of this is read, so the tie at exactly half a turn — where
+ * `Math.round` goes up and Rust's `round` goes away from zero — is the same
+ * distance either way.
+ */
+function shortWayRound(delta: number): number {
+  return delta - Math.round(delta);
+}
 
 interface Compiled {
   x: number;
@@ -203,6 +220,9 @@ export class ColorSurface {
   private moments: Moment[] = [];
   /** Loop length in seconds. Only read when `moments` has something in it. */
   private length = 0;
+  /** Whether the position axis wraps. Off is what every field did before this
+   *  existed, and what an unset flag on the wire means. */
+  private cycle = false;
 
   constructor(cfg: SurfaceConfig) {
     this.points = authored(cfg).map(compile);
@@ -251,6 +271,18 @@ export class ColorSurface {
     });
     surface.length = timelineLength(timeline);
     return surface;
+  }
+
+  /**
+   * The same surface with the position axis joined end to end, or not.
+   *
+   * A builder rather than a constructor argument: it changes how the field is
+   * *read*, not what was authored, so compiling a config or a timeline knows
+   * nothing about it — which is also why it survives {@link ColorSurface.seek}.
+   */
+  cycling(on: boolean): ColorSurface {
+    this.cycle = on;
+    return this;
   }
 
   /** Whether this surface moves on its own. A still one ignores
@@ -343,7 +375,7 @@ export class ColorSurface {
 
     for (let i = 0; i < this.points.length; i++) {
       const p = this.points[i];
-      const dx = x - p.x;
+      const dx = this.cycle ? shortWayRound(x - p.x) : x - p.x;
       const dy = y - p.y;
       const d2 = dx * dx + dy * dy;
 

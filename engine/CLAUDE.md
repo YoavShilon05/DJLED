@@ -152,7 +152,7 @@ the primary documentation and are usually more current than any summary here.
 
 ## Tests
 
-312 total: 252 unit (in-module `#[cfg(test)]`) + 60 integration.
+319 total: 257 unit (in-module `#[cfg(test)]`) + 62 integration.
 
 | File | What it defends |
 |---|---|

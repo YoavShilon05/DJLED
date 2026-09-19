@@ -59,29 +59,34 @@ export class ColorField {
   /** The object the cached key was taken from, so a repaint that was not caused
    *  by an edit costs one reference comparison instead of a serialisation. */
   private source: SurfaceConfig | null = null;
+  /** Whether the cached raster was drawn on a joined axis. Part of the cache
+   *  key rather than of the surface, because that is where it lives on the
+   *  layer — and a flip of it changes every pixel near the two edges. */
+  private cycle = false;
 
   constructor() {
     this.canvas.width = FIELD_W;
     this.canvas.height = FIELD_H;
   }
 
-  render(surface: SurfaceConfig): HTMLCanvasElement {
+  render(surface: SurfaceConfig, cycle = false): HTMLCanvasElement {
     // The plot repaints on every frame the engine sends, and the surface it is
     // handed is rebuilt only when the layer changes — so the common case is the
     // same object twice and never needs stringifying at all. The key stays for
     // the case that is not: a config adopted from the engine is a new object
     // holding what was already on screen.
-    if (surface === this.source) return this.canvas;
+    if (surface === this.source && cycle === this.cycle) return this.canvas;
     this.source = surface;
+    this.cycle = cycle;
 
-    const key = JSON.stringify(surface);
+    const key = `${cycle}:${JSON.stringify(surface)}`;
     if (key === this.key) return this.canvas;
     this.key = key;
 
     const ctx = this.canvas.getContext("2d");
     if (!ctx) return this.canvas;
 
-    const compiled = new ColorSurface(surface);
+    const compiled = new ColorSurface(surface).cycling(cycle);
     const image = ctx.createImageData(FIELD_W, FIELD_H);
     const data = image.data;
 

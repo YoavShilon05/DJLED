@@ -139,6 +139,31 @@ describe("the layer stack", () => {
     expect(composited[LEDS - 1]).not.toEqual(red[LEDS - 1]);
   });
 
+  /**
+   * The editor's half of the colour cycle, twinned with
+   * `a_cycling_layer_carries_a_colour_past_the_end_of_the_strip` in
+   * `engine/tests/pipeline.rs`. A colour confined to the treble end of its
+   * field paints the bass end of the strip, because with the axis joined the
+   * two ends are the same place — and with it off it does not, which is what
+   * makes this a test of the flag rather than of the radius.
+   */
+  it("carries a confined colour past the end of the strip when cycling", () => {
+    // Tall enough to cover the level axis where it sits: the radius is
+    // Euclidean over (position, level).
+    const treble = (cycle: boolean): EditorLayer => ({
+      ...flat("#ffffff"),
+      cycle,
+      colorKeyframes: [
+        { id: nextId("ck"), hz: 20_000, db: DB_MIN, color: "#ffffff", radius: 0.6 },
+        { id: nextId("ck"), hz: 20_000, db: DB_MAX, color: "#ffffff", radius: 0.6 },
+      ],
+    });
+
+    const red = render(show(flat("#ff2000")));
+    expect(render(show(flat("#ff2000"), treble(false)))[0]).toEqual(red[0]);
+    expect(render(show(flat("#ff2000"), treble(true)))[0]).not.toEqual(red[0]);
+  });
+
   /** A hidden layer contributes nothing, which is what the eye toggle promises. */
   it("skips a disabled layer entirely", () => {
     const hidden: EditorLayer = { ...flat("#40ff60"), enabled: false };

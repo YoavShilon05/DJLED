@@ -206,6 +206,21 @@ describe("the wire format", () => {
     expect(back.layers[0].colorKeyframes[1].radius).toBe(null);
   });
 
+  /**
+   * The colour cycle is a layer setting, so it has to survive both directions —
+   * and an engine that predates it sends nothing, which has to read as off
+   * rather than as undefined finding its way into the renderer.
+   */
+  it("carries the colour cycle both ways, and reads an absent one as off", () => {
+    const layer = { ...defaultLayer("Chase"), cycle: true };
+    const show = toEngineConfig({ ...DEFAULT_CONFIG, layers: [layer], activeLayerId: layer.id });
+    expect(show.layers[0].cycle).toBe(true);
+    expect(fromEngineConfig(DEFAULT_CONFIG, show).layers[0].cycle).toBe(true);
+
+    const older = { layers: [{ ...show.layers[0], cycle: undefined as unknown as boolean }] };
+    expect(fromEngineConfig(DEFAULT_CONFIG, older).layers[0].cycle).toBe(false);
+  });
+
   /** Adopting the engine's stack must not leave the selection pointing at a
    *  layer that no longer exists. */
   it("adopts an engine stack and reselects", () => {

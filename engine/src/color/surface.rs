@@ -52,6 +52,23 @@
 //! reaches — including a field with no keyframes at all — the sample is
 //! transparent black, so an area of effect composes with the stack the way a
 //! hole in it should: the layer below shows through.
+//!
+//! # Colour cycle
+//!
+//! With [`ColorSurface::cycling`] on, the position axis is a *circle* rather
+//! than a segment: the distance from a keyframe to a point is measured the
+//! short way round, so the two ends of the strip are neighbours. An area of
+//! effect that runs off one end comes back on the other, and a keyframe
+//! animated from x = 0 to x = 1 arrives where it started instead of jumping
+//! back — which is the whole reason it exists, since a chase is a colour
+//! crossing the wall over and over and a loop has to close for that to read.
+//!
+//! Only the x axis wraps. The y axis is level, and level has no far side: a
+//! quiet band is not adjacent to a loud one.
+//!
+//! It is one flag for the whole field rather than per keyframe, because it is a
+//! statement about the *axis* — half a field on a circle and half on a segment
+//! is not a shape anything downstream could draw.
 
 use serde::{Deserialize, Serialize};
 
@@ -238,6 +255,9 @@ pub struct ColorSurface {
     /// The field as it stands right now, which is the whole of it for a surface
     /// that does not animate.
     points: Vec<Compiled>,
+    /// Whether the position axis wraps — see the module docs. Off is what every
+    /// field did before this existed, and what an unset flag on the wire means.
+    cycle: bool,
     /// Precomputed `1 / (2σ²)`.
     falloff: f32,
     /// Empty unless this surface animates. Sorted by [`Moment::at`].
@@ -259,6 +279,7 @@ impl ColorSurface {
             falloff: falloff_of(cfg.sigma),
             moments: Vec::new(),
             length: 0.0,
+            cycle: false,
         })
     }
 
@@ -314,7 +335,19 @@ impl ColorSurface {
         let points = start.points.iter().flatten().map(|p| p.compile()).collect();
         let falloff = falloff_of(start.sigma);
 
-        Ok(Self { points, falloff, moments, length: timeline.length() })
+        Ok(Self { points, falloff, moments, length: timeline.length(), cycle: false })
+    }
+
+    /// The same surface with the position axis joined end to end, or not.
+    ///
+    /// A builder rather than an argument to every constructor: it changes how
+    /// the field is *read*, not what was authored, so nothing about compiling a
+    /// config or a timeline depends on it. That is also why it survives
+    /// [`ColorSurface::seek`] — the flag belongs to the surface, and the keys
+    /// it walks know nothing about it.
+    pub fn cycling(mut self, on: bool) -> Self {
+        self.cycle = on;
+        self
     }
 
     /// Whether this surface moves on its own. A still one ignores
@@ -425,7 +458,8 @@ impl ColorSurface {
         let mut nearest: Option<(f32, usize)> = None;
 
         for (i, p) in self.points.iter().enumerate() {
-            let (dx, dy) = (x - p.x, y - p.y);
+            let dx = if self.cycle { short_way_round(x - p.x) } else { x - p.x };
+            let dy = y - p.y;
             let d2 = dx * dx + dy * dy;
 
             let taper = match p.reach {
@@ -521,6 +555,17 @@ fn wrapped(delta: f32) -> f32 {
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
+}
+
+/// A separation along the position axis, measured the short way round a strip
+/// joined end to end. Never more than half the field, and correct for a
+/// keyframe authored outside 0..1 as well as inside it.
+///
+/// Only the square of this is ever read, so the tie at exactly half a turn —
+/// where Rust rounds away from zero and JavaScript rounds up — is the same
+/// distance either way and the port stays exact.
+fn short_way_round(delta: f32) -> f32 {
+    delta - delta.round()
 }
 
 /// One keyframe part of the way from where it was authored at one key to where
@@ -823,6 +868,77 @@ mod tests {
             let alpha = surface.sample(i as f32 / 16.0, 0.5).alpha;
             assert!(alpha > 0.9, "x={i} fell to {alpha} with an unconfined keyframe present");
         }
+    }
+
+    // -- Colour cycle ----------------------------------------------------
+
+    /// The claim the flag is for: an area of effect that runs off one end of
+    /// the strip comes back on the other, rather than being clipped there.
+    #[test]
+    fn a_cycling_area_of_effect_wraps_around_the_strip() {
+        let cfg = SurfaceConfig {
+            keyframes: vec![Keyframe::within(0.95, 0.5, "#ff2000", 0.2)],
+            sigma: 0.25,
+        };
+
+        let plain = ColorSurface::new(&cfg).unwrap();
+        assert!(close(plain.sample(0.02, 0.5).alpha, 0.0), "it reached the far end uncycled");
+
+        let cycling = ColorSurface::new(&cfg).unwrap().cycling(true);
+        assert!(
+            cycling.sample(0.02, 0.5).alpha > 0.5,
+            "0.07 away around the loop, and it did not arrive"
+        );
+    }
+
+    /// Only the position axis is a circle. Level has no far side — a silent
+    /// band is not next to a loud one — and wrapping y would light the bottom
+    /// of the field whenever the top of it was lit.
+    #[test]
+    fn only_the_position_axis_wraps() {
+        let surface = ColorSurface::new(&SurfaceConfig {
+            keyframes: vec![Keyframe::within(0.5, 0.95, "#ff2000", 0.2)],
+            sigma: 0.25,
+        })
+        .unwrap()
+        .cycling(true);
+
+        assert!(close(surface.sample(0.5, 0.02).alpha, 0.0), "the level axis wrapped");
+    }
+
+    /// Joining the axis makes the two ends of the strip one point, so every
+    /// field paints them identically. A closed-form property rather than a
+    /// captured value, and the whole of what makes a colour cross the seam
+    /// without a step.
+    #[test]
+    fn the_ends_of_a_cycling_field_meet() {
+        let surface = default_surface().cycling(true);
+        for i in 0..=8 {
+            let y = i as f32 / 8.0;
+            let (a, b) = (surface.sample(0.0, y), surface.sample(1.0, y));
+            assert!(
+                close(a.l, b.l) && close(a.a, b.a) && close(a.b, b.b) && close(a.alpha, b.alpha),
+                "the ends disagreed at y={y}: {a:?} against {b:?}"
+            );
+        }
+
+        // And without the flag they are as far apart as the field is wide, or
+        // the assertion above would hold whatever cycling did.
+        let plain = default_surface();
+        assert!(!close(plain.sample(0.0, 1.0).l, plain.sample(1.0, 1.0).l));
+    }
+
+    /// Nothing is ever more than half the field away, whichever side of the
+    /// seam either point is on — including a keyframe authored outside 0..1,
+    /// which a hand-edited preset is free to hold.
+    #[test]
+    fn nothing_is_further_than_half_the_strip() {
+        for i in -20..=20 {
+            let d = i as f32 / 8.0;
+            assert!(short_way_round(d).abs() <= 0.5 + 1e-6, "{d} came out {}", short_way_round(d));
+        }
+        assert!(close(short_way_round(0.9), -0.1));
+        assert!(close(short_way_round(-0.9), 0.1));
     }
 
     /// A radius nobody set must change nothing. The default palette is the
@@ -1299,6 +1415,20 @@ mod tests {
 
         surface.seek(2.0);
         assert!(is_color(surface.sample(0.5, 0.5), "#ff0000"), "a switched-off timeline moved");
+    }
+
+    /// The flag belongs to the surface, not to the keys it walks — so a loop
+    /// that has been sought is still cycling afterwards. Getting this wrong
+    /// would cycle on the first frame and stop on the second, which reads as
+    /// the wall tearing once per loop rather than as a setting doing nothing.
+    #[test]
+    fn cycling_survives_a_seek() {
+        let mut surface = ColorSurface::animated(&sliding()).unwrap().cycling(true);
+        for phase in [0.0, 0.3, 0.75, 0.9] {
+            surface.seek(phase * 4.0);
+            let (a, b) = (surface.sample(0.0, 0.5), surface.sample(1.0, 0.5));
+            assert!(close(a.alpha, b.alpha), "the seam opened at phase {phase}");
+        }
     }
 
     /// Seeking runs once per layer per frame, so it must not allocate after the

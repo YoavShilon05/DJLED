@@ -45,7 +45,11 @@ fn committed_reference_matches_this_implementation() {
             .collect();
 
         let cfg = SurfaceConfig { keyframes, sigma: case["sigma"].as_f64().unwrap() as f32 };
-        let surface = ColorSurface::new(&cfg).expect("reference config must be valid");
+        // Absent means off, which is what every case recorded before the flag
+        // existed meant and what an older peer sends.
+        let surface = ColorSurface::new(&cfg)
+            .expect("reference config must be valid")
+            .cycling(case["cycle"].as_bool().unwrap_or(false));
 
         let samples = case["samples"].as_array().expect("case has no samples array");
         assert!(!samples.is_empty(), "case '{name}' contains no samples");
@@ -131,6 +135,43 @@ fn reference_exercises_the_area_of_effect() {
     assert!(baseline > 0, "no sample falls in the dead space past every area of effect");
 }
 
+/// And for cycling: a fixture where nothing joins the axis would agree whether
+/// the port measured a distance the short way round or not, since that is the
+/// only thing the flag changes.
+#[test]
+fn reference_exercises_cycling() {
+    let doc = document();
+    let cycling: Vec<&serde_json::Value> = doc["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(doc["timelines"].as_array().unwrap())
+        .filter(|c| c["cycle"].as_bool().unwrap_or(false))
+        .collect();
+
+    assert!(!cycling.is_empty(), "nothing in the reference joins the position axis");
+
+    // A case that cycles but keeps every colour away from the seam proves
+    // nothing either: the flag only shows where the short way round is the way
+    // across the edge.
+    let near_the_seam = cycling
+        .iter()
+        .flat_map(|c| match c["keyframes"].as_array() {
+            Some(keys) => keys.clone(),
+            None => c["keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|k| k["keyframes"].as_array().unwrap().clone())
+                .collect(),
+        })
+        .any(|k| {
+            let x = k["x"].as_f64().unwrap();
+            !(0.15..=0.85).contains(&x)
+        });
+    assert!(near_the_seam, "no cycling keyframe sits near an edge, where wrapping shows");
+}
+
 /// The fixture is only worth having for opacity if something in it is actually
 /// translucent. An all-opaque reference would let both implementations get
 /// opacity-weighted blending wrong and still agree.
@@ -167,8 +208,9 @@ fn committed_reference_matches_the_timeline_implementation() {
 
     for case in timelines {
         let name = case["name"].as_str().unwrap_or("?");
-        let mut surface =
-            ColorSurface::animated(&timeline(case)).expect("reference timeline must be valid");
+        let mut surface = ColorSurface::animated(&timeline(case))
+            .expect("reference timeline must be valid")
+            .cycling(case["cycle"].as_bool().unwrap_or(false));
 
         let phases = case["phases"].as_array().expect("case has no phases array");
         assert!(!phases.is_empty(), "timeline '{name}' contains no phases");

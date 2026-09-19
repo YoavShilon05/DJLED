@@ -521,6 +521,7 @@ controls land in three different places, and which one matters:
 | Frame hop | rebuilds the analyser | changes how often transforms run |
 | Threshold, clamp, curve | `color/intensity.rs` | output shaping, not analysis |
 | LED sectors, reverse, mirror | `color/strip.rs` | spatial, applied last — and per layer, so sectors also confine a layer to part of the wall |
+| Colour keyframes, blend radius, colour cycle | `color/surface.rs` | they build the colour field; cycling changes how far apart two positions on it are, which is why it is here and not with reverse and mirror |
 | Master brightness | `color/render.rs`, after the fold | the power budget for the whole strip, which is why it is the one control not on a layer |
 
 **The EQ sits after the AGC and before the range map**, and both ends are load-
@@ -613,6 +614,36 @@ its authored value right up to the edge and then falls off a cliff into the
 baseline. The fix is to carry the taper a second time, *before* normalisation —
 as a maximum rather than a sum, so two overlapping areas of effect are covered
 where either one covers and not covered twice.
+
+### Colour cycle
+
+A layer can be told that its two ends are the same place. With **colour cycle**
+on, distance along the position axis is measured the short way round: an area of
+effect that runs off the treble end comes back on the bass end, and a keyframe
+animated from one end to the other arrives where it started instead of snapping
+back. That is the difference between a chase and a sweep with a seam in it, and
+it is the reason the setting exists at all — everything else here already looped
+in time, and nothing looped in space.
+
+Three decisions inside it:
+
+- **Only position wraps.** The other axis is level, and level has no far side: a
+  silent band is not adjacent to a loud one. Wrapping it would light the bottom
+  of the field whenever the top of it was lit.
+- **It is one flag for the layer**, not for a keyframe and not for a timeline
+  key. It says what shape the axis *is*, and half a field on a circle with the
+  other half on a segment is not a shape anything downstream could paint. For
+  the same reason it sits beside the sectors and the EQ rather than on the
+  timeline — it builds the field rather than being sampled from it.
+- **It changes how the field is read, not what was authored.** Nothing about a
+  saved show differs; turning it off gives back exactly the strip that was there
+  before. That is also what lets the editor's plot draw the wrapped halves of an
+  area of effect as ghosts either side of the graph rather than moving anything.
+
+Note that it is *not* the same as mirror or reverse. Those are spatial — they
+decide where a colour lands on the strip. This decides what the colour field
+itself considers adjacent, which is why the editor's graph shows it and the
+direction control does not.
 
 The UI reimplements this in TypeScript to preview without a round trip.
 `ui/src/color/reference.json` is generated from the Rust and asserted by tests on
@@ -739,8 +770,8 @@ next during the blackout.
 ## Tests
 
 ```bash
-cargo test --manifest-path engine/Cargo.toml   # 312
-cd ui && npm test && npm run typecheck         # 113
+cargo test --manifest-path engine/Cargo.toml   # 319
+cd ui && npm test && npm run typecheck         # 120
 ```
 
 The ones worth knowing about live in `engine/tests/artifacts.rs`: they assert the

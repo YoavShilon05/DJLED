@@ -1,4 +1,9 @@
-import { memo, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
+import {
+  memo,
+  useId,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 
 import type { EditorLayer, GizmoFlags } from "../config/editor";
 import { DB_TICKS } from "../config/scales";
@@ -100,6 +105,13 @@ export const GizmoLayer = memo(function GizmoLayer({
   // Everything gated on this is a statement about level, and a flat plot has no
   // level. Read once so the eight places that ask agree by construction.
   const levels = !layout.flat;
+  // Only the wrapped halves of an area of effect are clipped, so an ordinary
+  // ring still overhangs the plot the way it always has. Minted rather than
+  // spelled out: an id is document-wide, and a second plot would silently share
+  // the first one's rectangle.
+  // The colons React puts in an id are legal in a fragment reference but not in
+  // a CSS selector, and this is read back as `url(#…)` — so they come out.
+  const clipId = `plot-clip${useId().replace(/:/g, "")}`;
 
   return (
     <svg
@@ -107,6 +119,12 @@ export const GizmoLayer = memo(function GizmoLayer({
       height={layout.height}
       style={{ position: "absolute", inset: 0, pointerEvents: "none", userSelect: "none" }}
     >
+      <defs>
+        <clipPath id={clipId}>
+          <rect x={plot.x} y={plot.y} width={plot.w} height={plot.h} />
+        </clipPath>
+      </defs>
+
       {/*
         Background target. Right-click adds a colour keyframe and double-click
         adds an EQ band — the two gestures share the plot, so they cannot share
@@ -230,10 +248,11 @@ export const GizmoLayer = memo(function GizmoLayer({
       */}
       {gizmos.colorKeyframes &&
         layer.colorKeyframes.map((k) => {
-          if (k.radius === null) return null;
+          const radius = k.radius;
+          if (radius === null) return null;
           const cx = xOfHz(layout, k.hz);
           const cy = yOfDb(layout, k.db);
-          const rx = k.radius * plot.w;
+          const rx = radius * plot.w;
           const opacity =
             sameTarget(selected, { kind: "color", id: k.id }) ||
             sameTarget(active, { kind: "color", id: k.id })
@@ -242,32 +261,48 @@ export const GizmoLayer = memo(function GizmoLayer({
           // On a flat plot every keyframe is on the one row, so the reach is
           // purely horizontal and the honest mark is the span it covers. An
           // ellipse there would claim a vertical extent the field does not have.
-          return layout.flat ? (
-            <rect
-              key={`aoe-${k.id}`}
-              x={cx - rx}
-              y={plot.y + 1}
-              width={rx * 2}
-              height={plot.h - 2}
-              fill="none"
-              stroke={palette.gizmo}
-              strokeWidth={1}
-              strokeDasharray="3 4"
-              strokeOpacity={opacity}
-            />
+          const mark = (dx: number) =>
+            layout.flat ? (
+              <rect
+                key={`aoe-${k.id}-${dx}`}
+                x={cx + dx - rx}
+                y={plot.y + 1}
+                width={rx * 2}
+                height={plot.h - 2}
+                fill="none"
+                stroke={palette.gizmo}
+                strokeWidth={1}
+                strokeDasharray="3 4"
+                strokeOpacity={opacity}
+              />
+            ) : (
+              <ellipse
+                key={`aoe-${k.id}-${dx}`}
+                cx={cx + dx}
+                cy={cy}
+                rx={rx}
+                ry={radius * plot.h}
+                fill="none"
+                stroke={palette.gizmo}
+                strokeWidth={1}
+                strokeDasharray="3 4"
+                strokeOpacity={opacity}
+              />
+            );
+
+          // On a joined axis the reach that runs off one end of the plot really
+          // is painted on the other, so the mark is drawn a plot-width either
+          // side as well. Clipped, because only the part inside the plot is on
+          // the strip — and without the copies the editor would show a reach
+          // stopping at an edge the field does not have.
+          return layer.cycle ? (
+            <g key={`aoe-${k.id}`} clipPath={`url(#${clipId})`}>
+              {mark(-plot.w)}
+              {mark(0)}
+              {mark(plot.w)}
+            </g>
           ) : (
-            <ellipse
-              key={`aoe-${k.id}`}
-              cx={cx}
-              cy={cy}
-              rx={rx}
-              ry={k.radius * plot.h}
-              fill="none"
-              stroke={palette.gizmo}
-              strokeWidth={1}
-              strokeDasharray="3 4"
-              strokeOpacity={opacity}
-            />
+            mark(0)
           );
         })}
 

@@ -70,6 +70,10 @@ export interface LayerConfig {
   /** The same field over time: a loop of whole fields, interpolated. No keys
    *  for a layer that does not animate, which is every show that predates this. */
   timeline: Timeline;
+  /** Join the two ends of this layer's colour field, so a colour running off
+   *  one end of the strip comes back on the other. A property of the layer
+   *  rather than of the field: it says what shape the position axis is. */
+  cycle: boolean;
   eq: EqBand[];
   ledKeyframes: LedKeyframe[];
   reverse: boolean;

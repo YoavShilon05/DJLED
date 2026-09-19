@@ -126,6 +126,18 @@ export interface EditorLayer {
   ledKeyframes: LedKeyframe[];
   /** Applied to this layer's spectrum before anything else looks at it. */
   eq: EqBand[];
+  /**
+   * Join the two ends of this layer's colour field.
+   *
+   * With it on, the position axis is a circle: a keyframe's area of effect that
+   * runs off the treble end comes back on the bass end, and a colour animated
+   * from one end to the other arrives where it started instead of jumping back.
+   * That is what makes a chase a loop rather than a sweep with a seam in it.
+   *
+   * Per layer, not per keyframe and not per timeline key — it is a statement
+   * about the axis, and half a field on a circle is not a shape.
+   */
+  cycle: boolean;
   /** Play this layer back to front. */
   reverse: boolean;
   /** Fold this layer's range into each half of the strip. */
@@ -245,6 +257,9 @@ export function defaultLayer(name: string): EditorLayer {
     // Flat. The EQ is a correction layer, so having it do nothing until asked is
     // the only honest default.
     eq: [],
+    // A strip with two ends, which is what every layer was before cycling
+    // existed and what the engine's own default is.
+    cycle: false,
     reverse: false,
     mirror: false,
     threshold: -62,
@@ -399,6 +414,7 @@ function toEngineLayer(layer: EditorLayer): LayerConfig {
     // See `LayerConfig.surface`.
     surface: toSurface(layer),
     timeline: toTimeline(layer),
+    cycle: layer.cycle,
     eq: layer.eq,
     ledKeyframes: layer.ledKeyframes,
     reverse: layer.reverse,
@@ -461,6 +477,8 @@ function fromEngineLayer(layer: LayerConfig): EditorLayer {
     // are minted fresh rather than expected back.
     eq: layer.eq.map((b) => ({ ...b, id: nextId("eq") })),
     ledKeyframes: layer.ledKeyframes.map((k) => ({ ...k, id: nextId("led") })),
+    // Absent is off: a peer that predates the flag means a strip with two ends.
+    cycle: layer.cycle === true,
     reverse: layer.reverse,
     mirror: layer.mirror,
     threshold: layer.threshold,
@@ -541,6 +559,7 @@ function sanitiseLayer(stored: Partial<EditorLayer>): EditorLayer {
     id: typeof stored.id === "string" && stored.id ? stored.id : base.id,
     name: stored.name?.trim() || base.name,
     enabled: stored.enabled !== false,
+    cycle: stored.cycle === true,
     opacity: clamp01(stored.opacity, 1),
     source: sanitiseSource(stored.source),
     // Empty is a legitimate colour field — a layer that paints nothing — so like

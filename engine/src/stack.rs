@@ -233,6 +233,7 @@ impl LiveStack {
                 } else {
                     l.config.timeline.clone()
                 },
+                cycle: l.config.cycle,
                 layout: l.config.layout(),
                 intensity: if l.analysis.is_static() {
                     IntensityConfig::pass_through()

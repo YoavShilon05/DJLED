@@ -13,7 +13,7 @@ that make this directory dangerous.
 ```bash
 npm install
 npm run dev         # vite on 5173
-npm test            # vitest run — 113 tests, 10 files
+npm test            # vitest run — 120 tests, 10 files
 npm run typecheck   # tsc --noEmit
 npm run build       # typecheck + vite build
 npm run smoke       # node scripts/stack-smoke.mjs, against a running engine

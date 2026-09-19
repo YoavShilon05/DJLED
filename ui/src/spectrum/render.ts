@@ -192,7 +192,9 @@ export function layerCoverage(
   // The loop wherever the layer has one, and its still field where it does not.
   // Sought before any position is sampled, exactly as the engine's run loop
   // seeks before it renders — sampling first would show every frame one behind.
-  const surface = ColorSurface.forLayer(toRenderSurface(layer), toRenderTimeline(layer));
+  const surface = ColorSurface.forLayer(toRenderSurface(layer), toRenderTimeline(layer)).cycling(
+    layer.cycle,
+  );
   surface.seek(now);
   const out: LinearRgb[] = new Array(ledCount);
   const opacity = clamp(layer.opacity, 0, 1);

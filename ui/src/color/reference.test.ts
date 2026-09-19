@@ -11,10 +11,12 @@
  * `engine/examples/color_reference.rs`). Both sides assert against it, so either
  * one drifting fails a test.
  *
- * It carries two palettes. The first is the shipped default, which is opaque.
- * The second is translucent, because opacity-weighted blending is the subtlest
- * thing here to port and an all-opaque fixture would let both sides get it wrong
- * and still agree.
+ * It carries several palettes. The first is the shipped default, which is
+ * opaque. The second is translucent, because opacity-weighted blending is the
+ * subtlest thing here to port and an all-opaque fixture would let both sides get
+ * it wrong and still agree. Others confine their keyframes and join the position
+ * axis end to end — the two places a port can quietly measure a distance
+ * differently and agree everywhere else.
  */
 
 import { describe, expect, it } from "vitest";
@@ -37,8 +39,15 @@ interface Sample {
 interface Case {
   name: string;
   sigma: number;
+  /** Whether the recorded samples were taken on a joined position axis. */
+  cycle?: boolean;
   keyframes: SurfaceConfig["keyframes"];
   samples: Sample[];
+}
+
+/** A recorded case, back in the shape the editor compiles. */
+function surfaceOf(c: Case): ColorSurface {
+  return new ColorSurface(c).cycling(c.cycle === true);
 }
 
 const cases = reference.cases as Case[];
@@ -52,7 +61,7 @@ describe("colour surface matches the Rust implementation", () => {
   it.each(cases.map((c) => [c.name, c] as const))(
     "agrees on every %s sample in Oklab",
     (_name, testCase) => {
-      const surface = new ColorSurface(testCase);
+      const surface = surfaceOf(testCase);
       for (const s of testCase.samples) {
         const got = surface.sample(s.x, s.y);
         expect(Math.abs(got.l - s.l), `l at (${s.x}, ${s.y})`).toBeLessThan(LAB_TOLERANCE);
@@ -68,7 +77,7 @@ describe("colour surface matches the Rust implementation", () => {
   it.each(cases.map((c) => [c.name, c] as const))(
     "agrees on the bytes the %s palette would put on the LEDs",
     (_name, testCase) => {
-      const surface = new ColorSurface(testCase);
+      const surface = surfaceOf(testCase);
       for (const s of testCase.samples) {
         const got = oklabToLedBytes(surface.sample(s.x, s.y));
         for (let c = 0; c < 3; c++) {
@@ -109,6 +118,7 @@ interface Phase {
 interface TimelineCase {
   name: string;
   length: number;
+  cycle?: boolean;
   keys: { at: number; sigma: number; keyframes: SurfaceConfig["keyframes"] }[];
   phases: Phase[];
 }
@@ -132,7 +142,9 @@ describe("timelines match the Rust implementation", () => {
   it.each(timelines.map((c) => [c.name, c] as const))(
     "agrees with the engine at every instant of the %s loop",
     (_name, testCase) => {
-      const surface = ColorSurface.animated(timelineOf(testCase));
+      const surface = ColorSurface.animated(timelineOf(testCase)).cycling(
+        testCase.cycle === true,
+      );
       for (const phase of testCase.phases) {
         surface.seek(phase.seconds);
         for (const s of phase.samples) {
@@ -150,7 +162,9 @@ describe("timelines match the Rust implementation", () => {
   it.each(timelines.map((c) => [c.name, c] as const))(
     "agrees on the bytes the %s loop would put on the LEDs",
     (_name, testCase) => {
-      const surface = ColorSurface.animated(timelineOf(testCase));
+      const surface = ColorSurface.animated(timelineOf(testCase)).cycling(
+        testCase.cycle === true,
+      );
       for (const phase of testCase.phases) {
         surface.seek(phase.seconds);
         for (const s of phase.samples) {
@@ -176,6 +190,21 @@ describe("timelines match the Rust implementation", () => {
     const radii = timelines.flatMap((t) => t.keys.flatMap((k) => k.keyframes.map((f) => f.radius)));
     expect(radii.some((r) => typeof r === "number")).toBe(true);
     expect(radii.some((r) => r == null)).toBe(true);
+  });
+
+  it("exercises a joined position axis", () => {
+    // Cycling is the only thing that changes how far apart two positions are,
+    // so without a case that uses it the file agrees whichever way the port
+    // measures — and a keyframe away from both edges would never show it.
+    const cycling = [...cases, ...timelines].filter((c) => c.cycle === true);
+    expect(cycling.length).toBeGreaterThan(0);
+
+    const positions = cycling.flatMap((c) =>
+      "keyframes" in c
+        ? c.keyframes.map((k) => k.x)
+        : c.keys.flatMap((k) => k.keyframes.map((f) => f.x)),
+    );
+    expect(positions.some((x) => x < 0.15 || x > 0.85)).toBe(true);
   });
 
   it("actually moves between phases", () => {

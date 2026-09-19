@@ -87,6 +87,17 @@ pub struct Layer {
     /// Per layer, length and all, because two layers have no reason to agree
     /// about time any more than they do about a decay or a device.
     pub timeline: Timeline,
+    /// Join the two ends of this layer's colour field, so a colour that runs
+    /// off one end of the strip comes back on the other.
+    ///
+    /// A property of the layer rather than of a keyframe or of a timeline key:
+    /// it says what shape the position axis *is*, and half a field on a circle
+    /// with the other half on a segment is not a shape anything could paint.
+    /// For the same reason it is not on the timeline — like the sectors and the
+    /// EQ, it builds the field rather than being sampled from it.
+    ///
+    /// See [`crate::color::ColorSurface::cycling`].
+    pub cycle: bool,
     pub eq: Vec<EqBand>,
     pub led_keyframes: Vec<LedKeyframe>,
     pub reverse: bool,
@@ -117,6 +128,7 @@ impl Default for Layer {
             source: Source::default_output(),
             surface: SurfaceConfig::default(),
             timeline: Timeline::default(),
+            cycle: false,
             eq: Vec::new(),
             led_keyframes: Vec::new(),
             reverse: false,
@@ -319,6 +331,7 @@ mod tests {
                 "surface": { "keyframes": [{"x":0,"y":1,"color":"#ff2000"}], "sigma": 0.25 },
                 "eq": [{"id":"eq-1","type":"peak","hz":2000,"gain":6,"q":1.4}],
                 "ledKeyframes": [{"id":"a","led":0,"hz":20},{"id":"b","led":149,"hz":20000}],
+                "cycle": true,
                 "reverse": true,
                 "mirror": true,
                 "threshold": -55.5,
@@ -339,6 +352,7 @@ mod tests {
         assert_eq!(layer.eq.len(), 1);
         assert_eq!(layer.led_keyframes.len(), 2);
         assert!(layer.reverse && layer.mirror);
+        assert!(layer.cycle);
         assert_eq!(layer.threshold, -55.5);
         assert_eq!(layer.curve.kind, CurveKind::EaseIn);
         assert_eq!(layer.hop(), 1024);
@@ -394,6 +408,9 @@ mod tests {
     fn missing_fields_fall_back_to_defaults() {
         let cfg: ShowConfig = serde_json::from_str(r#"{"reverse":true}"#).unwrap();
         assert!(cfg.base().reverse);
+        // A peer that predates the flag means "as it always was", which is a
+        // strip with two ends rather than a ring.
+        assert!(!cfg.base().cycle);
         assert_eq!(cfg.base().decay(), REFERENCE_DECAY);
         assert_eq!(cfg.base().hop(), DEFAULT_HOP);
         assert!(cfg.base().eq.is_empty());

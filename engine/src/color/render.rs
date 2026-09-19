@@ -81,6 +81,10 @@ pub struct LayerVisual {
     /// The same field over time. Its keys win wherever there are any — see
     /// [`ColorSurface::for_layer`].
     pub timeline: Timeline,
+    /// Whether this layer's position axis is joined end to end — see
+    /// [`ColorSurface::cycling`]. Not part of the field itself: it is how the
+    /// field is read, which is why it rides beside it rather than inside it.
+    pub cycle: bool,
     pub layout: LayoutConfig,
     pub intensity: IntensityConfig,
     /// Master opacity for the layer, multiplied into every sample's own.
@@ -101,6 +105,7 @@ impl LayerVisual {
         Self {
             surface,
             timeline: Timeline::default(),
+            cycle: false,
             layout,
             intensity,
             opacity: 1.0,
@@ -118,7 +123,8 @@ struct CompiledLayer {
 impl CompiledLayer {
     fn new(visual: &LayerVisual, points: usize, leds: usize) -> Result<Self, String> {
         Ok(Self {
-            surface: ColorSurface::for_layer(&visual.surface, &visual.timeline)?,
+            surface: ColorSurface::for_layer(&visual.surface, &visual.timeline)?
+                .cycling(visual.cycle),
             map: StripMap::new(
                 visual.layout.clone(),
                 visual.intensity,
@@ -633,6 +639,7 @@ mod tests {
         LayerVisual {
             surface: surface.clone(),
             timeline: Timeline::default(),
+            cycle: false,
             layout: LayoutConfig::spanning(150),
             intensity: IntensityConfig::pass_through(),
             opacity,
