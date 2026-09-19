@@ -209,6 +209,39 @@ export const GizmoLayer = memo(function GizmoLayer({
         </>
       )}
 
+      {/*
+        Areas of effect, under the handles so a ring never sits on top of the
+        keyframe it belongs to. Drawn for every confined keyframe rather than
+        only the selected one: the holes they leave between them are a property
+        of the field as a whole, and are unreadable one ring at a time.
+
+        An ellipse, not a circle. The radius is a distance in the unit square,
+        and the plot is not square — so a circle here would claim a reach along
+        the frequency axis that the strip does not have.
+      */}
+      {gizmos.colorKeyframes &&
+        layer.colorKeyframes.map((k) =>
+          k.radius === null ? null : (
+            <ellipse
+              key={`aoe-${k.id}`}
+              cx={xOfHz(layout, k.hz)}
+              cy={yOfDb(layout, k.db)}
+              rx={k.radius * plot.w}
+              ry={k.radius * plot.h}
+              fill="none"
+              stroke={palette.gizmo}
+              strokeWidth={1}
+              strokeDasharray="3 4"
+              strokeOpacity={
+                sameTarget(selected, { kind: "color", id: k.id }) ||
+                sameTarget(active, { kind: "color", id: k.id })
+                  ? 0.9
+                  : 0.3
+              }
+            />
+          ),
+        )}
+
       {gizmos.colorKeyframes &&
         layer.colorKeyframes.map((k) => {
           const target: GizmoTarget = { kind: "color", id: k.id };

@@ -442,6 +442,25 @@ fn layer(color: &str, opacity: f32, centers: &[f32]) -> LayerVisual {
     }
 }
 
+/// A layer painting `color` only within `radius` of the bass end of its field.
+///
+/// Two keyframes rather than one because the radius is Euclidean over
+/// (position, level) and the level axis is as tall as the position axis is
+/// wide: confining a whole *column* of the field takes more reach than the
+/// horizontal distance alone suggests.
+fn confined_layer(color: &str, radius: f32, centers: &[f32]) -> LayerVisual {
+    LayerVisual {
+        surface: SurfaceConfig {
+            keyframes: vec![
+                djled_engine::color::Keyframe::within(0.0, 0.0, color, radius),
+                djled_engine::color::Keyframe::within(0.0, 1.0, color, radius),
+            ],
+            sigma: 0.5,
+        },
+        ..layer(color, 1.0, centers)
+    }
+}
+
 fn centers() -> Vec<f32> {
     Engine::new(&EngineConfig::default(), SR).centers().to_vec()
 }
@@ -530,4 +549,82 @@ fn the_wire_format_is_unchanged_by_the_stack() {
     assert_eq!(p.renderer.pixels().len(), BANDS);
     assert_eq!(p.link.last_frame_bytes(), 149);
     assert_eq!(p.link.leds().len(), LEDS);
+}
+
+/// A keyframe's area of effect, all the way to the LED bytes: past it the layer
+/// paints nothing, so the strip shows what is underneath rather than the colour
+/// the same keyframe would have reached with if it were unconfined.
+///
+/// Driven by a bass tone *and* a treble one, because an LED with no level is
+/// black whatever is painted on it — the two ends of the strip both have to be
+/// lit before covering one of them is a statement about coverage.
+///
+/// The `assert_ne` on the unconfined stack is the half that matters. Without it
+/// this passes on a build where the radius is parsed, stored and then ignored.
+#[test]
+fn a_confined_keyframe_leaves_the_rest_of_the_strip_to_the_layer_below() {
+    let c = centers();
+    let both_ends = |i: usize| 0.5 * (tone(60.0)(i) + tone(8_000.0)(i));
+
+    let mut alone = Stack::new(&[layer("#ff2000", 1.0, &c)]);
+    alone.run(1.5, &both_ends);
+
+    // Picked from the bottom layer rather than assumed, so the assertions below
+    // are about coverage and not about whether anything is lit there at all.
+    let treble = brightest_in(alone.link.leds(), LEDS * 2 / 3..LEDS);
+    let bass = brightest_in(alone.link.leds(), 0..LEDS / 3);
+    assert!(light(alone.link.leds()[treble]) > 0 && light(alone.link.leds()[bass]) > 0);
+
+    let mut covered = Stack::new(&[layer("#ff2000", 1.0, &c), layer("#ffffff", 1.0, &c)]);
+    covered.run(1.5, &both_ends);
+    assert_ne!(
+        covered.link.leds()[treble],
+        alone.link.leds()[treble],
+        "an unconfined top layer did not reach the treble end, so this proves nothing"
+    );
+
+    let mut confined =
+        Stack::new(&[layer("#ff2000", 1.0, &c), confined_layer("#ffffff", 0.6, &c)]);
+    confined.run(1.5, &both_ends);
+    assert_eq!(
+        confined.link.leds()[treble],
+        alone.link.leds()[treble],
+        "the area of effect did not stop the top layer covering the treble end"
+    );
+    assert_ne!(
+        confined.link.leds()[bass],
+        alone.link.leds()[bass],
+        "the area of effect swallowed the keyframe where it was supposed to reach"
+    );
+}
+
+/// Total light in one pixel.
+fn light(px: [u8; 3]) -> u32 {
+    px.iter().map(|&c| c as u32).sum()
+}
+
+fn brightest_in(leds: &[[u8; 3]], range: std::ops::Range<usize>) -> usize {
+    range.max_by_key(|&i| light(leds[i])).unwrap()
+}
+
+/// A layer with no colour keyframes at all paints nothing — which is not the
+/// same as painting black. The stack below must come through untouched, or
+/// deleting the last keyframe would blank the wall instead of emptying one
+/// layer.
+#[test]
+fn an_empty_colour_field_paints_nothing() {
+    let c = centers();
+
+    let empty = LayerVisual {
+        surface: SurfaceConfig { keyframes: Vec::new(), sigma: 0.5 },
+        ..layer("#ffffff", 1.0, &c)
+    };
+
+    let mut stacked = Stack::new(&[layer("#ff2000", 1.0, &c), empty]);
+    stacked.run(1.5, tone(440.0));
+
+    let mut alone = Stack::new(&[layer("#ff2000", 1.0, &c)]);
+    alone.run(1.5, tone(440.0));
+
+    assert_eq!(stacked.link.leds(), alone.link.leds(), "an empty field changed the strip");
 }

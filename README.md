@@ -523,6 +523,40 @@ than merely look like it does:
   Without that asymmetry an invisible keyframe would tint its neighbours with a
   colour nobody can see.
 
+### Area of effect
+
+A keyframe can also be told how far it reaches, and past that it contributes
+nothing. That is a different question from the blend radius, which is easy to
+conflate with it: the blend radius decides how two keyframes that *both* reach a
+point share it, and it is one number for the whole layer — so narrowing it to
+confine one colour sharpens every other colour at the same time. The area of
+effect is per keyframe and decides whether a keyframe is in that conversation at
+all.
+
+Two consequences follow, and both are choices rather than fallout:
+
+- **The field need not be covered.** Where nothing reaches — including a layer
+  with no keyframes at all, which is now a legal thing to author — the sample is
+  *transparent* black, not opaque black. An unreached position has to let the
+  layer below through, exactly like a position no LED sector reaches; anything
+  else would make an area of effect useless in a stack, which is the only place
+  it is interesting.
+- **The edge is a fade, not a disc.** Presence holds at 1 across the interior of
+  the radius and smoothsteps to zero over the outer 35% of it. A hard cutoff was
+  the obvious reading and is wrong on a wall: every other edge in this field is
+  smooth, so the one hard line reads as a fault in the strip. Fading over the
+  whole radius is wrong the other way, because then full opacity is reached only
+  at the exact centre and an opaque keyframe never looks opaque.
+
+There is a subtlety in the second point worth recording, because it is invisible
+until you hit it. Normalised weighting is what keeps the blend convex, and it is
+also what silently undoes a taper: with one keyframe in reach, the taper appears
+in both the numerator and the denominator and cancels exactly, so opacity holds
+its authored value right up to the edge and then falls off a cliff into the
+baseline. The fix is to carry the taper a second time, *before* normalisation —
+as a maximum rather than a sum, so two overlapping areas of effect are covered
+where either one covers and not covered twice.
+
 The UI reimplements this in TypeScript to preview without a round trip.
 `ui/src/color/reference.json` is generated from the Rust and asserted by tests on
 **both** sides, so a divergence fails a test rather than making the editor lie:

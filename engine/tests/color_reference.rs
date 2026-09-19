@@ -35,11 +35,12 @@ fn committed_reference_matches_this_implementation() {
             .unwrap_or_else(|| panic!("case '{name}' has no keyframes array"))
             .iter()
             .map(|k| {
-                Keyframe::new(
+                let base = Keyframe::new(
                     k["x"].as_f64().unwrap() as f32,
                     k["y"].as_f64().unwrap() as f32,
                     k["color"].as_str().unwrap(),
-                )
+                );
+                Keyframe { radius: k["radius"].as_f64().map(|r| r as f32), ..base }
             })
             .collect();
 
@@ -106,6 +107,28 @@ fn reference_tracks_the_default_surface() {
         assert!((recorded["y"].as_f64().unwrap() as f32 - current.y).abs() < 1e-6);
     }
     assert!((case["sigma"].as_f64().unwrap() as f32 - default.sigma).abs() < 1e-6);
+}
+
+/// Likewise for the area of effect: the fixture has to contain dead space, or
+/// both implementations could ignore the radius entirely and still agree.
+#[test]
+fn reference_exercises_the_area_of_effect() {
+    let doc = document();
+    let cases = doc["cases"].as_array().unwrap();
+
+    let confined = cases
+        .iter()
+        .flat_map(|c| c["keyframes"].as_array().unwrap())
+        .filter(|k| k["radius"].is_number())
+        .count();
+    assert!(confined > 0, "no keyframe in the reference carries a radius");
+
+    let baseline = cases
+        .iter()
+        .flat_map(|c| c["samples"].as_array().unwrap())
+        .filter(|s| s["alpha"].as_f64().unwrap() == 0.0)
+        .count();
+    assert!(baseline > 0, "no sample falls in the dead space past every area of effect");
 }
 
 /// The fixture is only worth having for opacity if something in it is actually

@@ -2,6 +2,7 @@ import { useCallback, useMemo, useRef, useState, type MouseEvent as ReactMouseEv
 import {
   ActionIcon,
   Box,
+  Checkbox,
   ColorPicker,
   ColorSwatch,
   Divider,
@@ -24,6 +25,9 @@ import { ColorSurface } from "../color/surface";
 import {
   nextId,
   toSurface,
+  RADIUS_DEFAULT,
+  RADIUS_MAX,
+  RADIUS_MIN,
   type ColorKeyframe,
   type EditorLayer,
   type GizmoFlags,
@@ -60,7 +64,12 @@ const PLOT_HEIGHT = 400;
 /** The clamp must stay above the threshold, or the curve has no domain. */
 const MIN_WINDOW_DB = 6;
 
-const MIN_COLOR_KEYFRAMES = 2;
+/**
+ * Sectors, unlike colours, have a floor: one of them defines no span at all, so
+ * a layer with fewer than two reaches no LED and the engine substitutes a
+ * spanning layout behind the editor's back. A colour field has no such floor —
+ * an empty one is a layer that paints nothing, which is a thing to author.
+ */
 const MIN_LED_KEYFRAMES = 2;
 
 interface Props {
@@ -144,7 +153,9 @@ export function SpectrumEditor({
 
   const removeSelected = useCallback(() => {
     if (!selected) return;
-    if (selected.kind === "color" && layer.colorKeyframes.length > MIN_COLOR_KEYFRAMES) {
+    if (selected.kind === "color") {
+      // No minimum: a field with nothing in it paints nothing, and nothing is
+      // transparent rather than black, so the layers below still show.
       onChange({
         ...layer,
         colorKeyframes: layer.colorKeyframes.filter((k) => k.id !== selected.id),
@@ -180,6 +191,9 @@ export function SpectrumEditor({
         hz,
         db,
         color: oklabToHex(sampled),
+        // Unconfined, so dropping one behaves as it always has. An area of
+        // effect is something you reach for, not something you inherit.
+        radius: null,
       };
       onChange({ ...layer, colorKeyframes: [...layer.colorKeyframes, keyframe] });
       setSelected({ kind: "color", id: keyframe.id });
@@ -220,6 +234,16 @@ export function SpectrumEditor({
       setSelected({ kind: "eq", id: band.id });
     },
     [layer, layout, localPoint, onChange],
+  );
+
+  const updateColor = useCallback(
+    (id: string, patch: Partial<ColorKeyframe>) => {
+      onChange({
+        ...layer,
+        colorKeyframes: layer.colorKeyframes.map((k) => (k.id === id ? { ...k, ...patch } : k)),
+      });
+    },
+    [layer, onChange],
   );
 
   const updateEq = useCallback(
@@ -304,12 +328,7 @@ export function SpectrumEditor({
                   </Text>
                 </Group>
                 <Tooltip label="Delete (Del)">
-                  <ActionIcon
-                    color="red"
-                    aria-label="Delete keyframe"
-                    disabled={layer.colorKeyframes.length <= MIN_COLOR_KEYFRAMES}
-                    onClick={removeSelected}
-                  >
+                  <ActionIcon color="red" aria-label="Delete keyframe" onClick={removeSelected}>
                     <TrashIcon />
                   </ActionIcon>
                 </Tooltip>
@@ -325,18 +344,44 @@ export function SpectrumEditor({
                 format="hexa"
                 alphaLabel="Opacity"
                 value={selectedColor.color}
-                onChange={(color) =>
-                  onChange({
-                    ...layer,
-                    colorKeyframes: layer.colorKeyframes.map((k) =>
-                      k.id === selectedColor.id ? { ...k, color } : k,
-                    ),
-                  })
-                }
+                onChange={(color) => updateColor(selectedColor.id, { color })}
                 swatches={SWATCHES}
                 swatchesPerRow={8}
                 fullWidth
               />
+              <Divider />
+              {/*
+                The checkbox is the control; the slider is only reachable once
+                the answer to "how far" stops being "everywhere". Unticking
+                starts from a visible area rather than from zero, so the plot
+                shows a ring the moment it is switched on.
+              */}
+              <Checkbox
+                size="xs"
+                label="Infinite area of effect"
+                checked={selectedColor.radius === null}
+                onChange={(event) =>
+                  updateColor(selectedColor.id, {
+                    radius: event.currentTarget.checked ? null : RADIUS_DEFAULT,
+                  })
+                }
+              />
+              {selectedColor.radius !== null && (
+                <Field
+                  label="Radius"
+                  value={selectedColor.radius.toFixed(2)}
+                  info="How far this colour reaches, as a fraction of the plot. Past it the keyframe contributes nothing and the field falls to transparent, so the layers below show through rather than black. This is not the blend radius: that decides how two keyframes that both reach a point share it, and it is one number for the whole layer."
+                >
+                  <Slider
+                    min={RADIUS_MIN}
+                    max={RADIUS_MAX}
+                    step={0.01}
+                    value={selectedColor.radius}
+                    onChange={(radius) => updateColor(selectedColor.id, { radius })}
+                    label={(v) => v.toFixed(2)}
+                  />
+                </Field>
+              )}
             </Stack>
           )}
 

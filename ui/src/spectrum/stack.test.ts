@@ -34,8 +34,8 @@ function flat(color: string, opacity = 1): EditorLayer {
     clamp: DB_MIN - 19,
     blend: 0.5,
     colorKeyframes: [
-      { id: nextId("ck"), hz: 20, db: DB_MIN, color },
-      { id: nextId("ck"), hz: 20_000, db: DB_MAX, color },
+      { id: nextId("ck"), hz: 20, db: DB_MIN, color, radius: null },
+      { id: nextId("ck"), hz: 20_000, db: DB_MAX, color, radius: null },
     ],
   };
 }

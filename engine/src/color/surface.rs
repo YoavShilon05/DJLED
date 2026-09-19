@@ -39,6 +39,19 @@
 //! the plain Gaussian weights, colour uses those weights scaled by opacity. See
 //! [`ColorSurface::sample`] for why, and [`super::oklab`] for what opacity means
 //! once it reaches the strip.
+//!
+//! # Area of effect
+//!
+//! A keyframe may also carry a [`Keyframe::radius`], past which it contributes
+//! nothing at all. That is a different question from [`SurfaceConfig::sigma`],
+//! which is how two keyframes that both reach a point share it; sigma is one
+//! number for the whole field, so narrowing it to confine one keyframe sharpens
+//! every other one at the same time.
+//!
+//! The consequence is that the field need not be covered. Where nothing
+//! reaches — including a field with no keyframes at all — the sample is
+//! transparent black, so an area of effect composes with the stack the way a
+//! hole in it should: the layer below shows through.
 
 use serde::{Deserialize, Serialize};
 
@@ -60,16 +73,43 @@ pub struct Keyframe {
     /// means fully opaque, which is what keeps presets written before opacity
     /// existed loading unchanged.
     pub color: String,
+    /// How far this keyframe reaches, as a distance in the unit square.
+    /// `None` — and an absent field — means everywhere, which is what every
+    /// keyframe did before this existed.
+    ///
+    /// This is *not* [`SurfaceConfig::sigma`]. Sigma is how two keyframes that
+    /// both reach a point argue over it; this is whether a keyframe reaches the
+    /// point at all. A keyframe confined to the bass end still blends normally
+    /// with its neighbours there, and simply is not in the conversation at the
+    /// treble end — which is the thing sigma cannot say, because shrinking
+    /// sigma to confine one keyframe sharpens every other one too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radius: Option<f32>,
 }
 
 impl Keyframe {
+    /// A keyframe that reaches the whole field.
     pub fn new(x: f32, y: f32, color: &str) -> Self {
-        Self { x, y, color: color.to_string() }
+        Self { x, y, color: color.to_string(), radius: None }
+    }
+
+    /// A keyframe confined to `radius` of where it sits.
+    pub fn within(x: f32, y: f32, color: &str, radius: f32) -> Self {
+        Self { radius: Some(radius), ..Self::new(x, y, color) }
     }
 }
 
+/// Smallest area of effect that still means something. Below this a keyframe
+/// reaches a region narrower than one LED at any plausible strip length, so
+/// there is nothing to gain by letting it go to zero and a division to lose.
+pub const MIN_RADIUS: f32 = 1e-3;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SurfaceConfig {
+    /// May be empty. A field with nothing in it is a layer that paints nothing,
+    /// which is a legitimate thing to author and the state a layer passes
+    /// through while its keyframes are being replaced one at a time.
     pub keyframes: Vec<Keyframe>,
     /// Blend radius. Smaller gives each keyframe a tighter region and crisper
     /// transitions; larger blurs them together. Around a quarter of the typical
@@ -100,6 +140,9 @@ struct Compiled {
     x: f32,
     y: f32,
     color: Oklab,
+    /// Precomputed `1 / r` for a confined keyframe, `None` for one that reaches
+    /// everywhere.
+    reach: Option<f32>,
 }
 
 pub struct ColorSurface {
@@ -109,15 +152,25 @@ pub struct ColorSurface {
 }
 
 impl ColorSurface {
+    /// Compile a config for sampling. The only way this fails is a colour that
+    /// is not hex; a field with no keyframes at all is legal and samples as
+    /// transparent black everywhere. See [`ColorSurface::sample`].
     pub fn new(cfg: &SurfaceConfig) -> Result<Self, String> {
-        if cfg.keyframes.is_empty() {
-            return Err("colour surface needs at least one keyframe".into());
-        }
-
         let points = cfg
             .keyframes
             .iter()
-            .map(|k| Ok(Compiled { x: k.x, y: k.y, color: parse_color(&k.color)?.to_oklab() }))
+            .map(|k| {
+                Ok(Compiled {
+                    x: k.x,
+                    y: k.y,
+                    color: parse_color(&k.color)?.to_oklab(),
+                    // A radius of zero would divide by zero and then multiply a
+                    // zero distance by the infinity it produced, which is a NaN
+                    // on the strip. Floored instead, so a keyframe dragged to
+                    // nothing simply reaches nothing.
+                    reach: k.radius.map(|r| 1.0 / r.max(MIN_RADIUS)),
+                })
+            })
             .collect::<Result<Vec<_>, String>>()?;
 
         let sigma = cfg.sigma.max(1e-3);
@@ -135,22 +188,52 @@ impl ColorSurface {
     /// [`Oklab::blend`], which this is the inlined form of: the accumulation is
     /// spelled out here because it also has to track the nearest keyframe, and
     /// this runs once per strip position per frame.
+    ///
+    /// # The baseline
+    ///
+    /// Where no keyframe reaches — because there are none, or because every one
+    /// of them is confined somewhere else — the answer is transparent black.
+    /// Not *opaque* black: an unreached position has to let a layer underneath
+    /// through, exactly like a position no LED sector reaches. That makes
+    /// authoring nothing and authoring a hole the same statement, which is the
+    /// only way an area of effect can be composed with a stack.
     pub fn sample(&self, x: f32, y: f32) -> Oklab {
         let (x, y) = (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
 
-        // `weight` normalises opacity; `cover` normalises colour.
+        // `weight` normalises opacity; `cover` normalises colour. `present` is
+        // the third quantity an area of effect needs and neither of those two
+        // can supply — see below.
         let (mut weight, mut cover) = (0.0f32, 0.0f32);
         let (mut l, mut a, mut b) = (0.0f32, 0.0f32, 0.0f32);
-        let mut nearest = (f32::MAX, 0usize);
+        let mut present = 0.0f32;
+        let mut nearest: Option<(f32, usize)> = None;
 
         for (i, p) in self.points.iter().enumerate() {
             let (dx, dy) = (x - p.x, y - p.y);
             let d2 = dx * dx + dy * dy;
-            if d2 < nearest.0 {
-                nearest = (d2, i);
-            }
 
-            let w = (-d2 * self.falloff).exp();
+            let taper = match p.reach {
+                // Only unconfined keyframes are candidates for the fallback
+                // below — a confined one is not allowed to colour a point it
+                // does not reach, which is the whole feature.
+                None => {
+                    if nearest.is_none_or(|(best, _)| d2 < best) {
+                        nearest = Some((d2, i));
+                    }
+                    1.0
+                }
+                Some(inv_r) => {
+                    let t = d2.sqrt() * inv_r;
+                    if t >= 1.0 {
+                        continue;
+                    }
+                    edge_taper(t)
+                }
+            };
+
+            present = present.max(taper);
+
+            let w = (-d2 * self.falloff).exp() * taper;
             let wa = w * p.color.alpha;
             weight += w;
             cover += wa;
@@ -161,12 +244,25 @@ impl ColorSurface {
 
         // With a small sigma and a point far from every keyframe, all weights
         // can underflow to zero. Falling back to the nearest keyframe keeps the
-        // surface defined everywhere instead of returning black.
+        // surface defined everywhere instead of returning black — but only the
+        // unconfined ones can stand in, and where there are none the baseline
+        // above is the answer.
         if weight <= f32::MIN_POSITIVE {
-            return self.points[nearest.1].color;
+            return match nearest {
+                Some((_, i)) => self.points[i].color,
+                None => Oklab::with_alpha(0.0, 0.0, 0.0, 0.0),
+            };
         }
 
-        let alpha = cover / weight;
+        // Normalisation is what makes this a convex combination, and it is also
+        // what would silently undo the taper: with one keyframe in reach it
+        // appears in both `cover` and `weight` and cancels exactly, so opacity
+        // would hold the authored value right to the edge and then fall off a
+        // cliff into the baseline. `present` is the taper *before*
+        // normalisation — how much of anything reaches here at all — and it is
+        // the maximum rather than the sum, so two overlapping areas of effect
+        // are covered where either one covers, not covered twice.
+        let alpha = present * cover / weight;
 
         // Every keyframe within reach is fully transparent, so there is no
         // colour to average — only the absence of one.
@@ -176,6 +272,24 @@ impl ColorSurface {
 
         Oklab::with_alpha(l / cover, a / cover, b / cover, alpha)
     }
+}
+
+/// The outer fraction of a radius spent fading out. Across the rest of it a
+/// keyframe is simply present, at the opacity it was authored with.
+///
+/// Zero — a hard-edged disc — is the obvious reading of "area of effect" and is
+/// wrong on a wall: every other edge in this field is smooth, so the one hard
+/// line reads as a fault in the strip rather than as a decision. One is wrong
+/// the other way, because then full opacity is reached only at the exact centre
+/// and an opaque keyframe never looks opaque.
+const EDGE: f32 = 0.35;
+
+/// Presence at `t`, the distance from a keyframe as a fraction of its radius.
+/// Flat at 1 across the interior, then smoothstep to 0, with zero slope at both
+/// ends of the fade so neither joint shows.
+fn edge_taper(t: f32) -> f32 {
+    let u = ((1.0 - t) / EDGE).min(1.0);
+    u * u * (3.0 - 2.0 * u)
 }
 
 /// Parse `#rrggbb` or `#rrggbbaa`, with or without the hash.
@@ -329,13 +443,172 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_and_malformed_configs() {
-        assert!(ColorSurface::new(&SurfaceConfig { keyframes: vec![], sigma: 0.25 }).is_err());
+    fn rejects_malformed_colours() {
         assert!(ColorSurface::new(&SurfaceConfig {
             keyframes: vec![Keyframe::new(0.0, 0.0, "nope")],
             sigma: 0.25,
         })
         .is_err());
+    }
+
+    /// A layer with no colours authored at all paints nothing — and *nothing* is
+    /// transparent, not black. Opaque black would blank everything under it,
+    /// which is the opposite of what an empty field should do to a stack.
+    #[test]
+    fn an_empty_field_is_transparent_black_everywhere() {
+        let surface = ColorSurface::new(&SurfaceConfig { keyframes: vec![], sigma: 0.25 }).unwrap();
+        for i in 0..=8 {
+            for j in 0..=8 {
+                let c = surface.sample(i as f32 / 8.0, j as f32 / 8.0);
+                assert!(close(c.alpha, 0.0), "({i}, {j}) sampled at opacity {}", c.alpha);
+                assert!(close(c.l, 0.0) && close(c.a, 0.0) && close(c.b, 0.0), "produced {c:?}");
+            }
+        }
+    }
+
+    /// The point of the radius: past it the keyframe is not merely faint, it is
+    /// absent. With nothing else in the field that means the baseline.
+    #[test]
+    fn a_confined_keyframe_reaches_nothing_past_its_radius() {
+        let surface = ColorSurface::new(&SurfaceConfig {
+            keyframes: vec![Keyframe::within(0.25, 0.5, "#ff2000", 0.2)],
+            sigma: 0.25,
+        })
+        .unwrap();
+
+        assert!(surface.sample(0.25, 0.5).alpha > 0.9, "the keyframe faded at its own position");
+        for x in [0.5, 0.75, 1.0] {
+            let c = surface.sample(x, 0.5);
+            assert!(close(c.alpha, 0.0), "x={x} is {:.3} of the way outside 0.2 away", c.alpha);
+        }
+    }
+
+    /// Two confined keyframes with a gap between them: the gap is the baseline,
+    /// not a blend of the two. This is the dead space the feature creates, and
+    /// it has to be transparent so the layer below fills it.
+    #[test]
+    fn dead_space_between_confined_keyframes_is_transparent() {
+        let surface = ColorSurface::new(&SurfaceConfig {
+            keyframes: vec![
+                Keyframe::within(0.0, 0.5, "#ff2000", 0.2),
+                Keyframe::within(1.0, 0.5, "#40c0ff", 0.2),
+            ],
+            sigma: 0.25,
+        })
+        .unwrap();
+
+        assert!(surface.sample(0.0, 0.5).alpha > 0.9);
+        assert!(surface.sample(1.0, 0.5).alpha > 0.9);
+        assert!(close(surface.sample(0.5, 0.5).alpha, 0.0), "the gap was painted");
+    }
+
+    /// The edge of an area of effect must be a fade, not a step — a step here is
+    /// a hard line across the wall.
+    #[test]
+    fn a_confined_keyframe_fades_out_rather_than_stopping() {
+        let surface = ColorSurface::new(&SurfaceConfig {
+            keyframes: vec![Keyframe::within(0.5, 0.5, "#ff2000", 0.3)],
+            sigma: 0.25,
+        })
+        .unwrap();
+
+        let step = 1.0 / 2048.0;
+        let mut previous = surface.sample(0.5, 0.5).alpha;
+        let mut x = 0.5;
+        while x < 1.0 {
+            x += step;
+            let alpha = surface.sample(x, 0.5).alpha;
+            assert!(alpha <= previous + 1e-4, "opacity rose again at x={x}");
+            assert!((alpha - previous).abs() < 0.02, "opacity stepped at x={x}");
+            previous = alpha;
+        }
+        assert!(close(previous, 0.0), "it never actually reached the baseline");
+    }
+
+    /// An unconfined keyframe standing beside a confined one must still cover
+    /// the whole field, including the dead space the confined one leaves.
+    #[test]
+    fn an_unconfined_keyframe_still_covers_everything() {
+        let surface = ColorSurface::new(&SurfaceConfig {
+            keyframes: vec![
+                Keyframe::within(0.0, 0.5, "#ff2000", 0.15),
+                Keyframe::new(1.0, 0.5, "#40c0ff"),
+            ],
+            sigma: 0.25,
+        })
+        .unwrap();
+
+        for i in 0..=16 {
+            let alpha = surface.sample(i as f32 / 16.0, 0.5).alpha;
+            assert!(alpha > 0.9, "x={i} fell to {alpha} with an unconfined keyframe present");
+        }
+    }
+
+    /// A radius nobody set must change nothing. The default palette is the
+    /// strongest form of that: it predates the field entirely.
+    #[test]
+    fn an_absent_radius_reaches_everywhere() {
+        let bounded_to_everything = ColorSurface::new(&SurfaceConfig {
+            // Far past the √2 diagonal of the unit square, so every point is
+            // deep inside the plateau and a radius this large is the same thing
+            // as no radius at all.
+            keyframes: vec![Keyframe::within(0.5, 0.5, "#ff2000", 100.0)],
+            sigma: 0.25,
+        })
+        .unwrap();
+        assert!(bounded_to_everything.sample(1.0, 1.0).alpha > 0.9);
+
+        let plain = ColorSurface::new(&SurfaceConfig {
+            keyframes: vec![Keyframe::new(0.5, 0.5, "#ff2000")],
+            sigma: 0.25,
+        })
+        .unwrap();
+        for i in 0..=8 {
+            assert!(close(plain.sample(i as f32 / 8.0, 0.5).alpha, 1.0));
+        }
+    }
+
+    /// A radius dragged to zero must reach nothing, rather than dividing by it
+    /// and putting a NaN on the wire.
+    #[test]
+    fn a_zero_radius_is_harmless() {
+        let surface = ColorSurface::new(&SurfaceConfig {
+            keyframes: vec![Keyframe::within(0.5, 0.5, "#ff2000", 0.0)],
+            sigma: 0.25,
+        })
+        .unwrap();
+
+        for i in 0..=8 {
+            for j in 0..=8 {
+                let c = surface.sample(i as f32 / 8.0, j as f32 / 8.0);
+                assert!(c.l.is_finite() && c.alpha.is_finite(), "produced {c:?}");
+            }
+        }
+    }
+
+    /// The radius has to survive the wire, and an absent one has to stay absent
+    /// — that is what keeps every preset written before this loading unchanged.
+    #[test]
+    fn the_radius_round_trips_and_stays_optional() {
+        let cfg = SurfaceConfig {
+            keyframes: vec![
+                Keyframe::new(0.0, 0.0, "#ff2000"),
+                Keyframe::within(1.0, 1.0, "#40c0ff", 0.3),
+            ],
+            sigma: 0.25,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(!json.contains("\"radius\":null"), "an unconfined keyframe wrote a radius: {json}");
+
+        let back: SurfaceConfig = serde_json::from_str(&json).unwrap();
+        assert!(back.keyframes[0].radius.is_none());
+        assert!(close(back.keyframes[1].radius.unwrap(), 0.3));
+
+        // And a config from before the field existed.
+        let old: SurfaceConfig =
+            serde_json::from_str(r##"{"keyframes":[{"x":0,"y":1,"color":"#ff2000"}],"sigma":0.25}"##)
+                .unwrap();
+        assert!(old.keyframes[0].radius.is_none());
     }
 
     /// Coincident keyframes are something a user dragging points will produce.

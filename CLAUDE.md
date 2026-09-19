@@ -112,6 +112,11 @@ row there can be computed perfectly and dropped on the way to the wire.
 while weighting opacity by `w` alone. Without that asymmetry an invisible
 keyframe tints its neighbours. See `README.md` § Colour.
 
+**5a. Where no keyframe reaches, the surface is *transparent* black.** That is
+the baseline an empty field and the dead space past every area of effect both
+fall to, and it is what lets either compose with a stack instead of blanking it.
+Opaque black would be the same pixels on one layer and a blackout on six.
+
 **6. No gamma step to the LEDs.** `Oklab → linear RGB → byte` is complete.
 Adding one is the classic wrong fix.
 
@@ -186,6 +191,18 @@ trip.
   The layer thumbnails are the exception that proves it: they read a ref on
   their own timer rather than taking a prop, precisely so twelve rows do not
   re-render to repaint twelve canvases.
+- **A keyframe's area of effect is not the blend radius, and the two are one
+  click apart in the same panel.** Blend radius (the surface's sigma) is one
+  number for the layer and decides how two keyframes that *both* reach a point
+  share it. The area of effect is per keyframe and decides whether a keyframe
+  reaches the point at all. Narrowing sigma to confine one colour sharpens every
+  other colour on the layer, which is the mistake this exists to make
+  unnecessary.
+- **A taper inside a normalised sum cancels itself.** The area of effect is
+  applied twice on purpose — once as a weight, and once as `present`, outside the
+  normalisation. Drop the second and a lone confined keyframe holds full opacity
+  to its edge and then steps to nothing, which is a hard line across the wall.
+  Pinned by `a_confined_keyframe_fades_out_rather_than_stopping`.
 - **Gizmo checkboxes are visibility, not bypass.** A hidden EQ still shapes the
   signal. They live in the graph's own `Overlays` menu, not in the sidebar.
 - **There is no save button, and the preset bar is not a loader.** Selecting a

@@ -111,8 +111,8 @@ export const ShapePanel = memo(function ShapePanel({ layer, onChange, sampleRate
       <Field
         label="Blend radius"
         value={layer.blend.toFixed(2)}
-        hint="Reach of each colour keyframe."
-        info="Smaller is crisper, larger blurs neighbouring keyframes together. This is the colour surface's sigma — it is what makes two keyframes a gradient rather than two stripes."
+        hint="How sharply colour keyframes hand over to each other."
+        info="Smaller is crisper, larger blurs neighbouring keyframes together. This is the colour surface's sigma — it is what makes two keyframes a gradient rather than two stripes. It is not a keyframe's area of effect: this decides how two keyframes that both reach a point share it, and it is one number for the whole layer, so narrowing it to confine one colour sharpens every other one too. Confining a single colour is on the keyframe itself, in the plot."
       >
         <Slider
           min={0.05}

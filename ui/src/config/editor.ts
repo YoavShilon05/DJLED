@@ -48,7 +48,35 @@ export interface ColorKeyframe {
    * same as transparent: black covers.
    */
   color: string;
+  /**
+   * How far this colour reaches, as a distance in the unit square — the same
+   * space {@link EditorLayer.blend} is measured in, so the two are comparable
+   * even though they answer different questions. `null` is unconfined, which is
+   * what every keyframe was before this existed.
+   *
+   * Blend radius decides how two keyframes that both reach a point share it;
+   * this decides whether a keyframe is in that conversation at all. Sigma is one
+   * number for the whole layer, so it cannot confine one colour without
+   * sharpening every other one at the same time.
+   *
+   * Past every keyframe's reach the field is transparent black, so confining
+   * colours leaves holes the layers below show through rather than black.
+   */
+  radius: number | null;
 }
+
+/**
+ * Area of effect, from just-a-point to past the diagonal of the unit square.
+ *
+ * The top of the range is ‖(1, 1)‖ rounded up: at that reach a keyframe in one
+ * corner touches the opposite one, so anything larger is the same field twice.
+ */
+export const RADIUS_MIN = 0.02;
+export const RADIUS_MAX = 1.45;
+
+/** What un-ticking "infinite" starts from. About a third of the field, which is
+ *  visibly an area of effect without being one that covers everything. */
+export const RADIUS_DEFAULT = 0.35;
 
 /**
  * A frequency pinned to an LED index. Consecutive keyframes define a sector:
@@ -104,7 +132,9 @@ export interface EditorLayer {
   sampleLength: number;
   /** How MIDI notes land on the axis, when this layer is driven by MIDI. */
   midi: MidiConfig;
-  /** Reach of each colour keyframe's influence — the surface's sigma. */
+  /** How sharply colour keyframes hand over to each other — the surface's
+   *  sigma. One number for the whole layer, which is why confining a single
+   *  colour is {@link ColorKeyframe.radius} and not this. */
   blend: number;
 }
 
@@ -155,6 +185,7 @@ export function defaultLayer(name: string): EditorLayer {
       hz: normToHz(k.x),
       db: normToDb(k.y),
       color: k.color,
+      radius: k.radius ?? null,
     })),
     ledKeyframes: [
       { id: nextId("led"), led: 0, hz: 20 },
@@ -194,10 +225,10 @@ export function newLayer(name: string): EditorLayer {
   return {
     ...base,
     colorKeyframes: [
-      { id: nextId("ck"), hz: 20, db: DB_MIN, color: "#00000000" },
-      { id: nextId("ck"), hz: 20_000, db: DB_MIN, color: "#00000000" },
-      { id: nextId("ck"), hz: 20, db: DB_MAX, color: "#ffffff" },
-      { id: nextId("ck"), hz: 20_000, db: DB_MAX, color: "#ffffff" },
+      { id: nextId("ck"), hz: 20, db: DB_MIN, color: "#00000000", radius: null },
+      { id: nextId("ck"), hz: 20_000, db: DB_MIN, color: "#00000000", radius: null },
+      { id: nextId("ck"), hz: 20, db: DB_MAX, color: "#ffffff", radius: null },
+      { id: nextId("ck"), hz: 20_000, db: DB_MAX, color: "#ffffff", radius: null },
     ],
   };
 }
@@ -242,6 +273,10 @@ export function toSurface(layer: EditorLayer): SurfaceConfig {
       x: hzToNorm(k.hz),
       y: dbToNorm(k.db),
       color: k.color,
+      // Left off entirely when unconfined, which is how the engine writes it —
+      // so a show authored here and one round-tripped through the engine are
+      // the same JSON rather than differing by a field full of nulls.
+      ...(k.radius === null ? {} : { radius: k.radius }),
     })),
   };
 }
@@ -287,6 +322,7 @@ function fromEngineLayer(layer: LayerConfig): EditorLayer {
       hz: normToHz(k.x),
       db: normToDb(k.y),
       color: k.color,
+      radius: typeof k.radius === "number" ? k.radius : null,
     })),
     // Ids are the editor's own bookkeeping and never cross the wire, so they
     // are minted fresh rather than expected back.
@@ -370,16 +406,19 @@ function sanitiseLayer(stored: Partial<EditorLayer>): EditorLayer {
     enabled: stored.enabled !== false,
     opacity: clamp01(stored.opacity, 1),
     source: sanitiseSource(stored.source),
-    colorKeyframes:
-      Array.isArray(stored.colorKeyframes) && stored.colorKeyframes.length
-        ? stored.colorKeyframes
-        : base.colorKeyframes,
+    // Empty is a legitimate colour field — a layer that paints nothing — so like
+    // the EQ this only guards against the field being absent or the wrong shape.
+    // A stored keyframe missing a radius is one written before areas of effect
+    // existed, and unconfined is what it meant.
+    colorKeyframes: Array.isArray(stored.colorKeyframes)
+      ? stored.colorKeyframes.map((k) => ({ ...k, radius: k.radius ?? null }))
+      : base.colorKeyframes,
+    // Sectors are not the same: a layer with no sectors reaches no LED at all,
+    // and the engine would substitute a spanning layout anyway.
     ledKeyframes:
       Array.isArray(stored.ledKeyframes) && stored.ledKeyframes.length
         ? stored.ledKeyframes
         : base.ledKeyframes,
-    // Empty is a legitimate EQ, so unlike the keyframes this only guards
-    // against the field being absent or the wrong shape.
     eq: Array.isArray(stored.eq) ? stored.eq : base.eq,
     curve: { ...base.curve, ...stored.curve },
     threshold: clampDb(stored.threshold, base.threshold),

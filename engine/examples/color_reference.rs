@@ -10,11 +10,13 @@
 //! Either implementation drifting breaks a test rather than quietly making the
 //! editor lie.
 //!
-//! Two palettes are emitted. The first is the shipped default, which is fully
+//! Three palettes are emitted. The first is the shipped default, which is fully
 //! opaque and so pins the colour pipeline. The second is deliberately
 //! translucent: opacity-weighted blending is the subtlest thing here to port,
 //! and an all-opaque fixture would agree perfectly while both sides got it
-//! wrong.
+//! wrong. The third confines its keyframes, which pins the other easily
+//! mistranscribed part — the taper at the edge of an area of effect, and the
+//! transparent baseline in the dead space past it.
 //!
 //! Regenerate after any deliberate change to the colour pipeline:
 //!
@@ -32,6 +34,7 @@ fn main() {
     let cases = [
         ("default", SurfaceConfig::default()),
         ("translucent", translucent()),
+        ("confined", confined()),
     ];
     let rendered: Vec<String> = cases.iter().map(|(name, cfg)| case(name, cfg)).collect();
     println!("{}", rendered.join(",\n"));
@@ -54,13 +57,40 @@ fn translucent() -> SurfaceConfig {
     }
 }
 
+/// Areas of effect that overlap, that leave a gap, and that sit beside an
+/// unconfined keyframe — the three cases the taper and the baseline are decided
+/// by, and all three are sampled on the same 9×9 grid as everything else.
+fn confined() -> SurfaceConfig {
+    SurfaceConfig {
+        keyframes: vec![
+            Keyframe::within(0.0, 0.0, "#ff2000", 0.35),
+            Keyframe::within(0.25, 1.0, "#40ff60", 0.35),
+            Keyframe::within(1.0, 0.5, "#40c0ff80", 0.3),
+            Keyframe::new(0.5, 0.0, "#20104000"),
+        ],
+        sigma: 0.25,
+    }
+}
+
 fn case(name: &str, cfg: &SurfaceConfig) -> String {
     let surface = ColorSurface::new(cfg).expect("reference surface must be valid");
 
     let keyframes: Vec<String> = cfg
         .keyframes
         .iter()
-        .map(|k| format!("        {{ \"x\": {}, \"y\": {}, \"color\": \"{}\" }}", k.x, k.y, k.color))
+        .map(|k| {
+            // Absent rather than null when the keyframe is unconfined, matching
+            // what the wire format does — the fixture is only worth having if it
+            // is the shape the two implementations really exchange.
+            let radius = match k.radius {
+                Some(r) => format!(", \"radius\": {r}"),
+                None => String::new(),
+            };
+            format!(
+                "        {{ \"x\": {}, \"y\": {}, \"color\": \"{}\"{radius} }}",
+                k.x, k.y, k.color
+            )
+        })
         .collect();
 
     let mut samples = Vec::new();

@@ -121,6 +121,22 @@ describe("stored configs", () => {
     expect(config.layers[0].id).not.toBe(config.layers[1].id);
   });
 
+  /**
+   * An empty colour field is a layer that paints nothing, which is a state the
+   * editor passes through whenever a palette is replaced one keyframe at a
+   * time. Restoring the default palette behind the user's back would undo the
+   * deletions they just made.
+   */
+  it("keeps a colour field that was emptied on purpose", () => {
+    const layer = { ...defaultLayer("Blank"), colorKeyframes: [] };
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ layers: [layer], activeLayerId: layer.id }),
+    );
+    expect(loadConfig().layers[0].colorKeyframes).toEqual([]);
+  });
+
+  /** Sectors are the opposite case: fewer than two spans no LEDs at all. */
   it("never loads an empty stack", () => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ layers: [] }));
     expect(loadConfig().layers.length).toBeGreaterThan(0);
@@ -161,6 +177,31 @@ describe("the wire format", () => {
     // renderer samples.
     expect(show.layers[0].surface.keyframes[0].x).toBeGreaterThanOrEqual(0);
     expect(show.layers[0].surface.keyframes[0].x).toBeLessThanOrEqual(1);
+  });
+
+  /**
+   * An area of effect has to survive both directions, and an unconfined
+   * keyframe has to cross the wire with no radius on it at all — that absence
+   * is what every show written before the feature relies on meaning
+   * "everywhere".
+   */
+  it("carries an area of effect both ways, and omits one that is not set", () => {
+    const base = defaultLayer("Confined");
+    const layer = {
+      ...base,
+      colorKeyframes: [
+        { ...base.colorKeyframes[0], radius: 0.4 },
+        { ...base.colorKeyframes[1], radius: null },
+      ],
+    };
+
+    const show = toEngineConfig({ ...DEFAULT_CONFIG, layers: [layer], activeLayerId: layer.id });
+    expect(show.layers[0].surface.keyframes[0].radius).toBe(0.4);
+    expect("radius" in show.layers[0].surface.keyframes[1]).toBe(false);
+
+    const back = fromEngineConfig(DEFAULT_CONFIG, show);
+    expect(back.layers[0].colorKeyframes[0].radius).toBe(0.4);
+    expect(back.layers[0].colorKeyframes[1].radius).toBe(null);
   });
 
   /** Adopting the engine's stack must not leave the selection pointing at a
