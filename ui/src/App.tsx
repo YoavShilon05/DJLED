@@ -200,12 +200,24 @@ export default function App() {
 
   const persist = useDebouncedCallback(saveConfig, 400);
 
+  /**
+   * Every edit in the editor lands here.
+   *
+   * Takes an updater as well as a value, and updates `configRef` *before*
+   * setting state, because two edits in one event handler are a real gesture:
+   * adding a timeline key selects it in the same click. React has not
+   * re-rendered in between, so a second call that closed over the render's
+   * `config` would build on the config from before the first and silently
+   * throw it away — which is exactly how the new key used to vanish.
+   */
   const applyConfig = useCallback(
-    (next: EditorConfig) => {
-      setConfig(next);
+    (next: EditorConfig | ((prev: EditorConfig) => EditorConfig)) => {
+      const value = typeof next === "function" ? next(configRef.current ?? loadConfig()) : next;
+      configRef.current = value;
+      setConfig(value);
       setError(null);
-      persist(next);
-      clientRef.current?.setConfig(toEngineConfig(next));
+      persist(value);
+      clientRef.current?.setConfig(toEngineConfig(value));
     },
     [persist],
   );
@@ -215,8 +227,8 @@ export default function App() {
    *  below, because a field belongs to one key of the loop rather than to the
    *  layer. */
   const applyLayer = useCallback(
-    (layer: EditorLayer) => applyConfig(withLayer(config, layer)),
-    [applyConfig, config],
+    (layer: EditorLayer) => applyConfig((c) => withLayer(c, layer)),
+    [applyConfig],
   );
 
   const applyBrightness = useCallback((value: number) => {
@@ -265,8 +277,8 @@ export default function App() {
   const activeKeyId = keyOf(layer, config.activeKeyId).id;
 
   const selectKey = useCallback(
-    (id: string) => applyConfig({ ...config, activeKeyId: id }),
-    [applyConfig, config],
+    (id: string) => applyConfig((c) => ({ ...c, activeKeyId: id })),
+    [applyConfig],
   );
 
   /**
