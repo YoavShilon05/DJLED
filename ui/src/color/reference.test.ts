@@ -22,6 +22,7 @@ import { describe, expect, it } from "vitest";
 import reference from "./reference.json";
 import { oklabToLedBytes } from "./oklab";
 import { ColorSurface, type SurfaceConfig } from "./surface";
+import type { Timeline } from "./timeline";
 
 interface Sample {
   x: number;
@@ -97,5 +98,95 @@ describe("colour surface matches the Rust implementation", () => {
     expect(alphas.some((a) => a > 0.99)).toBe(true);
     expect(alphas.some((a) => a < 0.1)).toBe(true);
     expect(alphas.some((a) => a >= 0.3 && a <= 0.7)).toBe(true);
+  });
+});
+
+interface Phase {
+  seconds: number;
+  samples: Sample[];
+}
+
+interface TimelineCase {
+  name: string;
+  length: number;
+  keys: { at: number; sigma: number; keyframes: SurfaceConfig["keyframes"] }[];
+  phases: Phase[];
+}
+
+const timelines = reference.timelines as TimelineCase[];
+
+/** A recorded timeline, back in the shape the editor compiles. */
+function timelineOf(c: TimelineCase): Timeline {
+  return {
+    enabled: true,
+    length: c.length,
+    keys: c.keys.map((k, i) => ({
+      id: `k${i}`,
+      at: k.at,
+      surface: { sigma: k.sigma, keyframes: k.keyframes },
+    })),
+  };
+}
+
+describe("timelines match the Rust implementation", () => {
+  it.each(timelines.map((c) => [c.name, c] as const))(
+    "agrees with the engine at every instant of the %s loop",
+    (_name, testCase) => {
+      const surface = ColorSurface.animated(timelineOf(testCase));
+      for (const phase of testCase.phases) {
+        surface.seek(phase.seconds);
+        for (const s of phase.samples) {
+          const got = surface.sample(s.x, s.y);
+          const at = `(${s.x}, ${s.y}) at ${phase.seconds}s`;
+          expect(Math.abs(got.l - s.l), `l at ${at}`).toBeLessThan(LAB_TOLERANCE);
+          expect(Math.abs(got.a - s.a), `a at ${at}`).toBeLessThan(LAB_TOLERANCE);
+          expect(Math.abs(got.b - s.b), `b at ${at}`).toBeLessThan(LAB_TOLERANCE);
+          expect(Math.abs(got.alpha - s.alpha), `alpha at ${at}`).toBeLessThan(LAB_TOLERANCE);
+        }
+      }
+    },
+  );
+
+  it.each(timelines.map((c) => [c.name, c] as const))(
+    "agrees on the bytes the %s loop would put on the LEDs",
+    (_name, testCase) => {
+      const surface = ColorSurface.animated(timelineOf(testCase));
+      for (const phase of testCase.phases) {
+        surface.seek(phase.seconds);
+        for (const s of phase.samples) {
+          const got = oklabToLedBytes(surface.sample(s.x, s.y));
+          for (let c = 0; c < 3; c++) {
+            expect(
+              Math.abs(got[c] - s.led[c]),
+              `channel ${c} at (${s.x}, ${s.y}) at ${phase.seconds}s`,
+            ).toBeLessThanOrEqual(1);
+          }
+        }
+      }
+    },
+  );
+
+  it("exercises the awkward halves of a blend", () => {
+    // A span whose ends disagree about whether a keyframe exists, and both a
+    // confined and an unconfined radius. Without them, both implementations
+    // could take the easy reading of each and still agree with the file.
+    const counts = timelines.map((t) => t.keys.map((k) => k.keyframes.length));
+    expect(counts.some((c) => Math.min(...c) !== Math.max(...c))).toBe(true);
+
+    const radii = timelines.flatMap((t) => t.keys.flatMap((k) => k.keyframes.map((f) => f.radius)));
+    expect(radii.some((r) => typeof r === "number")).toBe(true);
+    expect(radii.some((r) => r == null)).toBe(true);
+  });
+
+  it("actually moves between phases", () => {
+    // Otherwise every assertion above could pass on a loop that never leaves
+    // its first key.
+    const moved = timelines.some((t) => {
+      const first = t.phases[0].samples.map((s) => s.l);
+      return t.phases
+        .slice(1)
+        .some((p) => p.samples.some((s, i) => Math.abs(s.l - first[i]) > 1e-3));
+    });
+    expect(moved).toBe(true);
   });
 });

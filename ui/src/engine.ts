@@ -32,6 +32,7 @@
  */
 
 import type { SurfaceConfig } from "./color/surface";
+import type { Timeline } from "./color/timeline";
 import type { CurveConfig } from "./config/curve";
 import type { EqBand } from "./config/eq";
 import type { LedKeyframe } from "./config/editor";
@@ -56,7 +57,19 @@ export interface LayerConfig {
    *  it fades toward what is underneath, not toward black. */
   opacity: number;
   source: InputSource;
+  /**
+   * The colour field this layer paints with when it does not animate.
+   *
+   * Where {@link LayerConfig.timeline} has keys they are authoritative and this
+   * is the degraded view of them — the field the loop starts from, written so a
+   * peer that knows nothing about timelines still sees a layer that looks like
+   * itself. Derived on the way out rather than stored beside them, so the two
+   * cannot disagree.
+   */
   surface: SurfaceConfig;
+  /** The same field over time: a loop of whole fields, interpolated. No keys
+   *  for a layer that does not animate, which is every show that predates this. */
+  timeline: Timeline;
   eq: EqBand[];
   ledKeyframes: LedKeyframe[];
   reverse: boolean;

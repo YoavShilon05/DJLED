@@ -25,7 +25,7 @@
 //! ```
 
 use djled_engine::color::oklab::{LinearRgb, Oklab};
-use djled_engine::color::{ColorSurface, Keyframe, SurfaceConfig};
+use djled_engine::color::{ColorSurface, Keyframe, SurfaceConfig, Timeline, TimelineKey};
 
 fn main() {
     println!("{{");
@@ -37,6 +37,18 @@ fn main() {
         ("confined", confined()),
     ];
     let rendered: Vec<String> = cases.iter().map(|(name, cfg)| case(name, cfg)).collect();
+    println!("{}", rendered.join(",\n"));
+    println!("  ],");
+
+    // The same contract for the field as a function of time. Separate from the
+    // cases above rather than folded into them, because a still surface is what
+    // every show that does not animate still is and it must stay pinned on its
+    // own — a timeline that broke its own start would otherwise be the only
+    // thing to fail.
+    println!("  \"timelines\": [");
+    let timelines = [("sweep", sweep()), ("reach", reach())];
+    let rendered: Vec<String> =
+        timelines.iter().map(|(name, tl)| timeline_case(name, tl)).collect();
     println!("{}", rendered.join(",\n"));
     println!("  ]");
     println!("}}");
@@ -75,42 +87,17 @@ fn confined() -> SurfaceConfig {
 fn case(name: &str, cfg: &SurfaceConfig) -> String {
     let surface = ColorSurface::new(cfg).expect("reference surface must be valid");
 
-    let keyframes: Vec<String> = cfg
-        .keyframes
-        .iter()
-        .map(|k| {
-            // Absent rather than null when the keyframe is unconfined, matching
-            // what the wire format does — the fixture is only worth having if it
-            // is the shape the two implementations really exchange.
-            let radius = match k.radius {
-                Some(r) => format!(", \"radius\": {r}"),
-                None => String::new(),
-            };
-            format!(
-                "        {{ \"x\": {}, \"y\": {}, \"color\": \"{}\"{radius} }}",
-                k.x, k.y, k.color
-            )
-        })
-        .collect();
+    // Absent rather than null when a keyframe is unconfined, matching what the
+    // wire format does — the fixture is only worth having if it is the shape the
+    // two implementations really exchange. See `keyframe`.
+    let keyframes: Vec<String> =
+        cfg.keyframes.iter().map(|k| format!("        {}", keyframe(k))).collect();
 
     let mut samples = Vec::new();
     for i in 0..=8 {
         for j in 0..=8 {
             let (x, y) = (i as f32 / 8.0, j as f32 / 8.0);
-            let lab = surface.sample(x, y);
-            let led = led_bytes(lab);
-            samples.push(format!(
-                "        {{ \"x\": {x}, \"y\": {y}, \
-                 \"l\": {}, \"a\": {}, \"b\": {}, \"alpha\": {}, \
-                 \"led\": [{}, {}, {}] }}",
-                fmt(lab.l),
-                fmt(lab.a),
-                fmt(lab.b),
-                fmt(lab.alpha),
-                led[0],
-                led[1],
-                led[2],
-            ));
+            samples.push(format!("        {}", sample(&surface, x, y)));
         }
     }
 
@@ -143,4 +130,158 @@ fn led_bytes(lab: Oklab) -> [u8; 3] {
         (rgb.g * 255.0).round() as u8,
         (rgb.b * 255.0).round() as u8,
     ]
+}
+
+/// A field whose keyframes move, recolour and change blend radius between three
+/// keys — the ordinary case, and the one that pins position, colour, opacity and
+/// sigma all interpolating together.
+fn sweep() -> Timeline {
+    let key = |at, ax, ay, a: &str, bx, by, b: &str, sigma| TimelineKey {
+        id: String::new(),
+        at,
+        surface: SurfaceConfig {
+            keyframes: vec![Keyframe::new(ax, ay, a), Keyframe::new(bx, by, b)],
+            sigma,
+        },
+    };
+    Timeline {
+        enabled: true,
+        length: 4.0,
+        keys: vec![
+            key(0.0, 0.0, 0.0, "#ff2000ff", 1.0, 1.0, "#40c0ff40", 0.25),
+            key(0.4, 0.5, 1.0, "#40ff6080", 0.5, 0.0, "#0000ffff", 0.45),
+            key(0.75, 1.0, 0.5, "#ffffff00", 0.0, 0.5, "#ff00a6ff", 0.12),
+        ],
+    }
+}
+
+/// The two cases the ordinary lerp cannot cover on its own: an area of effect
+/// opening all the way into reaching everywhere, and a keyframe authored at one
+/// key and absent from the next, which has to fade rather than vanish.
+fn reach() -> Timeline {
+    Timeline {
+        enabled: true,
+        length: 3.0,
+        keys: vec![
+            TimelineKey {
+                id: String::new(),
+                at: 0.0,
+                surface: SurfaceConfig {
+                    keyframes: vec![
+                        Keyframe::within(0.2, 0.5, "#ff2000", 0.15),
+                        Keyframe::within(0.9, 0.9, "#40c0ff", 0.4),
+                    ],
+                    sigma: 0.25,
+                },
+            },
+            TimelineKey {
+                id: String::new(),
+                at: 0.6,
+                surface: SurfaceConfig {
+                    // The second keyframe is gone: the first has opened up to
+                    // unconfined, and the one that is missing fades out across
+                    // the span rather than disappearing at the key.
+                    keyframes: vec![Keyframe::new(0.6, 0.2, "#8cff00")],
+                    sigma: 0.3,
+                },
+            },
+        ],
+    }
+}
+
+/// One timeline, sampled at a handful of instants.
+///
+/// The phases are chosen to hit a key exactly, to land mid-span, and to fall
+/// inside the wrap from the last key back to the first — the three things the
+/// bracketing walk has to get right, and the one a port is most likely to get
+/// wrong.
+fn timeline_case(name: &str, tl: &Timeline) -> String {
+    let mut surface = ColorSurface::animated(tl).expect("reference timeline must be valid");
+
+    let keys: Vec<String> = tl
+        .keys
+        .iter()
+        .map(|k| {
+            let keyframes: Vec<String> =
+                k.surface.keyframes.iter().map(|f| format!("          {}", keyframe(f))).collect();
+            [
+                "        {".to_string(),
+                format!("          \"at\": {},", k.at),
+                format!("          \"sigma\": {},", k.surface.sigma),
+                "          \"keyframes\": [".to_string(),
+                keyframes.join(",\n"),
+                "          ]".to_string(),
+                "        }".to_string(),
+            ]
+            .join("\n")
+        })
+        .collect();
+
+    let length = tl.length();
+    let phases: Vec<String> = [0.0f64, 0.25, 0.5, 0.675, 0.93]
+        .iter()
+        .map(|phase| {
+            let seconds = phase * length as f64;
+            surface.seek(seconds);
+
+            let mut samples = Vec::new();
+            for i in 0..=4 {
+                for j in 0..=4 {
+                    let (x, y) = (i as f32 / 4.0, j as f32 / 4.0);
+                    samples.push(format!("            {}", sample(&surface, x, y)));
+                }
+            }
+            [
+                "        {".to_string(),
+                format!("          \"seconds\": {seconds},"),
+                "          \"samples\": [".to_string(),
+                samples.join(",\n"),
+                "          ]".to_string(),
+                "        }".to_string(),
+            ]
+            .join("\n")
+        })
+        .collect();
+
+    [
+        "    {".to_string(),
+        format!("      \"name\": \"{name}\","),
+        format!("      \"length\": {length},"),
+        "      \"keys\": [".to_string(),
+        keys.join(",\n"),
+        "      ],".to_string(),
+        "      \"phases\": [".to_string(),
+        phases.join(",\n"),
+        "      ]".to_string(),
+        "    }".to_string(),
+    ]
+    .join("\n")
+}
+
+/// One keyframe, in the shape the wire really uses — an absent `radius` rather
+/// than a null one for an unconfined keyframe.
+fn keyframe(k: &Keyframe) -> String {
+    let radius = match k.radius {
+        Some(r) => format!(", \"radius\": {r}"),
+        None => String::new(),
+    };
+    format!("{{ \"x\": {}, \"y\": {}, \"color\": \"{}\"{radius} }}", k.x, k.y, k.color)
+}
+
+/// One sampled point, with both the Oklab the surface answers and the bytes it
+/// would put on the wire.
+fn sample(surface: &ColorSurface, x: f32, y: f32) -> String {
+    let lab = surface.sample(x, y);
+    let led = led_bytes(lab);
+    format!(
+        "{{ \"x\": {x}, \"y\": {y}, \"l\": {}, \"a\": {}, \"b\": {}, \"alpha\": {}, \
+         \"led\": [{}, {}, {}] }}",
+        fmt(lab.l),
+        fmt(lab.a),
+        fmt(lab.b),
+        fmt(lab.alpha),
+        led[0],
+        led[1],
+        led[2],
+    )
 }

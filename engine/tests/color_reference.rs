@@ -13,7 +13,7 @@
 //! ```
 
 use djled_engine::color::oklab::LinearRgb;
-use djled_engine::color::{ColorSurface, Keyframe, SurfaceConfig};
+use djled_engine::color::{ColorSurface, Keyframe, SurfaceConfig, Timeline, TimelineKey};
 
 const REFERENCE: &str = include_str!("../../ui/src/color/reference.json");
 
@@ -151,4 +151,134 @@ fn reference_exercises_opacity() {
         alphas.iter().any(|&a| (0.3..0.7).contains(&a)),
         "no sample is partially covered, which is where the blending maths shows"
     );
+}
+
+/// The same contract for the field as a function of time.
+///
+/// Both implementations walk the same bracketing keys, blend the same way and
+/// wrap the same way, so the Preview strip shows the instant of the loop the
+/// wall is actually at. A drift here is worse than a static one: it looks
+/// correct until somebody tries to place a key against the music.
+#[test]
+fn committed_reference_matches_the_timeline_implementation() {
+    let doc = document();
+    let timelines = doc["timelines"].as_array().expect("reference.json has no timelines array");
+    assert!(!timelines.is_empty(), "reference.json contains no timelines");
+
+    for case in timelines {
+        let name = case["name"].as_str().unwrap_or("?");
+        let mut surface =
+            ColorSurface::animated(&timeline(case)).expect("reference timeline must be valid");
+
+        let phases = case["phases"].as_array().expect("case has no phases array");
+        assert!(!phases.is_empty(), "timeline '{name}' contains no phases");
+
+        for phase in phases {
+            let seconds = phase["seconds"].as_f64().unwrap();
+            surface.seek(seconds);
+
+            for s in phase["samples"].as_array().unwrap() {
+                let (x, y) = (s["x"].as_f64().unwrap() as f32, s["y"].as_f64().unwrap() as f32);
+                let got = surface.sample(x, y);
+
+                for (channel, actual, expected) in [
+                    ("l", got.l, s["l"].as_f64().unwrap() as f32),
+                    ("a", got.a, s["a"].as_f64().unwrap() as f32),
+                    ("b", got.b, s["b"].as_f64().unwrap() as f32),
+                    ("alpha", got.alpha, s["alpha"].as_f64().unwrap() as f32),
+                ] {
+                    assert!(
+                        (actual - expected).abs() < 1e-6,
+                        "{channel} at ({x}, {y}) of '{name}' at {seconds}s: got {actual}, \
+                         reference says {expected}. Regenerate the fixture if this was intended."
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The fixture has to contain a span whose two ends disagree about whether a
+/// keyframe exists, and one that opens an area of effect all the way out.
+/// Without them both implementations could take the easy reading of each and
+/// still agree with the file.
+#[test]
+fn reference_exercises_the_awkward_halves_of_a_blend() {
+    let doc = document();
+    let timelines = doc["timelines"].as_array().unwrap();
+
+    let counts: Vec<Vec<usize>> = timelines
+        .iter()
+        .map(|t| {
+            t["keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|k| k["keyframes"].as_array().unwrap().len())
+                .collect()
+        })
+        .collect();
+    assert!(
+        counts.iter().any(|c| c.iter().min() != c.iter().max()),
+        "no timeline in the fixture has a keyframe missing from one of its keys",
+    );
+
+    let radii: Vec<Option<f64>> = timelines
+        .iter()
+        .flat_map(|t| t["keys"].as_array().unwrap())
+        .flat_map(|k| k["keyframes"].as_array().unwrap())
+        .map(|f| f["radius"].as_f64())
+        .collect();
+    assert!(radii.iter().any(|r| r.is_some()), "no confined keyframe in the fixture");
+    assert!(radii.iter().any(|r| r.is_none()), "no unconfined keyframe in the fixture");
+
+    // And the loop has to actually move, or every phase could be the first key.
+    let moved = timelines.iter().any(|t| {
+        let phases = t["phases"].as_array().unwrap();
+        let first: Vec<f64> =
+            phases[0]["samples"].as_array().unwrap().iter().map(|s| s["l"].as_f64().unwrap()).collect();
+        phases.iter().skip(1).any(|p| {
+            p["samples"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(&first)
+                .any(|(s, l)| (s["l"].as_f64().unwrap() - l).abs() > 1e-3)
+        })
+    });
+    assert!(moved, "every phase in the fixture is the same field");
+}
+
+/// A recorded timeline, back in the shape the engine compiles.
+fn timeline(case: &serde_json::Value) -> Timeline {
+    Timeline {
+        enabled: true,
+        length: case["length"].as_f64().unwrap() as f32,
+        keys: case["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| {
+                TimelineKey::new(
+                    k["at"].as_f64().unwrap() as f32,
+                    SurfaceConfig {
+                        sigma: k["sigma"].as_f64().unwrap() as f32,
+                        keyframes: k["keyframes"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|f| Keyframe {
+                                radius: f["radius"].as_f64().map(|r| r as f32),
+                                ..Keyframe::new(
+                                    f["x"].as_f64().unwrap() as f32,
+                                    f["y"].as_f64().unwrap() as f32,
+                                    f["color"].as_str().unwrap(),
+                                )
+                            })
+                            .collect(),
+                    },
+                )
+            })
+            .collect(),
+    }
 }

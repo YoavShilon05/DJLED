@@ -5,7 +5,9 @@
 //! but could still be wired together wrongly.
 
 use djled_engine::color::intensity::IntensityConfig;
-use djled_engine::color::{Geometry, LayerVisual, LayoutConfig, RenderConfig, Renderer, SurfaceConfig};
+use djled_engine::color::{
+    Geometry, LayerVisual, LayoutConfig, RenderConfig, Renderer, SurfaceConfig, Timeline,
+};
 use djled_engine::link::{expand_bands_to_leds, Link, MockLink};
 use djled_engine::{Engine, EngineConfig};
 
@@ -435,6 +437,7 @@ fn layer(color: &str, opacity: f32, centers: &[f32]) -> LayerVisual {
             ],
             sigma: 0.5,
         },
+        timeline: Timeline::default(),
         layout: LayoutConfig::spanning(LEDS),
         intensity: IntensityConfig::pass_through(),
         opacity,
@@ -686,6 +689,18 @@ impl StillShow {
         }
         frames
     }
+
+    /// The strip at one instant of the loop, with the clock moved there first.
+    ///
+    /// Mirrors the order the run loop uses — seek, then render — because a
+    /// timeline is a function of the clock rather than of arriving samples, and
+    /// rendering before seeking would show every frame one behind.
+    fn at(&mut self, seconds: f64) -> Vec<[u8; 3]> {
+        self.renderer.seek(seconds);
+        let pixels = self.renderer.render_stack(&self.stack.all_levels());
+        self.link.send(pixels).unwrap();
+        self.link.leds().to_vec()
+    }
 }
 
 /// A still layer spanning the strip, painted with one colour authored at `db`
@@ -778,4 +793,125 @@ fn a_still_layer_sits_under_a_layer_that_paints_nothing() {
         alone.link.leds(),
         "an empty field over a still one changed the strip",
     );
+}
+
+/// A still layer whose field is a loop of `colors`, spread evenly around it.
+///
+/// Still rather than reactive because it isolates what is being measured: with
+/// no audio anywhere in the chain, anything that changes on the wire changed
+/// because the clock moved.
+fn animated_layer(colors: &[&str], length: f32, db: f32) -> djled_engine::Layer {
+    let y = djled_engine::color::intensity::db_to_level(db);
+    let field = |color: &str| SurfaceConfig {
+        keyframes: vec![
+            djled_engine::color::Keyframe::new(0.0, y, color),
+            djled_engine::color::Keyframe::new(1.0, y, color),
+        ],
+        sigma: 0.5,
+    };
+    djled_engine::Layer {
+        timeline: Timeline {
+            enabled: true,
+            length,
+            keys: colors
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    djled_engine::color::TimelineKey::new(
+                        i as f32 / colors.len() as f32,
+                        field(c),
+                    )
+                })
+                .collect(),
+        },
+        // The mirror a peer that knows nothing about timelines would paint. The
+        // keys win, and the test below is what says so.
+        surface: field(colors[0]),
+        ..still_layer(colors[0], db)
+    }
+}
+
+/// The claim the feature was asked for, all the way to the LED bytes: a layer's
+/// timeline replaces its colour field as the loop runs, with no audio in the
+/// chain at all.
+#[test]
+fn a_timeline_reaches_the_leds() {
+    let mut show = StillShow::new(vec![animated_layer(&["#ff2000", "#2040ff"], 4.0, 0.0)]);
+
+    // Phase 0 and phase 0.5 of a four second loop, taken from the same clock
+    // the run loop reads.
+    let start = show.at(0.0);
+    let half = show.at(2.0);
+
+    assert!(
+        start.iter().all(|px| px[0] > px[2]),
+        "the first key is not the warm colour it was authored: {:?}",
+        start[0]
+    );
+    assert!(
+        half.iter().all(|px| px[2] > px[0]),
+        "half a loop later the second key had not arrived: {:?}",
+        half[0]
+    );
+}
+
+/// Between two keys the wall is between two colours, rather than holding one
+/// until it switches. The whole difference between a timeline and a playlist.
+#[test]
+fn a_timeline_crossfades_rather_than_switching() {
+    let mut show = StillShow::new(vec![animated_layer(&["#ff2000", "#2040ff"], 4.0, 0.0)]);
+
+    let start = show.at(0.0)[LEDS / 2];
+    let quarter = show.at(1.0)[LEDS / 2];
+    let half = show.at(2.0)[LEDS / 2];
+
+    assert!(
+        quarter[2] > start[2] && quarter[2] < half[2],
+        "the blue channel stepped instead of crossing: {start:?} then {quarter:?} then {half:?}",
+    );
+    assert!(
+        quarter[0] < start[0] && quarter[0] > half[0],
+        "the red channel stepped instead of crossing: {start:?} then {quarter:?} then {half:?}",
+    );
+}
+
+/// The loop closes: a whole length later the wall is back where it started, to
+/// the byte. A show left up for a set depends on this and nothing else.
+#[test]
+fn a_timeline_comes_back_round_to_where_it_started() {
+    let mut show = StillShow::new(vec![animated_layer(&["#ff2000", "#2040ff"], 4.0, 0.0)]);
+
+    let start = show.at(1_750_000_000.0);
+    let later = show.at(1_750_000_004.0);
+    assert_eq!(start, later, "a full loop did not return to the same bytes");
+}
+
+/// A still layer's field is read along one row, and a timeline's keys are no
+/// exception — each of them is projected onto it. Without that, animating the
+/// one kind of layer that has no level axis would paint whatever its keys
+/// happened to hold along the top edge.
+#[test]
+fn a_still_layers_timeline_is_read_along_one_row() {
+    let mut low = StillShow::new(vec![animated_layer(&["#40c0ff", "#ff2000"], 4.0, -80.0)]);
+    let mut high = StillShow::new(vec![animated_layer(&["#40c0ff", "#ff2000"], 4.0, 0.0)]);
+
+    for seconds in [0.0, 1.0, 2.0, 3.0] {
+        assert_eq!(
+            low.at(seconds),
+            high.at(seconds),
+            "at {seconds}s the timeline's colour moved with the intensity axis",
+        );
+    }
+}
+
+/// Every show written before timelines existed must be deaf to the clock. This
+/// is the byte-identity half of that promise — the parse half is in `show.rs`.
+#[test]
+fn a_layer_without_a_timeline_ignores_the_clock() {
+    let mut show = StillShow::new(vec![still_layer("#ff2000", 0.0)]);
+
+    let start = show.at(0.0);
+    for seconds in [0.5, 2.0, 1_750_000_000.0] {
+        assert_eq!(show.at(seconds), start, "the clock moved a layer that does not animate");
+    }
 }

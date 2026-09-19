@@ -56,6 +56,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::oklab::{srgb_hex_to_linear, srgba_hex_to_linear, LinearRgb, Oklab};
+use super::timeline::{Timeline, TimelineKey};
 
 /// One authored control point. `color` is an sRGB hex string so saved presets
 /// stay readable and hand-editable.
@@ -164,6 +165,19 @@ impl SurfaceConfig {
     }
 }
 
+/// Largest area of effect worth distinguishing from no limit at all.
+///
+/// The diagonal of the unit square is √2, so a keyframe reaching this far
+/// touches every point of the field from any corner. It exists because
+/// [`Keyframe::radius`] is an `Option` and an interpolation cannot be halfway
+/// to `None`: across a span where one end is confined and the other is not,
+/// "everywhere" stands in as this distance, the radius grows smoothly into it,
+/// and reaching it turns the limit off again. The editor's radius slider tops
+/// out at the same number, so the two ends of that interpolation are both
+/// authorable.
+pub const UNCONFINED: f32 = 1.45;
+
+#[derive(Clone, Copy)]
 struct Compiled {
     x: f32,
     y: f32,
@@ -173,10 +187,63 @@ struct Compiled {
     reach: Option<f32>,
 }
 
+/// One authored keyframe with its colour parsed, before a radius has been
+/// turned into the reciprocal [`Compiled`] samples with.
+///
+/// Kept separate because interpolation happens in the authored units: lerping
+/// `1 / r` would make an area of effect open fast and close slowly for no
+/// reason anybody asked for.
+#[derive(Clone, Copy)]
+struct Authored {
+    x: f32,
+    y: f32,
+    color: Oklab,
+    radius: Option<f32>,
+}
+
+impl Authored {
+    fn compile(self) -> Compiled {
+        Compiled {
+            x: self.x,
+            y: self.y,
+            color: self.color,
+            // A radius of zero would divide by zero and then multiply a zero
+            // distance by the infinity it produced, which is a NaN on the
+            // strip. Floored instead, so a keyframe dragged to nothing simply
+            // reaches nothing.
+            reach: self.radius.map(|r| 1.0 / r.max(MIN_RADIUS)),
+        }
+    }
+
+    /// The same keyframe with its opacity scaled — how a keyframe authored at
+    /// one end of a span and absent from the other crosses it.
+    fn faded(self, by: f32) -> Self {
+        Self { color: Oklab::with_alpha(self.color.l, self.color.a, self.color.b, self.color.alpha * by), ..self }
+    }
+}
+
+/// The whole field at one authored moment of a loop.
+struct Moment {
+    /// Where in the loop, 0..1.
+    at: f32,
+    /// The blend radius at this moment. Interpolated as sigma rather than as
+    /// the falloff it becomes, for the same reason a radius is.
+    sigma: f32,
+    /// Index-matched across every moment, padded to the longest. `None` where
+    /// this keyframe is not authored here — see [`ColorSurface::seek`].
+    points: Vec<Option<Authored>>,
+}
+
 pub struct ColorSurface {
+    /// The field as it stands right now, which is the whole of it for a surface
+    /// that does not animate.
     points: Vec<Compiled>,
     /// Precomputed `1 / (2σ²)`.
     falloff: f32,
+    /// Empty unless this surface animates. Sorted by [`Moment::at`].
+    moments: Vec<Moment>,
+    /// Loop length in seconds. Only read when `moments` has something in it.
+    length: f32,
 }
 
 impl ColorSurface {
@@ -184,25 +251,146 @@ impl ColorSurface {
     /// is not hex; a field with no keyframes at all is legal and samples as
     /// transparent black everywhere. See [`ColorSurface::sample`].
     pub fn new(cfg: &SurfaceConfig) -> Result<Self, String> {
-        let points = cfg
-            .keyframes
+        let points: Vec<Compiled> =
+            authored(cfg)?.into_iter().map(Authored::compile).collect();
+
+        Ok(Self {
+            points,
+            falloff: falloff_of(cfg.sigma),
+            moments: Vec::new(),
+            length: 0.0,
+        })
+    }
+
+    /// The field a layer paints with: its timeline where it has one, and its
+    /// still surface where it does not.
+    ///
+    /// The two are not alternatives the caller picks between, because the keys
+    /// are authoritative wherever there are any — [`crate::show::Layer::surface`]
+    /// is only the view of them a peer that does not know about timelines gets,
+    /// and reading it in preference to a key would mean an editor and an engine
+    /// that both understand timelines still argued about which field was live.
+    pub fn for_layer(surface: &SurfaceConfig, timeline: &Timeline) -> Result<Self, String> {
+        match timeline.start() {
+            // A timeline switched off, or one with a single key, is a still
+            // field — the one the loop would have started from.
+            Some(start) if !timeline.animates() => Self::new(start),
+            Some(_) => Self::animated(timeline),
+            None => Self::new(surface),
+        }
+    }
+
+    /// Compile a timeline for sampling. Fails on the same thing
+    /// [`ColorSurface::new`] does and nothing else: a colour that is not hex.
+    ///
+    /// Every key is padded to the longest one's keyframe count, so the blend in
+    /// [`ColorSurface::seek`] is an index walk with no bookkeeping. The keys
+    /// are sorted here rather than trusted, because a hand-edited preset is
+    /// under no obligation to be in order and an out-of-order key would
+    /// otherwise play the loop backwards through it.
+    pub fn animated(timeline: &Timeline) -> Result<Self, String> {
+        let mut keys: Vec<&TimelineKey> = timeline.keys.iter().collect();
+        keys.sort_by(|a, b| a.at.total_cmp(&b.at));
+
+        let width = keys.iter().map(|k| k.surface.keyframes.len()).max().unwrap_or(0);
+
+        let moments = keys
             .iter()
             .map(|k| {
-                Ok(Compiled {
-                    x: k.x,
-                    y: k.y,
-                    color: parse_color(&k.color)?.to_oklab(),
-                    // A radius of zero would divide by zero and then multiply a
-                    // zero distance by the infinity it produced, which is a NaN
-                    // on the strip. Floored instead, so a keyframe dragged to
-                    // nothing simply reaches nothing.
-                    reach: k.radius.map(|r| 1.0 / r.max(MIN_RADIUS)),
+                let mut points: Vec<Option<Authored>> =
+                    authored(&k.surface)?.into_iter().map(Some).collect();
+                points.resize(width, None);
+                Ok(Moment {
+                    at: if k.at.is_finite() { k.at.clamp(0.0, 1.0) } else { 0.0 },
+                    sigma: k.surface.sigma,
+                    points,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
 
-        let sigma = cfg.sigma.max(1e-3);
-        Ok(Self { points, falloff: 1.0 / (2.0 * sigma * sigma) })
+        // Valid before anything has sought: a renderer built mid-frame paints
+        // the start of the loop rather than an empty field.
+        let start = &moments[0];
+        let points = start.points.iter().flatten().map(|p| p.compile()).collect();
+        let falloff = falloff_of(start.sigma);
+
+        Ok(Self { points, falloff, moments, length: timeline.length() })
+    }
+
+    /// Whether this surface moves on its own. A still one ignores
+    /// [`ColorSurface::seek`] entirely.
+    pub fn animates(&self) -> bool {
+        self.moments.len() >= 2
+    }
+
+    /// Move the field to where the loop has reached at `seconds` — seconds
+    /// since the Unix epoch, which is what makes the engine and the editor
+    /// agree on the instant without it crossing the wire. See
+    /// [`crate::color::timeline`].
+    ///
+    /// Cheap enough to call once per frame per layer: it walks the two
+    /// bracketing keys once and writes into a buffer it already owns. Nothing
+    /// is parsed and nothing is allocated after the first call.
+    ///
+    /// # Between two keys
+    ///
+    /// Everything authored interpolates: position, colour, opacity, area of
+    /// effect and the blend radius. The one case that is not a plain lerp is a
+    /// keyframe authored at one end of the span and not the other, which fades
+    /// its opacity out across the span instead of appearing or vanishing
+    /// between two frames. The editor never produces that — it adds and removes
+    /// a colour on every key at once — but a hand-edited preset can, and a pop
+    /// on the wall is a worse answer than a fade.
+    pub fn seek(&mut self, seconds: f64) {
+        if !self.animates() {
+            return;
+        }
+
+        let n = self.moments.len();
+        let length = self.length.max(1e-3) as f64;
+        let mut phase = (seconds % length) / length;
+        if phase < 0.0 {
+            phase += 1.0;
+        }
+        let phase = phase as f32;
+
+        // The bracketing pair, wrapping past the last key back to the first —
+        // which is the whole of what makes this a loop rather than a ramp. A
+        // phase before the first key is still inside that wrap.
+        let (a, b) = if phase < self.moments[0].at {
+            (n - 1, 0)
+        } else {
+            let mut i = 0;
+            while i + 1 < n && self.moments[i + 1].at <= phase {
+                i += 1;
+            }
+            (i, (i + 1) % n)
+        };
+
+        // Both spans are measured around the loop, so the one that crosses the
+        // wrap comes out positive rather than as a negative span that would
+        // play the segment backwards.
+        let span = wrapped(self.moments[b].at - self.moments[a].at);
+        let travelled = wrapped(phase - self.moments[a].at);
+        let t = if span > 1e-6 { (travelled / span).clamp(0.0, 1.0) } else { 0.0 };
+
+        let (from, to) = (&self.moments[a], &self.moments[b]);
+        self.falloff = falloff_of(lerp(from.sigma, to.sigma, t));
+
+        // Cleared and refilled rather than resized: the capacity is already
+        // there after the first frame, so this allocates nothing.
+        self.points.clear();
+        for (start, end) in from.points.iter().zip(&to.points) {
+            let blended = match (start, end) {
+                (Some(p), Some(q)) => Some(mix(*p, *q, t)),
+                (Some(p), None) => Some(p.faded(1.0 - t)),
+                (None, Some(q)) => Some(q.faded(t)),
+                (None, None) => None,
+            };
+            if let Some(point) = blended {
+                self.points.push(point.compile());
+            }
+        }
     }
 
     /// Colour and opacity at a point in the unit square. Inputs outside 0..1 are
@@ -299,6 +487,71 @@ impl ColorSurface {
         }
 
         Oklab::with_alpha(l / cover, a / cover, b / cover, alpha)
+    }
+}
+
+/// Every keyframe of a field, with its colour parsed and nothing else done to
+/// it. The one place a config can be rejected, and the shared half of compiling
+/// a still surface and compiling a timeline key.
+fn authored(cfg: &SurfaceConfig) -> Result<Vec<Authored>, String> {
+    cfg.keyframes
+        .iter()
+        .map(|k| {
+            Ok(Authored {
+                x: k.x,
+                y: k.y,
+                color: parse_color(&k.color)?.to_oklab(),
+                radius: k.radius,
+            })
+        })
+        .collect()
+}
+
+/// `1 / (2σ²)`, with sigma floored so a field authored at zero blend is sharp
+/// rather than a division by zero.
+fn falloff_of(sigma: f32) -> f32 {
+    let sigma = sigma.max(1e-3);
+    1.0 / (2.0 * sigma * sigma)
+}
+
+/// A difference of two phases, measured forwards around the loop.
+fn wrapped(delta: f32) -> f32 {
+    if delta >= 0.0 { delta } else { delta + 1.0 }
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+/// One keyframe part of the way from where it was authored at one key to where
+/// it is authored at the next.
+///
+/// Colour is interpolated in Oklab, which is the whole reason colours live in
+/// Oklab here: a red crossing to a blue passes through the purples rather than
+/// through the muddy grey a linear-RGB lerp would give.
+///
+/// The radius is the one value with no obvious midpoint, because "everywhere"
+/// is not a distance. [`UNCONFINED`] stands in for it, so an area of effect
+/// opening up grows smoothly to the size of the field and only then stops
+/// being a limit at all.
+fn mix(p: Authored, q: Authored, t: f32) -> Authored {
+    let radius = match (p.radius, q.radius) {
+        (None, None) => None,
+        (from, to) => {
+            let r = lerp(from.unwrap_or(UNCONFINED), to.unwrap_or(UNCONFINED), t);
+            if r >= UNCONFINED { None } else { Some(r) }
+        }
+    };
+    Authored {
+        x: lerp(p.x, q.x, t),
+        y: lerp(p.y, q.y, t),
+        color: Oklab::with_alpha(
+            lerp(p.color.l, q.color.l, t),
+            lerp(p.color.a, q.color.a, t),
+            lerp(p.color.b, q.color.b, t),
+            lerp(p.color.alpha, q.color.alpha, t),
+        ),
+        radius,
     }
 }
 
@@ -744,5 +997,320 @@ mod tests {
             assert!(c.l.is_finite() && c.a.is_finite() && c.b.is_finite(), "produced {c:?}");
             assert!(close(c.alpha, 0.0), "opacity should be zero, got {}", c.alpha);
         }
+    }
+
+    // -- Timelines -------------------------------------------------------
+    //
+    // The field as a function of time. `seek` takes seconds since the epoch, so
+    // every case below picks a length and a phase and multiplies.
+    //
+    // Two probe fields run through these, and the choice of each is the
+    // interpolator's doing. `dot` has a single unconfined keyframe, so the
+    // normalised weighting makes its colour the colour of the *whole* field —
+    // which is what turns "did the colour travel" into one sample. `spot`
+    // confines its keyframe instead, so the field is covered near it and
+    // transparent away from it, and opacity reads out *where* it is. Sweeping
+    // for a brightest point would answer neither: one keyframe, normalised, is
+    // the same lightness everywhere.
+
+    /// A field that is one colour everywhere. See above.
+    fn dot(color: &str) -> SurfaceConfig {
+        SurfaceConfig { keyframes: vec![Keyframe::new(0.5, 0.5, color)], sigma: 0.25 }
+    }
+
+    /// A field covered within 0.3 of `x` and transparent past it.
+    fn spot(x: f32) -> SurfaceConfig {
+        SurfaceConfig { keyframes: vec![Keyframe::within(x, 0.5, "#ffffff", 0.3)], sigma: 0.25 }
+    }
+
+    fn lab(hex: &str) -> Oklab {
+        parse_color(hex).unwrap().to_oklab()
+    }
+
+    fn is_color(got: Oklab, hex: &str) -> bool {
+        let want = lab(hex);
+        close(got.l, want.l) && close(got.a, want.a) && close(got.b, want.b)
+    }
+
+    /// Red to blue and back, over four seconds.
+    fn fading() -> Timeline {
+        Timeline {
+            enabled: true,
+            length: 4.0,
+            keys: vec![
+                TimelineKey::new(0.0, dot("#ff0000")),
+                TimelineKey::new(0.5, dot("#0000ff")),
+            ],
+        }
+    }
+
+    /// A covered area travelling from one end of the strip to the other.
+    fn sliding() -> Timeline {
+        Timeline {
+            enabled: true,
+            length: 4.0,
+            keys: vec![TimelineKey::new(0.0, spot(0.0)), TimelineKey::new(0.5, spot(1.0))],
+        }
+    }
+
+    /// A surface with no timeline must ignore the clock completely, or every
+    /// show written before this existed would start drifting.
+    #[test]
+    fn a_still_surface_does_not_move() {
+        let mut surface = default_surface();
+        assert!(!surface.animates());
+        let before = surface.sample(0.3, 0.7);
+        surface.seek(1_750_000_000.0);
+        assert_eq!(before, surface.sample(0.3, 0.7));
+    }
+
+    /// Landing on a key shows that key's field. Anything else and the authored
+    /// moments would be the only ones the loop never actually reaches.
+    #[test]
+    fn a_key_is_reached_exactly_at_its_own_phase() {
+        let mut surface = ColorSurface::animated(&fading()).unwrap();
+        assert!(surface.animates());
+
+        surface.seek(0.0);
+        assert!(is_color(surface.sample(0.5, 0.5), "#ff0000"), "phase 0 is not the first key");
+
+        // Half of a four second loop.
+        surface.seek(2.0);
+        assert!(is_color(surface.sample(0.5, 0.5), "#0000ff"), "phase 0.5 is not the second key");
+    }
+
+    /// The point of interpolating rather than switching: part way between two
+    /// keys is part way between their fields. Through Oklab, so red crossing to
+    /// blue passes through the purples rather than through the muddy grey a
+    /// linear RGB lerp would give.
+    #[test]
+    fn between_two_keys_the_colour_is_part_way_there() {
+        let mut surface = ColorSurface::animated(&fading()).unwrap();
+        // A quarter of the loop is halfway between the keys at 0 and 0.5.
+        surface.seek(1.0);
+
+        let got = surface.sample(0.5, 0.5);
+        let (red, blue) = (lab("#ff0000"), lab("#0000ff"));
+        assert!(close(got.l, (red.l + blue.l) / 2.0), "l: {}", got.l);
+        assert!(close(got.a, (red.a + blue.a) / 2.0), "a: {}", got.a);
+        assert!(close(got.b, (red.b + blue.b) / 2.0), "b: {}", got.b);
+    }
+
+    /// Positions travel as well as colours, which is the difference between a
+    /// palette crossfade and something moving along the wall.
+    #[test]
+    fn a_keyframe_travels_along_the_strip() {
+        let mut surface = ColorSurface::animated(&sliding()).unwrap();
+
+        surface.seek(0.0);
+        assert!(surface.sample(0.05, 0.5).alpha > 0.9, "the bass end is not covered at phase 0");
+        assert!(close(surface.sample(0.95, 0.5).alpha, 0.0), "the treble end already is");
+
+        // Halfway between the two keys, so halfway along the strip: both ends
+        // are now out of reach and the middle is covered.
+        surface.seek(1.0);
+        assert!(surface.sample(0.5, 0.5).alpha > 0.9, "the middle is not covered halfway");
+        assert!(close(surface.sample(0.05, 0.5).alpha, 0.0), "it did not leave the bass end");
+
+        surface.seek(2.0);
+        assert!(surface.sample(0.95, 0.5).alpha > 0.9, "it did not arrive at the treble end");
+    }
+
+    /// The last key interpolates back to the first rather than holding until
+    /// the loop restarts, which is what makes this a loop and not a ramp.
+    #[test]
+    fn the_loop_closes_from_the_last_key_back_to_the_first() {
+        let mut surface = ColorSurface::animated(&sliding()).unwrap();
+
+        // Three quarters of the loop: halfway back from the key at 0.5 to the
+        // one at 0, going forwards around the wrap.
+        surface.seek(3.0);
+        assert!(surface.sample(0.5, 0.5).alpha > 0.9, "the wrap did not interpolate");
+        assert!(close(surface.sample(0.95, 0.5).alpha, 0.0), "it never left the treble end");
+
+        // And a whole loop later is the start again.
+        surface.seek(4.0);
+        assert!(surface.sample(0.05, 0.5).alpha > 0.9, "the loop did not come back round");
+    }
+
+    /// A key out of order is sorted rather than played backwards. A preset can
+    /// be hand-edited, and an unsorted one would otherwise run the loop through
+    /// its keys in whatever order somebody happened to type them.
+    #[test]
+    fn keys_are_sorted_rather_than_trusted() {
+        let mut surface = ColorSurface::animated(&Timeline {
+            enabled: true,
+            length: 4.0,
+            keys: vec![
+                TimelineKey::new(0.5, dot("#0000ff")),
+                TimelineKey::new(0.0, dot("#ff0000")),
+            ],
+        })
+        .unwrap();
+
+        surface.seek(0.0);
+        assert!(is_color(surface.sample(0.5, 0.5), "#ff0000"));
+        surface.seek(2.0);
+        assert!(is_color(surface.sample(0.5, 0.5), "#0000ff"));
+    }
+
+    /// The blend radius is authored per key, so it has to travel too — a field
+    /// that softens over the loop is as much a look as one that moves.
+    ///
+    /// Read out through opacity: an opaque keyframe at one end of the field and
+    /// a transparent one at the other hand over across it, and how quickly they
+    /// do that *is* sigma.
+    #[test]
+    fn the_blend_radius_interpolates_with_the_field() {
+        let handover = |sigma| SurfaceConfig {
+            keyframes: vec![
+                Keyframe::new(0.0, 0.5, "#ffffffff"),
+                Keyframe::new(1.0, 0.5, "#ffffff00"),
+            ],
+            sigma,
+        };
+        let mut surface = ColorSurface::animated(&Timeline {
+            enabled: true,
+            length: 2.0,
+            keys: vec![
+                TimelineKey::new(0.0, handover(0.05)),
+                TimelineKey::new(0.5, handover(0.45)),
+            ],
+        })
+        .unwrap();
+
+        surface.seek(0.0);
+        let sharp = surface.sample(0.8, 0.5).alpha;
+        surface.seek(1.0);
+        let soft = surface.sample(0.8, 0.5).alpha;
+        assert!(soft > sharp + 0.1, "sigma did not open up: {sharp} then {soft}");
+    }
+
+    /// An area of effect is authored per key like everything else, so a loop can
+    /// open and close one.
+    #[test]
+    fn an_area_of_effect_opens_and_closes_over_the_loop() {
+        let reaching = |radius| SurfaceConfig {
+            keyframes: vec![Keyframe::within(0.0, 0.5, "#ffffff", radius)],
+            sigma: 0.25,
+        };
+        let mut surface = ColorSurface::animated(&Timeline {
+            enabled: true,
+            length: 2.0,
+            keys: vec![TimelineKey::new(0.0, reaching(0.1)), TimelineKey::new(0.5, reaching(0.9))],
+        })
+        .unwrap();
+
+        // A point well outside the tight radius and well inside the wide one.
+        surface.seek(0.0);
+        assert!(close(surface.sample(0.5, 0.5).alpha, 0.0), "the tight key already reached 0.5");
+        surface.seek(1.0);
+        assert!(surface.sample(0.5, 0.5).alpha > 0.5, "the wide key did not reach 0.5");
+    }
+
+    /// Going the other way: an area of effect can be released into reaching
+    /// everywhere, because a radius cannot be halfway to `None` and
+    /// [`UNCONFINED`] is the distance that stands in for it.
+    #[test]
+    fn an_area_of_effect_can_open_all_the_way_to_unconfined() {
+        let confined = SurfaceConfig {
+            keyframes: vec![Keyframe::within(0.0, 0.5, "#ffffff", 0.1)],
+            sigma: 0.25,
+        };
+        let open =
+            SurfaceConfig { keyframes: vec![Keyframe::new(0.0, 0.5, "#ffffff")], sigma: 0.25 };
+        let mut surface = ColorSurface::animated(&Timeline {
+            enabled: true,
+            length: 2.0,
+            keys: vec![TimelineKey::new(0.0, confined), TimelineKey::new(0.5, open)],
+        })
+        .unwrap();
+
+        surface.seek(0.0);
+        assert!(close(surface.sample(1.0, 0.5).alpha, 0.0), "the confined key reached the far end");
+        surface.seek(1.0);
+        assert!(surface.sample(1.0, 0.5).alpha > 0.9, "the far end was not covered");
+    }
+
+    /// A keyframe the editor never produces but a hand-edited preset can: one
+    /// authored at one key and missing from the next. It has to fade, because
+    /// appearing or vanishing between two frames is a visible step on the wall
+    /// and a parse error would lose the whole show.
+    #[test]
+    fn a_keyframe_missing_from_one_key_fades_rather_than_popping() {
+        let both = SurfaceConfig {
+            keyframes: vec![
+                Keyframe::new(0.0, 0.5, "#ffffff"),
+                Keyframe::within(1.0, 0.5, "#ffffff", 0.2),
+            ],
+            sigma: 0.15,
+        };
+        let one =
+            SurfaceConfig { keyframes: vec![Keyframe::new(0.0, 0.5, "#ffffff")], sigma: 0.15 };
+
+        let mut surface = ColorSurface::animated(&Timeline {
+            enabled: true,
+            length: 2.0,
+            keys: vec![TimelineKey::new(0.0, both), TimelineKey::new(0.5, one)],
+        })
+        .unwrap();
+
+        surface.seek(0.0);
+        let present = surface.sample(1.0, 0.5).alpha;
+        surface.seek(0.5);
+        let halfway = surface.sample(1.0, 0.5).alpha;
+        surface.seek(1.0);
+        let gone = surface.sample(1.0, 0.5).alpha;
+
+        assert!(present > 0.5, "the keyframe was not there to begin with: {present}");
+        assert!(gone < 0.05, "it should have gone entirely, got {gone}");
+        assert!(
+            halfway > 0.05 && halfway < present,
+            "it stepped instead of fading: {present} then {halfway} then {gone}"
+        );
+    }
+
+    /// The keys are the field wherever there are any. A layer's own surface is
+    /// the view a peer that does not understand timelines gets, and preferring
+    /// it would leave two editors arguing about which field is live.
+    #[test]
+    fn the_keys_win_over_the_layers_own_surface() {
+        let mut surface = ColorSurface::for_layer(&dot("#00ff00"), &fading()).unwrap();
+        assert!(surface.animates());
+        surface.seek(0.0);
+        assert!(is_color(surface.sample(0.5, 0.5), "#ff0000"), "the stored surface was painted");
+
+        // With no keys at all the surface is the whole of it, which is every
+        // show written before timelines existed.
+        let still = ColorSurface::for_layer(&dot("#00ff00"), &Timeline::default()).unwrap();
+        assert!(!still.animates());
+        assert!(is_color(still.sample(0.5, 0.5), "#00ff00"));
+    }
+
+    /// Switching a timeline off holds its first key rather than falling back to
+    /// the layer's stored surface, which is only ever a mirror of that key and
+    /// may be a stale one.
+    #[test]
+    fn a_timeline_switched_off_holds_its_first_key() {
+        let off = Timeline { enabled: false, ..fading() };
+        let mut surface = ColorSurface::for_layer(&dot("#00ff00"), &off).unwrap();
+        assert!(!surface.animates());
+        assert!(is_color(surface.sample(0.5, 0.5), "#ff0000"), "not the first key's field");
+
+        surface.seek(2.0);
+        assert!(is_color(surface.sample(0.5, 0.5), "#ff0000"), "a switched-off timeline moved");
+    }
+
+    /// Seeking runs once per layer per frame, so it must not allocate after the
+    /// first call. Capacity is the observable proxy for that.
+    #[test]
+    fn seeking_reuses_its_buffer() {
+        let mut surface = ColorSurface::animated(&sliding()).unwrap();
+        surface.seek(0.0);
+        let capacity = surface.points.capacity();
+        for i in 0..200 {
+            surface.seek(i as f64 * 0.017);
+        }
+        assert_eq!(surface.points.capacity(), capacity, "the point buffer was reallocated");
     }
 }

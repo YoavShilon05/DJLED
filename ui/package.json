@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "smoke": "node scripts/stack-smoke.mjs",
-    "preset-smoke": "node scripts/preset-smoke.mjs"
+    "preset-smoke": "node scripts/preset-smoke.mjs",
+    "timeline-smoke": "node scripts/timeline-smoke.mjs"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

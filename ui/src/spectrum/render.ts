@@ -31,15 +31,29 @@
  * single row that implies, so there is nothing for a threshold, a clamp or a
  * curve to do. That mirrors what `LiveStack::visuals` hands the engine's
  * renderer, and has to — this is the strip preview and that is the wall.
+ *
+ * # Time
+ *
+ * A layer's field can be a loop rather than a single field, and the instant of
+ * that loop is taken from the wall clock — the same clock the engine reads, so
+ * the two land on the same instant with nothing exchanged. `now` defaults to
+ * it and is a parameter only so a test can name an instant.
+ *
+ * Nothing here is memoised against it. The preview is already rebuilt on every
+ * frame the engine publishes, and offline on every frame the demo spectrum
+ * moves, so a loop animates without a clock of its own being put on the React
+ * frame path — which is the one thing this module must not cost.
  */
 
 import { linearRgbToDisplay, type Rgb } from "../color/display";
 import { CLEAR, clampedRgb, oklabToLinearRgb, over, type LinearRgb } from "../color/oklab";
 import { ColorSurface } from "../color/surface";
+import { nowSeconds } from "../color/timeline";
 import { evalCurve } from "../config/curve";
 import {
   isStatic,
   toRenderSurface,
+  toRenderTimeline,
   type EditorConfig,
   type EditorLayer,
   type LedKeyframe,
@@ -173,8 +187,13 @@ export function layerCoverage(
   layer: EditorLayer,
   frame: SpectrumFrame,
   ledCount: number,
+  now = nowSeconds(),
 ): LinearRgb[] {
-  const surface = new ColorSurface(toRenderSurface(layer));
+  // The loop wherever the layer has one, and its still field where it does not.
+  // Sought before any position is sampled, exactly as the engine's run loop
+  // seeks before it renders — sampling first would show every frame one behind.
+  const surface = ColorSurface.forLayer(toRenderSurface(layer), toRenderTimeline(layer));
+  surface.seek(now);
   const out: LinearRgb[] = new Array(ledCount);
   const opacity = clamp(layer.opacity, 0, 1);
   // A layer with no source has no spectrum to read; it sits at a flat full
@@ -227,6 +246,7 @@ export function renderStack(
   frames: LayerFrames,
   ledCount: number,
   masterBrightness = 1,
+  now = nowSeconds(),
 ): Rgb[] {
   const stack: LinearRgb[] = new Array(ledCount).fill(CLEAR);
 
@@ -234,7 +254,7 @@ export function renderStack(
     // A layer nobody can see is skipped rather than composited at zero, which
     // is the same result for a good deal less work.
     if (!layer.enabled || layer.opacity <= 0) return;
-    const contribution = layerCoverage(layer, frames(layer, index), ledCount);
+    const contribution = layerCoverage(layer, frames(layer, index), ledCount, now);
     for (let i = 0; i < ledCount; i++) {
       if (contribution[i].alpha <= 0) continue;
       stack[i] = over(contribution[i], stack[i]);
@@ -269,8 +289,9 @@ export function renderLayer(
   frame: SpectrumFrame,
   ledCount: number,
   masterBrightness = 1,
+  now = nowSeconds(),
 ): Rgb[] {
-  const coverage = layerCoverage(layer, frame, ledCount);
+  const coverage = layerCoverage(layer, frame, ledCount, now);
   const out: Rgb[] = new Array(ledCount);
   for (let i = 0; i < ledCount; i++) {
     out[i] = masterBrightness <= 0 ? BLACK_RGB : linearRgbToDisplay(coverage[i], masterBrightness);

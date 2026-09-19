@@ -18,6 +18,10 @@ capture.rs / midi/  →  dsp/  →  color/  →  link/  →  Arduino
      (sources)        (levels)  (bytes)   (serial)
                           └──────────────→ ui.rs (WebSocket 9001) → ui/ (React)
 
+color/timeline.rs: the colour field over time. Per layer, looping, clocked
+off the wall clock, so the editor previews the same instant of it without
+ever being told which one.
+
 presets.rs (12 shows on disk) ←→ hotkeys.rs (ctrl+alt+F1..F12, system-wide)
 ```
 
@@ -40,13 +44,14 @@ cargo run --manifest-path engine/Cargo.toml --release -- --port COM3
 cd ui && npm install && npm run dev
 
 # Tests
-cargo test --manifest-path engine/Cargo.toml        # 281 pass (228 lib + 53 integration)
-cd ui && npm test                                   # 86 pass across 9 files
+cargo test --manifest-path engine/Cargo.toml        # 312 pass (252 lib + 60 integration)
+cd ui && npm test                                   # 113 pass across 10 files
 cd ui && npm run typecheck                          # tsc --noEmit, clean
 
 # End-to-end over the real socket, against a running engine
 cd ui && npm run smoke              # the layer stack
 cd ui && npm run preset-smoke       # the twelve preset slots
+cd ui && npm run timeline-smoke     # a loop, against the clock both sides read
 
 # Regenerate the Rust→TS colour parity fixture (see Invariants)
 cargo run --manifest-path engine/Cargo.toml --example color_reference \
@@ -88,8 +93,17 @@ which ones to run.
 port of the compositing fold in `engine/src/color/render.rs`. If they diverge,
 the editor's Preview strip lies about what the wall will do.
 `ui/src/color/reference.json` is generated from the Rust and asserted on both
-sides (`engine/tests/color_reference.rs`, `ui/src/color/reference.test.ts`).
+sides (`engine/tests/color_reference.rs`, `ui/src/color/reference.test.ts`). It
+carries still palettes **and** whole timelines sampled at several instants, so
+a blend that agrees at rest and drifts in motion fails too.
 *Touch either side → regenerate the fixture and run both suites.*
+
+**1a. The timeline's phase never crosses the wire, so both sides derive it.**
+`SystemTime::now()` in `main.rs::epoch_seconds` and `Date.now()` in
+`color/timeline.ts::nowSeconds`, modulo a per-layer length. That is what makes
+the Preview strip show the instant the wall is at, and it is only checked
+end to end by `ui/scripts/timeline-smoke.mjs`, which reads the same clock from
+a third process. A unit test cannot see this one.
 
 **2. `ShowConfig` is one struct in two languages.** `engine/src/show.rs` and the
 interfaces at the top of `ui/src/engine.ts` are the same shape, camelCase on the
@@ -98,10 +112,22 @@ wire. `ui/src/config/editor.ts` (`toEngineConfig` / `fromEngineConfig`) is the
 scattered through components. Every Rust field carries `#[serde(default)]` so an
 older or newer peer degrades instead of dropping the whole edit.
 
+**2a. A layer's stored `surface` is the *first key* of its timeline, derived
+rather than duplicated.** `toEngineConfig` writes it from the same field it
+writes key 0 from, so the two cannot disagree; the engine reads the keys
+wherever there are any and the surface only when there are none. That is the
+whole of the compatibility story — a peer that knows nothing about timelines
+sees the start of the loop instead of an empty layer.
+
 **3. A one-layer stack must stay byte-identical to the pre-layers renderer.**
 Pinned in `engine/src/color/render.rs` and `engine/tests/pipeline.rs`. Old
 presets with flat fields and no `layers` key parse as a one-layer show via the
 custom `Deserialize` in `show.rs`.
+
+**3a. A layer with no timeline keys is deaf to the clock.** Pinned by
+`a_layer_without_a_timeline_ignores_the_clock` in `engine/tests/pipeline.rs` and
+its twin in `ui/src/spectrum/stack.test.ts`. Together with (3) this is what
+keeps every preset written before timelines existed rendering exactly as it did.
 
 **4. Every editor control needs an end-to-end test that it reaches the LED
 bytes.** `engine/tests/pipeline.rs` exists because unit tests for each stage
@@ -195,6 +221,40 @@ trip.
   `full_velocity_reaches_the_top_of_the_colour_surface_at_every_note`.
 - **"Frame hop" is not an FFT window length.** Bands each draw from one of five
   tiers (8192→128); the hop is how often those transforms run.
+- **A timeline key is the whole graph at a moment, and two keys are blended by
+  *position in the list*.** A `Keyframe` carries no id over the wire — it is a
+  point and a colour, so a preset stays readable — so index is the only
+  correspondence there is. The editor holds up its end by adding and deleting a
+  colour on *every* key at once (`mergeKeyEdit`): where a colour sits belongs to
+  the key, the *set* of colours belongs to the layer. A hand-edited preset can
+  still break that, so a keyframe present at one end of a span and absent at the
+  other fades rather than popping — never rejects.
+- **The loop runs off the wall clock and there is no transport.** Nothing pauses
+  it, nothing scrubs it, and switching preset does not restart it. That is the
+  price of both sides agreeing on the instant without exchanging it. The
+  editor's playhead is a readout, written onto one element from an animation
+  frame — putting it in React state would re-render that panel sixty times a
+  second to move a line.
+- **An animated show must keep rendering with every source idle.** `main.rs`
+  used to sleep whenever `stack.poll()` reported nothing; a timeline is the one
+  stage that is a function of the clock rather than of levels, so the idle path
+  now renders on the display clock when `renderer.animates()`. Drop that and a
+  show of loops freezes the moment the music stops — on the wall only, because
+  the editor's preview has its own clock, which is the worst way for it to fail.
+- **The first key cannot be deleted or moved.** It *is* `Layer::surface` —
+  `config/timeline.ts` keeps only the keys after it — so deleting the last of
+  the others leaves a still layer rather than an empty loop. `BASE_KEY` is the
+  empty string and `keyOf` falls back to it, which is also what makes a stale
+  `activeKeyId` from another layer harmless.
+- **An area of effect cannot be halfway to "everywhere".** `radius` is an
+  `Option`, so `UNCONFINED` (1.45 — the diagonal of the unit square, and the top
+  of the editor's slider) stands in for `None` when interpolating, and a lerp
+  that reaches it turns the limit off again. Both sides do this; it is in the
+  reference fixture.
+- **Sectors, EQ, thresholds and the curve are not on the timeline.** They build
+  a strip map and a filter chain rather than being sampled per frame, so
+  animating them means rebuilding an analyser at frame rate. Only the colour
+  field moves.
 - **The editor plot shows one layer; the strip preview shows the stack.** Judge
   composite results on the preview, never on the graph. Each row of the layer
   list also carries a thumbnail of that layer alone — at full opacity and full

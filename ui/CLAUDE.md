@@ -13,11 +13,12 @@ that make this directory dangerous.
 ```bash
 npm install
 npm run dev         # vite on 5173
-npm test            # vitest run — 86 tests, 9 files
+npm test            # vitest run — 113 tests, 10 files
 npm run typecheck   # tsc --noEmit
 npm run build       # typecheck + vite build
 npm run smoke       # node scripts/stack-smoke.mjs, against a running engine
 npm run preset-smoke  # node scripts/preset-smoke.mjs, same
+npm run timeline-smoke # node scripts/timeline-smoke.mjs, same
 ```
 
 No linter and no lint script, and no prettier config either. The files are
@@ -34,14 +35,16 @@ editor's squiggles.
 |---|---|
 | `App.tsx` | Wires the client to the panels. Owns `EditorConfig` state and the debounced send |
 | `engine.ts` | `EngineClient` — socket, auto-reconnect, and the engine's wire types *verbatim* |
-| `config/editor.ts` | `EditorConfig`, defaults, localStorage (`djled.editor`), `toEngineConfig` / `fromEngineConfig`, and `isStatic` / `toRenderSurface` |
+| `config/editor.ts` | `EditorConfig`, defaults, localStorage (`djled.editor`), `toEngineConfig` / `fromEngineConfig`, and `isStatic` / `toRenderSurface` / `toRenderTimeline` |
 | `config/scales.ts` | The two axes. Every gizmo, tick and hit test goes through here |
 | `config/eq.ts` | RBJ cookbook biquads, verbatim |
 | `config/curve.ts` | Intensity curve — cubic Béziers pinned at (0,0)–(1,1) |
 | `config/notes.ts` | MIDI note ↔ position on the frequency axis, and the relabelled ticks |
 | `config/presets.ts` | Slot ↔ function key, and the preset bar's labels. The *only* place 0-based slots meet 1-based keys |
+| `config/timeline.ts` | The loop as the editor authors it: keys, and where an edit lands |
 | `color/oklab.ts` | Port of `engine/src/color/oklab.rs` |
-| `color/surface.ts` | Port of `engine/src/color/surface.rs` |
+| `color/surface.ts` | Port of `engine/src/color/surface.rs`, still and animated |
+| `color/timeline.ts` | Port of `engine/src/color/timeline.rs`, and the shared clock |
 | `color/display.ts` | Screen-side conversion. **Not** the same as the LED path |
 | `color/reference.json` | Generated from the Rust — do not hand-edit |
 | `spectrum/layout.ts` | Pixel geometry for the whole editor block, one coordinate space |
@@ -64,7 +67,7 @@ PresetBar      all twelve shows, always visible; click the live one to rename
 StripPreview   Preview over Engine — the wall, and what it is really doing
 ────────────────────────────────────────────────────────────────
 LayerStack     │  SpectrumEditor + OverlayMenu
-Inspector      │
+Inspector      │  TimelineBar
  (scrolls)     │   (scrolls)
 ```
 
@@ -89,6 +92,24 @@ line worth having on screen permanently.
 
 - **`config/editor.ts` is the only place the wire shape is known.** A protocol
   change lands in `toEngineConfig` / `fromEngineConfig`, never in a component.
+- **The graph edits a *key*, not the layer.** `App` hands `SpectrumEditor` and
+  `Inspector` a `fieldLayer(layer, activeKeyId)` — the whole layer with the
+  selected key's colour field — and folds the result back with `mergeKeyEdit`.
+  That is the only place the editor decides whether an edit belonged to the key
+  (a colour moved, recoloured, confined; the blend radius) or to the layer
+  (everything else, *including* adding and deleting a colour, which applies to
+  every key at once). Every gizmo, hit test and popover keeps reading
+  `layer.colorKeyframes` and knows nothing about keys, which is the whole point.
+- **A colour keyframe's id is shared across every key at the same position.**
+  Two keys are blended by index — a `Keyframe` has no id on the wire — so the
+  editor mints one id per *position* and reuses it, in `fromEngineLayer` and in
+  `LayerStack`'s duplicate. Two keys of different lengths is the one thing that
+  breaks the correspondence, and it is why add and delete are layer-wide.
+- **`layer.colorKeyframes` and `layer.blend` are the first key of the loop.**
+  `timeline.keys` holds only the ones after it, so a layer with no keys is
+  exactly the still layer it always was — no migration, no second code path —
+  and the `surface` on the wire is derived from the same field rather than
+  stored beside it. The first key cannot be deleted or dragged off the start.
 - **`color/surface.ts`, `color/oklab.ts` and `spectrum/render.ts` must stay
   numerically identical to their Rust originals.** If they drift, the Preview
   strip lies about the wall. After touching either side, regenerate
@@ -169,6 +190,16 @@ line worth having on screen permanently.
   send directly, and it is committed on blur or Enter rather than per keystroke.
 - **Gizmo checkboxes are visibility, not bypass.** Nothing in `OverlayMenu`
   touches the signal.
+- **The timeline's playhead is a readout, not a transport.** The loop runs off
+  the wall clock so that this page and the engine agree on the instant without
+  exchanging it; `TimelineBar` writes a transform onto one element from an
+  animation frame rather than holding a position in state, which is the same
+  trick `LayerThumb` uses and for the same reason.
+- **`renderStack` and `renderLayer` take a `now` and default it to the clock.**
+  They are not memoised against it: the preview is already rebuilt on every
+  frame the engine publishes, and offline on every frame the demo spectrum
+  moves, so a loop animates without a clock of its own being added to the React
+  frame path.
 - `MAX_LAYERS` is 12 and `SAMPLE_LENGTHS` is a fixed list, both in
   `config/editor.ts`.
 
@@ -183,13 +214,23 @@ line worth having on screen permanently.
 | `spectrum/layout.test.ts` | The plot's geometry, and that a flat plot collapses the dB axis in `yOfDb` / `dbOfY` and nowhere else |
 | `config/eq.test.ts` | Closed-form properties, not captured values |
 | `config/editor.test.ts`, `config/notes.test.ts` | Round-tripping and the note axis |
+| `config/timeline.test.ts` | Where an edit lands — key or layer — and the wire form of a loop |
 | `config/presets.test.ts` | Slot ↔ function key numbering, and that the bar lists all twelve in hotkey order |
 
-`scripts/stack-smoke.mjs` and `scripts/preset-smoke.mjs` are the only checks
-that cross the real socket. The first sends a two-layer show to a running engine
-and reports the state echo, the per-layer frames and the composited strip. The
-second authors two presets, switches between them and confirms each comes back
-intact. Start the engine first.
+`scripts/stack-smoke.mjs`, `scripts/preset-smoke.mjs` and
+`scripts/timeline-smoke.mjs` are the only checks that cross the real socket. The
+first sends a two-layer show to a running engine and reports the state echo, the
+per-layer frames and the composited strip. The second authors two presets,
+switches between them and confirms each comes back intact. The third sends a
+four-second loop and buckets the frames that come back by where in the loop they
+arrived — the phase never crosses the wire, so reading the same clock from a
+third process is the only way to check the two sides agree about *when*. Start
+the engine first.
+
+Watch out for a browser tab: `EngineClient` reconnects on its own, so an editor
+left open will latch onto whatever engine appears and push its own show at it,
+which looks exactly like a smoke test failing. Run the engine on `--ui-port`
+9011 or close the tab.
 
 The hotkeys themselves cannot be checked from either — they are registered with
 Windows, so pressing them is the test. What `preset-smoke` covers is the switch

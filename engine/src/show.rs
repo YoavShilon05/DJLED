@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::color::intensity::{CurveKind, IntensityConfig, IntensityCurve};
 use crate::color::strip::{LayoutConfig, LedKeyframe};
-use crate::color::SurfaceConfig;
+use crate::color::{SurfaceConfig, Timeline};
 use crate::dsp::eq::EqBand;
 use crate::dsp::mrstft::DEFAULT_HOP;
 use crate::dsp::post::REFERENCE_DECAY;
@@ -70,7 +70,23 @@ pub struct Layer {
     /// handle; they do not share an analyser, so they can still differ in hop,
     /// EQ and decay.
     pub source: Source,
+    /// The colour field this layer paints with when it does not animate.
+    ///
+    /// Where [`Layer::timeline`] has keys they are authoritative and this is
+    /// the *degraded* view of them: the editor keeps it equal to the field at
+    /// the start of the loop, so a peer that knows nothing about timelines —
+    /// an older editor, a preset read by hand — still sees a layer that looks
+    /// like itself rather than an empty one. Nothing reads it while there are
+    /// keys. See [`crate::color::ColorSurface::for_layer`].
     pub surface: SurfaceConfig,
+    /// The same field over time: a loop of whole fields, interpolated. Empty of
+    /// keys for a layer that does not animate, which is what every show written
+    /// before timelines existed parses as — and byte for byte what such a show
+    /// rendered as before.
+    ///
+    /// Per layer, length and all, because two layers have no reason to agree
+    /// about time any more than they do about a decay or a device.
+    pub timeline: Timeline,
     pub eq: Vec<EqBand>,
     pub led_keyframes: Vec<LedKeyframe>,
     pub reverse: bool,
@@ -100,6 +116,7 @@ impl Default for Layer {
             opacity: 1.0,
             source: Source::default_output(),
             surface: SurfaceConfig::default(),
+            timeline: Timeline::default(),
             eq: Vec::new(),
             led_keyframes: Vec::new(),
             reverse: false,
@@ -453,6 +470,53 @@ mod tests {
             ..Layer::default()
         };
         assert_ne!(audio(Some(0)).feed_key(), audio(Some(1)).feed_key());
+    }
+
+    /// A timeline crosses the wire with the rest of the layer, keys and all.
+    #[test]
+    fn parses_a_timeline() {
+        let json = r##"{
+            "layers": [{
+                "id": "l1",
+                "surface": { "keyframes": [{"x":0,"y":1,"color":"#ff0000"}], "sigma": 0.25 },
+                "timeline": {
+                    "enabled": true,
+                    "length": 2.5,
+                    "keys": [
+                        { "id": "k0", "at": 0,
+                          "surface": { "keyframes": [{"x":0,"y":1,"color":"#ff0000"}], "sigma": 0.25 } },
+                        { "id": "k1", "at": 0.5,
+                          "surface": { "keyframes": [{"x":1,"y":1,"color":"#0000ff"}], "sigma": 0.4 } }
+                    ]
+                }
+            }]
+        }"##;
+        let cfg: ShowConfig = serde_json::from_str(json).unwrap();
+        let layer = cfg.base();
+
+        assert!(layer.timeline.animates());
+        assert_eq!(layer.timeline.length(), 2.5);
+        assert_eq!(layer.timeline.keys.len(), 2);
+        assert_eq!(layer.timeline.keys[1].at, 0.5);
+        assert_eq!(layer.timeline.keys[1].surface.sigma, 0.4);
+
+        // The stored surface mirrors the field the loop starts from, which is
+        // what a peer that knows nothing about timelines is shown.
+        assert_eq!(layer.surface.keyframes[0].color, "#ff0000");
+        assert_eq!(layer.timeline.start().unwrap().keyframes[0].color, "#ff0000");
+    }
+
+    /// Every show written before timelines existed is a layer that does not
+    /// animate, rather than one that fails to parse or one that starts moving.
+    #[test]
+    fn a_show_without_a_timeline_does_not_animate() {
+        let cfg: ShowConfig = serde_json::from_str(r#"{"layers":[{"id":"a"}]}"#).unwrap();
+        assert!(cfg.base().timeline.keys.is_empty());
+        assert!(!cfg.base().timeline.animates());
+
+        // And the flat pre-stack shape, for the same reason.
+        let cfg: ShowConfig = serde_json::from_str(r#"{"reverse":true}"#).unwrap();
+        assert!(!cfg.base().timeline.animates());
     }
 
     #[test]

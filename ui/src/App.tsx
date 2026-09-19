@@ -19,6 +19,7 @@ import {
 } from "./config/editor";
 import { DEFAULT_SAMPLE_RATE, EqCurve } from "./config/eq";
 import { presetName } from "./config/presets";
+import { fieldLayer, keyOf, mergeKeyEdit } from "./config/timeline";
 import { HeaderBar } from "./components/HeaderBar";
 import { Inspector } from "./components/Inspector";
 import { LayerStack } from "./components/LayerStack";
@@ -26,6 +27,7 @@ import type { LayerPreview } from "./components/LayerThumb";
 import { OverlayMenu } from "./components/OverlayMenu";
 import { PresetBar } from "./components/PresetBar";
 import { StripPreview } from "./components/StripPreview";
+import { TimelineBar } from "./components/TimelineBar";
 import {
   DEFAULT_URL,
   EngineClient,
@@ -208,7 +210,10 @@ export default function App() {
     [persist],
   );
 
-  /** Every panel except the layer list edits one layer, so they all land here. */
+  /** The layer list and the timeline bar edit the layer itself, so they land
+   *  here. Everything that edits its *colour field* goes through `applyField`
+   *  below, because a field belongs to one key of the loop rather than to the
+   *  layer. */
   const applyLayer = useCallback(
     (layer: EditorLayer) => applyConfig(withLayer(config, layer)),
     [applyConfig, config],
@@ -248,6 +253,37 @@ export default function App() {
 
   const live = status === "connected";
   const layer = activeLayer(config);
+
+  /**
+   * The key the graph is showing, resolved against the layer it belongs to.
+   *
+   * Going through `keyOf` rather than reading the stored id is what makes
+   * selecting a different layer safe: a key id from another layer names nothing
+   * here and falls back to the start of the loop, the same way an unknown layer
+   * id falls back to the top of the stack.
+   */
+  const activeKeyId = keyOf(layer, config.activeKeyId).id;
+
+  const selectKey = useCallback(
+    (id: string) => applyConfig({ ...config, activeKeyId: id }),
+    [applyConfig, config],
+  );
+
+  /**
+   * The layer as the graph and the inspector see it: every property of the
+   * layer, with the colour field of the selected key.
+   *
+   * Editing one is folded back by `mergeKeyEdit`, which is the only place the
+   * editor decides whether an edit belonged to the key or to the layer — a
+   * colour moved belongs to the key, a colour added or deleted belongs to every
+   * key at once. See `config/timeline.ts`.
+   */
+  const field = useMemo(() => fieldLayer(layer, activeKeyId), [layer, activeKeyId]);
+
+  const applyField = useCallback(
+    (edited: EditorLayer) => applyLayer(mergeKeyEdit(layer, activeKeyId, edited)),
+    [applyLayer, layer, activeKeyId],
+  );
 
   const statusById = useMemo(() => {
     if (!live) return NO_STATUS;
@@ -415,8 +451,8 @@ export default function App() {
               preview={preview}
             />
             <Inspector
-              layer={layer}
-              onChange={applyLayer}
+              layer={field}
+              onChange={applyField}
               devices={devices}
               status={activeStatus}
               connected={live}
@@ -441,13 +477,23 @@ export default function App() {
                 <OverlayMenu config={config} onChange={applyConfig} />
               </Group>
               <SpectrumEditor
-                layer={layer}
-                onChange={applyLayer}
+                layer={field}
+                onChange={applyField}
                 gizmos={config.gizmos}
                 frame={spectrum}
                 axis={axis}
                 ledCount={ledCount}
                 sampleRate={sampleRate}
+              />
+              {/* Under the graph, not beside it: the graph shows one key and
+                  this is where that key is chosen, so the two are one block.
+                  It is also in the scrolling half — see the note on the shell
+                  in `ui/CLAUDE.md`. */}
+              <TimelineBar
+                layer={layer}
+                onChange={applyLayer}
+                activeKeyId={activeKeyId}
+                onSelectKey={selectKey}
               />
               <Text size="xs" c="dimmed">
                 Right-click the graph for a colour keyframe ·{" "}
@@ -455,8 +501,8 @@ export default function App() {
                     and no gesture for one — saying otherwise would be the
                     caption describing a different graph. */}
                 {!isStatic(layer) && "double-click for an EQ band · "}
-                right-click the LED track for a sector · click to select,{" "}
-                <Kbd size="xs">Del</Kbd> to remove
+                right-click the LED track for a sector · right-click the timeline for a
+                key · click to select, <Kbd size="xs">Del</Kbd> to remove
               </Text>
             </Stack>
           </Paper>

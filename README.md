@@ -616,12 +616,113 @@ where either one covers and not covered twice.
 
 The UI reimplements this in TypeScript to preview without a round trip.
 `ui/src/color/reference.json` is generated from the Rust and asserted by tests on
-**both** sides, so a divergence fails a test rather than making the editor lie:
+**both** sides, so a divergence fails a test rather than making the editor lie.
+It carries still palettes and, since the timeline below, whole loops sampled at
+several instants — a field that agrees at rest and disagrees in motion is the
+same lie arriving later:
 
 ```bash
 cargo run --manifest-path engine/Cargo.toml --example color_reference \
   > ui/src/color/reference.json
 ```
+
+## The timeline
+
+A layer's colour field can be a *loop* of fields rather than one. Each key is a
+moment in the loop and the whole graph as it stands at that moment — keyframe
+positions, colours, opacities, areas of effect and the blend radius — and
+everything between two keys is interpolated. Lengths are per layer and
+independent, so a slow eight-second colour wash can sit under a two-second
+strobe with neither knowing about the other.
+
+### Why whole fields, and not a track per property
+
+The obvious design is the one every animation package uses: a track per
+animatable value, each with its own keys and its own curve. It was rejected
+because the thing being authored here is a *graph*. The editor already draws one
+colour field at a time and every gesture on it — drag a keyframe, pick a colour,
+widen an area of effect — edits that field as a whole. A key that **is** the
+graph at a moment therefore needs no second editor and no second mental model:
+select a key, and the plot is showing it. Adding one does not mean deciding
+first *which* property is being animated.
+
+The cost is that a value which does not change is stored once per key. At a
+handful of keyframes and a handful of keys that is a few hundred bytes, against
+a preset file that stays readable and an editor that needs no curve sheet.
+
+### The first key is the layer's own field
+
+There is no separate "key 0". `Layer::surface` — the field a layer has always
+had — *is* the start of the loop, and the timeline holds the keys after it.
+Three things follow and all three are the reason:
+
+- A layer with no keys is byte-for-byte the still layer it always was. No
+  migration, no second code path, and no timeline object to author before a
+  colour can be placed. Every preset written before this existed loads and
+  renders unchanged.
+- The `surface` on the wire is a *derivation* of the first key rather than a
+  second copy that could go stale, so an older editor — or somebody reading the
+  preset file — sees a layer that looks like itself rather than an empty one.
+- A loop always has a field at phase zero. The first key cannot be deleted or
+  dragged off the start, which is exactly the guarantee an animation with a
+  wrap-around needs.
+
+### Identity between two keys is position in the list
+
+Blending two fields means knowing which keyframe in one corresponds to which in
+the other, and a keyframe carries no id over the wire — it is deliberately just
+a point and a colour, so a preset stays hand-readable. Index is that
+correspondence, and the editor holds up its end: adding or deleting a colour
+applies to **every** key at once, so the nth keyframe means the same thing in
+all of them. Where a colour *sits*, what colour it is and how far it reaches are
+the key's; the *set* of colours is the layer's.
+
+A hand-edited preset can still hold keys of different lengths, so that is given
+the only sane meaning rather than being rejected: a keyframe authored at one end
+of a span and not the other fades out across it. Appearing or vanishing between
+two frames is a visible pop on the wall, and a parse error would lose the whole
+show.
+
+One value has no obvious midpoint. An area of effect is nullable — "everywhere"
+is not a distance you can be halfway to — so across a span where one end is
+confined and the other is not, `UNCONFINED` (1.45, the diagonal of the unit
+square rounded up, and the top of the editor's radius slider) stands in for it.
+An area of effect opening up therefore grows smoothly to the size of the field
+and only then stops being a limit at all.
+
+### The clock is the wall clock
+
+The phase is seconds since the Unix epoch modulo the loop length, and not an
+uptime or a playhead anybody owns. Three things follow, and all three are why:
+
+- **The engine and the editor agree without exchanging it.** Both read the same
+  machine's clock, so the Preview strip is showing the instant of the loop the
+  wall is actually at. Nothing about the phase is in the protocol.
+- **Nothing restarts a loop.** Switching preset, reloading the editor or
+  restarting the engine does not lurch a show that is already up mid-set.
+- **Two layers given the same length stay in step**, for as long as they exist,
+  with no transport to keep them there.
+
+The cost is that there is no scrubbing: the editor's timeline bar draws a
+playhead but does not own one. That is a real limitation and the trade was made
+deliberately — a head the editor could drag would have to cross the wire, and
+then "what the wall is doing" would depend on which tab last touched it.
+
+One consequence reaches into the run loop. A timeline is the only stage that has
+something new to paint with no new audio, so the engine can no longer sleep
+through an idle source when anything animates; it renders on the display clock
+instead. Without that, a show of loops would freeze the moment the music stopped
+— on the wall only, since the editor draws its preview on its own clock, which
+is the worst possible way for it to fail.
+
+### What is not animated
+
+Sectors, the EQ, the thresholds and the intensity curve are not on the timeline.
+They are not sampled per frame the way the colour field is — they build a strip
+map and a filter chain — so animating them would mean rebuilding an analyser at
+frame rate rather than interpolating a handful of numbers. The colour field is
+where the look lives; that is what moves.
+
 
 ## Protocol
 
@@ -638,8 +739,8 @@ next during the blackout.
 ## Tests
 
 ```bash
-cargo test --manifest-path engine/Cargo.toml   # 281
-cd ui && npm test && npm run typecheck         # 86
+cargo test --manifest-path engine/Cargo.toml   # 312
+cd ui && npm test && npm run typecheck         # 113
 ```
 
 The ones worth knowing about live in `engine/tests/artifacts.rs`: they assert the
@@ -683,6 +784,17 @@ shares the handle rather than opening it twice is not something a mock can
 demonstrate. `ui/src/spectrum/stack.test.ts` makes the same claims about the
 browser's copy of the fold, so the Preview strip cannot quietly disagree with the
 wall.
+
+The timeline is pinned in the same three places for the same three reasons,
+plus one it needed of its own. `color/surface.rs` covers the blend — landing on
+a key exactly, crossing between two, wrapping from the last back to the first,
+and the awkward halves nobody would think to write by hand. `pipeline.rs` drives
+an animated show through `LiveStack` with no audio anywhere and checks the LED
+bytes cross-fade and come back round. `ui/src/spectrum/stack.test.ts` makes the
+same claims of the browser's fold. The one it needed of its own is
+`ui/scripts/timeline-smoke.mjs`: the phase never crosses the wire, so the only
+way to know the two sides agree about *when* is to read the same clock from a
+third process and compare what arrives.
 
 The EQ is asserted against closed-form properties on **both** sides — a bell is
 exactly its gain at centre, a pass filter is −3.01 dB at cutoff when `Q = 1/√2`,

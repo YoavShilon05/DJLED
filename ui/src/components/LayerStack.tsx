@@ -120,16 +120,32 @@ export const LayerStack = memo(function LayerStack({ config, onChange, status, p
       const source = config.layers[index];
       // Every id inside the layer is minted fresh too. Sharing a keyframe id
       // between two layers would have one selection highlight both.
+      //
+      // Colour keyframe ids are the exception that proves it: they are minted
+      // once per *position* and reused across every timeline key, because
+      // position in the list is what the engine blends two keys on and the
+      // editor's rule is that the set of colours belongs to the layer.
+      const colorIds = source.colorKeyframes.map(() => nextId("ck"));
+      const reid = (frames: typeof source.colorKeyframes) =>
+        frames.map((k, i) => ({ ...k, id: colorIds[i] ?? nextId("ck") }));
       const copy: EditorLayer = {
         ...source,
         id: nextId("layer"),
         name: `${source.name} copy`,
         source: { ...source.source },
-        colorKeyframes: source.colorKeyframes.map((k) => ({ ...k, id: nextId("ck") })),
+        colorKeyframes: reid(source.colorKeyframes),
         ledKeyframes: source.ledKeyframes.map((k) => ({ ...k, id: nextId("led") })),
         eq: source.eq.map((b) => ({ ...b, id: nextId("eq") })),
         curve: { ...source.curve },
         midi: { ...source.midi },
+        timeline: {
+          ...source.timeline,
+          keys: source.timeline.keys.map((k) => ({
+            ...k,
+            id: nextId("key"),
+            colorKeyframes: reid(k.colorKeyframes),
+          })),
+        },
       };
       const layers = [...config.layers];
       layers.splice(index + 1, 0, copy);

@@ -24,6 +24,7 @@
  */
 
 import { hexToOklab, type Oklab } from "./oklab";
+import { animates, startOf, timelineLength, type Timeline } from "./timeline";
 
 export interface Keyframe {
   x: number;
@@ -47,6 +48,18 @@ export interface SurfaceConfig {
  * clamped to. Matches `MIN_RADIUS` in the Rust.
  */
 export const MIN_RADIUS = 1e-3;
+
+/**
+ * Largest area of effect worth distinguishing from no limit at all. Matches
+ * `UNCONFINED` in the Rust, and is the same number the editor's radius slider
+ * tops out at.
+ *
+ * The diagonal of the unit square is √2, so a keyframe reaching this far covers
+ * the field from any corner. It exists because a radius is nullable and an
+ * interpolation cannot be halfway to `null`: across a span where one end is
+ * confined and the other is not, "everywhere" stands in as this distance.
+ */
+export const UNCONFINED = 1.45;
 
 /**
  * The outer fraction of a radius spent fading out. Matches `EDGE` in the Rust;
@@ -83,21 +96,221 @@ interface Compiled {
   reach: number | null;
 }
 
+/**
+ * One authored keyframe with its colour parsed, before a radius has become the
+ * reciprocal {@link Compiled} samples with.
+ *
+ * Separate because interpolation happens in authored units: lerping `1 / r`
+ * would make an area of effect open fast and close slowly for no reason anyone
+ * asked for.
+ */
+interface Authored {
+  x: number;
+  y: number;
+  color: Oklab;
+  radius: number | null;
+}
+
+/** The whole field at one authored moment of a loop. */
+interface Moment {
+  /** Where in the loop, 0..1. */
+  at: number;
+  /** The blend radius here, interpolated as sigma rather than as the falloff it
+   *  becomes — for the same reason a radius is. */
+  sigma: number;
+  /** Index-matched across every moment, padded to the longest. `null` where
+   *  this keyframe is not authored here — see {@link ColorSurface.seek}. */
+  points: (Authored | null)[];
+}
+
+function compile(p: Authored): Compiled {
+  return {
+    x: p.x,
+    y: p.y,
+    color: p.color,
+    // Floored rather than allowed to be zero: `1 / 0` then multiplied by a zero
+    // distance is a NaN, and a NaN colour is a pixel nobody can explain.
+    reach: p.radius == null ? null : 1 / Math.max(p.radius, MIN_RADIUS),
+  };
+}
+
+function authored(cfg: SurfaceConfig): Authored[] {
+  return cfg.keyframes.map((k) => ({
+    x: k.x,
+    y: k.y,
+    color: hexToOklab(k.color),
+    radius: k.radius ?? null,
+  }));
+}
+
+function falloffOf(sigma: number): number {
+  const s = Math.max(sigma, 1e-3);
+  return 1 / (2 * s * s);
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
+}
+
+/** A difference of two phases, measured forwards around the loop. */
+function wrapped(delta: number): number {
+  return delta >= 0 ? delta : delta + 1;
+}
+
+/** The same keyframe with its opacity scaled — how one authored at one end of a
+ *  span and absent from the other crosses it. */
+function faded(p: Authored, by: number): Authored {
+  return { ...p, color: { ...p.color, alpha: p.color.alpha * by } };
+}
+
+/**
+ * One keyframe part of the way from where it is authored at one key to where it
+ * is authored at the next.
+ *
+ * Colour interpolates in Oklab, which is the whole reason colours live in Oklab
+ * here: red crossing to blue passes through the purples rather than through the
+ * muddy grey a linear-RGB lerp gives.
+ *
+ * The radius is the one value with no obvious midpoint, because "everywhere" is
+ * not a distance. {@link UNCONFINED} stands in for it, so an area of effect
+ * opening up grows smoothly to the size of the field and only then stops being
+ * a limit at all.
+ */
+function mix(p: Authored, q: Authored, t: number): Authored {
+  let radius: number | null = null;
+  if (p.radius !== null || q.radius !== null) {
+    const r = lerp(p.radius ?? UNCONFINED, q.radius ?? UNCONFINED, t);
+    radius = r >= UNCONFINED ? null : r;
+  }
+  return {
+    x: lerp(p.x, q.x, t),
+    y: lerp(p.y, q.y, t),
+    color: {
+      l: lerp(p.color.l, q.color.l, t),
+      a: lerp(p.color.a, q.color.a, t),
+      b: lerp(p.color.b, q.color.b, t),
+      alpha: lerp(p.color.alpha, q.color.alpha, t),
+    },
+    radius,
+  };
+}
+
 export class ColorSurface {
+  /** The field as it stands right now — the whole of it for a still surface. */
   private points: Compiled[];
   private falloff: number;
+  /** Empty unless this surface animates. Sorted by {@link Moment.at}. */
+  private moments: Moment[] = [];
+  /** Loop length in seconds. Only read when `moments` has something in it. */
+  private length = 0;
 
   constructor(cfg: SurfaceConfig) {
-    this.points = cfg.keyframes.map((k) => ({
-      x: k.x,
-      y: k.y,
-      color: hexToOklab(k.color),
-      // Floored rather than allowed to be zero: `1 / 0` then multiplied by a
-      // zero distance is a NaN, and a NaN colour is a pixel nobody can explain.
-      reach: k.radius == null ? null : 1 / Math.max(k.radius, MIN_RADIUS),
-    }));
-    const sigma = Math.max(cfg.sigma, 1e-3);
-    this.falloff = 1 / (2 * sigma * sigma);
+    this.points = authored(cfg).map(compile);
+    this.falloff = falloffOf(cfg.sigma);
+  }
+
+  /**
+   * The field a layer paints with: its timeline where it has one, and its still
+   * surface where it does not.
+   *
+   * Not two alternatives the caller picks between — the keys are authoritative
+   * wherever there are any, and a layer's stored surface is only the view of
+   * them a peer that does not know about timelines gets. Preferring it would
+   * leave the editor and the engine arguing about which field is live.
+   */
+  static forLayer(surface: SurfaceConfig, timeline: Timeline): ColorSurface {
+    const start = startOf(timeline);
+    if (start === null) return new ColorSurface(surface);
+    // A timeline switched off, or one with a single key, is a still field — the
+    // one the loop would have started from.
+    if (!animates(timeline)) return new ColorSurface(start);
+    return ColorSurface.animated(timeline);
+  }
+
+  /**
+   * Compile a timeline for sampling.
+   *
+   * Every key is padded to the longest one's keyframe count, so the blend in
+   * {@link ColorSurface.seek} is an index walk with no bookkeeping. The keys are
+   * sorted here rather than trusted: a hand-edited preset is under no obligation
+   * to be in order, and an out-of-order key would play the loop backwards.
+   */
+  static animated(timeline: Timeline): ColorSurface {
+    const keys = [...timeline.keys].sort((a, b) => a.at - b.at);
+    const width = keys.reduce((n, k) => Math.max(n, k.surface.keyframes.length), 0);
+
+    const surface = new ColorSurface(keys[0].surface);
+    surface.moments = keys.map((k) => {
+      const points: (Authored | null)[] = authored(k.surface);
+      while (points.length < width) points.push(null);
+      return {
+        at: Number.isFinite(k.at) ? Math.min(1, Math.max(0, k.at)) : 0,
+        sigma: k.surface.sigma,
+        points,
+      };
+    });
+    surface.length = timelineLength(timeline);
+    return surface;
+  }
+
+  /** Whether this surface moves on its own. A still one ignores
+   *  {@link ColorSurface.seek} entirely. */
+  animates(): boolean {
+    return this.moments.length >= 2;
+  }
+
+  /**
+   * Move the field to where the loop has reached at `seconds` — seconds since
+   * the Unix epoch, which is what makes this and the engine agree on the
+   * instant without it crossing the wire.
+   *
+   * Everything authored interpolates: position, colour, opacity, area of effect
+   * and the blend radius. The one case that is not a plain lerp is a keyframe
+   * authored at one end of the span and not the other, which fades its opacity
+   * out across the span. The editor never produces that — it adds and removes a
+   * colour on every key at once — but a hand-edited preset can, and a pop on
+   * the wall is a worse answer than a fade.
+   */
+  seek(seconds: number): void {
+    if (!this.animates()) return;
+
+    const n = this.moments.length;
+    const length = Math.max(this.length, 1e-3);
+    let phase = (seconds % length) / length;
+    if (phase < 0) phase += 1;
+
+    // The bracketing pair, wrapping past the last key back to the first — which
+    // is the whole of what makes this a loop rather than a ramp. A phase before
+    // the first key is still inside that wrap.
+    let a: number;
+    let b: number;
+    if (phase < this.moments[0].at) {
+      a = n - 1;
+      b = 0;
+    } else {
+      a = 0;
+      while (a + 1 < n && this.moments[a + 1].at <= phase) a += 1;
+      b = (a + 1) % n;
+    }
+
+    // Both spans are measured around the loop, so the one that crosses the wrap
+    // is positive rather than a negative span playing its segment backwards.
+    const span = wrapped(this.moments[b].at - this.moments[a].at);
+    const travelled = wrapped(phase - this.moments[a].at);
+    const t = span > 1e-6 ? Math.min(1, Math.max(0, travelled / span)) : 0;
+
+    const from = this.moments[a];
+    const to = this.moments[b];
+    this.falloff = falloffOf(lerp(from.sigma, to.sigma, t));
+
+    this.points.length = 0;
+    for (let i = 0; i < from.points.length; i++) {
+      const start = from.points[i];
+      const end = to.points[i];
+      if (start !== null && end !== null) this.points.push(compile(mix(start, end, t)));
+      else if (start !== null) this.points.push(compile(faded(start, 1 - t)));
+      else if (end !== null) this.points.push(compile(faded(end, t)));
+    }
   }
 
   /**

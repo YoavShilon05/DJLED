@@ -66,6 +66,7 @@ fn render(show: &ShowConfig) -> Vec<[u8; 3]> {
         .iter()
         .map(|l| LayerVisual {
             surface: l.surface.clone(),
+            timeline: l.timeline.clone(),
             layout: l.layout(),
             intensity: l.intensity(),
             opacity: if l.enabled { l.opacity() } else { 0.0 },

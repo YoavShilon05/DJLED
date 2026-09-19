@@ -278,3 +278,79 @@ describe("a layer with no source", () => {
     expect(render(show(base, empty), SILENT)).toEqual(render(show(base), SILENT));
   });
 });
+
+/**
+ * The preview's half of the timeline. The engine's is in
+ * `engine/tests/pipeline.rs`; if the two ever disagree the Preview strip is
+ * showing an instant of the loop the wall is not at.
+ */
+describe("a layer's loop", () => {
+  /** The same layer, with a second key holding a different colour. */
+  function looping(from: string, to: string, length = 4): EditorLayer {
+    const base = flat(from);
+    return {
+      ...base,
+      timeline: {
+        enabled: true,
+        length,
+        keys: [
+          {
+            id: "k1",
+            at: 0.5,
+            blend: base.blend,
+            colorKeyframes: base.colorKeyframes.map((k) => ({ ...k, color: to })),
+          },
+        ],
+      },
+    };
+  }
+
+  const at = (config: EditorConfig, seconds: number) =>
+    renderStack(config, () => LOUD, LEDS, 1, seconds);
+
+  it("paints each key at its own instant", () => {
+    const config = show(looping("#ff2000", "#2040ff"));
+    const start = at(config, 0);
+    const half = at(config, 2);
+
+    expect(start).toEqual(render(show(flat("#ff2000"))));
+    expect(half).toEqual(render(show(flat("#2040ff"))));
+  });
+
+  it("crosses between them rather than switching", () => {
+    const config = show(looping("#ff2000", "#2040ff"));
+    const [start, quarter, half] = [0, 1, 2].map((s) => at(config, s)[LEDS / 2]);
+
+    expect(quarter[2]).toBeGreaterThan(start[2]);
+    expect(quarter[2]).toBeLessThan(half[2]);
+    expect(quarter[0]).toBeLessThan(start[0]);
+    expect(quarter[0]).toBeGreaterThan(half[0]);
+  });
+
+  it("comes back round to where it started", () => {
+    const config = show(looping("#ff2000", "#2040ff"));
+    expect(at(config, 1_750_000_004)).toEqual(at(config, 1_750_000_000));
+  });
+
+  /** Every show that predates timelines has to be deaf to the clock — the same
+   *  promise `a_layer_without_a_timeline_ignores_the_clock` makes on the wall. */
+  it("leaves a layer without keys alone", () => {
+    const config = show(flat("#ff2000"));
+    const start = at(config, 0);
+    for (const seconds of [0.5, 2, 1_750_000_000]) {
+      expect(at(config, seconds)).toEqual(start);
+    }
+  });
+
+  /** Lengths are per layer and independent, which is the whole reason the
+   *  timeline lives on a layer rather than on the show. */
+  it("runs two layers on their own clocks", () => {
+    const fast = show(looping("#00ff00", "#ffffff", 2));
+    const slow = show(looping("#ff2000", "#2040ff", 8));
+
+    // Two seconds is a whole loop for one of them and a quarter of one for the
+    // other, which is the whole reason a length lives on a layer.
+    expect(at(fast, 2)).toEqual(at(fast, 0));
+    expect(at(slow, 2)).not.toEqual(at(slow, 0));
+  });
+});

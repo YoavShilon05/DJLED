@@ -224,6 +224,15 @@ impl LiveStack {
                 } else {
                     l.config.surface.clone()
                 },
+                // The same projection, applied to every key of the loop. A
+                // still colour that animates is exactly the combination that
+                // needs it: nothing to read a level from, and a field that
+                // still has to move.
+                timeline: if l.analysis.is_static() {
+                    l.config.timeline.flattened()
+                } else {
+                    l.config.timeline.clone()
+                },
                 layout: l.config.layout(),
                 intensity: if l.analysis.is_static() {
                     IntensityConfig::pass_through()

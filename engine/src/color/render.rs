@@ -30,6 +30,7 @@ use super::intensity::IntensityConfig;
 use super::oklab::LinearRgb;
 use super::strip::{LayoutConfig, StripMap};
 use super::surface::{ColorSurface, SurfaceConfig};
+use super::timeline::Timeline;
 
 #[derive(Clone, Debug)]
 pub struct RenderConfig {
@@ -75,7 +76,11 @@ pub struct Geometry {
 /// in strip space.
 #[derive(Clone, Debug)]
 pub struct LayerVisual {
+    /// The still field, read only when the timeline has no keys of its own.
     pub surface: SurfaceConfig,
+    /// The same field over time. Its keys win wherever there are any — see
+    /// [`ColorSurface::for_layer`].
+    pub timeline: Timeline,
     pub layout: LayoutConfig,
     pub intensity: IntensityConfig,
     /// Master opacity for the layer, multiplied into every sample's own.
@@ -93,7 +98,14 @@ impl LayerVisual {
         intensity: IntensityConfig,
         centers: Vec<f32>,
     ) -> Self {
-        Self { surface, layout, intensity, opacity: 1.0, centers }
+        Self {
+            surface,
+            timeline: Timeline::default(),
+            layout,
+            intensity,
+            opacity: 1.0,
+            centers,
+        }
     }
 }
 
@@ -106,7 +118,7 @@ struct CompiledLayer {
 impl CompiledLayer {
     fn new(visual: &LayerVisual, points: usize, leds: usize) -> Result<Self, String> {
         Ok(Self {
-            surface: ColorSurface::new(&visual.surface)?,
+            surface: ColorSurface::for_layer(&visual.surface, &visual.timeline)?,
             map: StripMap::new(
                 visual.layout.clone(),
                 visual.intensity,
@@ -189,6 +201,29 @@ impl Renderer {
 
     pub fn layer_count(&self) -> usize {
         self.layers.len()
+    }
+
+    /// Whether anything in the stack moves on its own.
+    ///
+    /// The run loop asks because a timeline is the one thing here that has
+    /// something new to draw with no new audio: every other stage is a function
+    /// of levels that have not changed. Without this a show of animated layers
+    /// would freeze the moment the music stopped — on the wall only, since the
+    /// editor draws its preview on its own clock.
+    pub fn animates(&self) -> bool {
+        self.layers.iter().any(|l| l.surface.animates())
+    }
+
+    /// Move every animated layer to where its own loop has reached.
+    ///
+    /// `seconds` is seconds since the Unix epoch rather than an uptime, so the
+    /// editor — reading the same machine's clock — previews the same instant of
+    /// the loop without the phase ever crossing the wire. Lengths are per layer,
+    /// so each one wraps on its own. See [`super::timeline`].
+    pub fn seek(&mut self, seconds: f64) {
+        for layer in &mut self.layers {
+            layer.surface.seek(seconds);
+        }
     }
 
     pub fn points(&self) -> usize {
@@ -597,6 +632,7 @@ mod tests {
             (0..BANDS).map(|i| norm_to_hz(i as f32 / (BANDS - 1) as f32)).collect();
         LayerVisual {
             surface: surface.clone(),
+            timeline: Timeline::default(),
             layout: LayoutConfig::spanning(150),
             intensity: IntensityConfig::pass_through(),
             opacity,

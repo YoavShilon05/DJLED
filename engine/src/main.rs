@@ -4,7 +4,7 @@
 //! whole pipeline can be watched in the terminal before the Arduino is wired up.
 
 use std::io::Write;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -316,6 +316,18 @@ fn explicit_source(args: &Args) -> Result<Option<Source>> {
         return Ok(None);
     }
     select_source(args).map(Some)
+}
+
+/// Seconds since the Unix epoch, which is what every layer's loop is a
+/// function of.
+///
+/// Deliberately not an uptime. The editor reads the same machine's clock with
+/// `Date.now()`, so both sides land on the same instant of the same loop with
+/// nothing exchanged, and restarting the engine or switching preset does not
+/// lurch a show that is already up on the wall. A clock before the epoch is not
+/// a real machine, so it is given the start of the loop rather than an error.
+fn epoch_seconds() -> f64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
 
 /// Build the renderer for whatever the stack currently produces.
@@ -664,13 +676,27 @@ fn run(
             }
         }
 
-        if !stack.poll() {
+        // A timeline has something new to paint with no new audio at all —
+        // it is the one stage that is a function of the clock rather than of
+        // levels — so an idle source must not park it. Rate-limited to the
+        // display clock while nothing is arriving, since there is no analysis
+        // frame to pace against and the alternative is a spin.
+        let animating = renderer.animates();
+        if !stack.poll() && !(animating && last_draw.elapsed() >= frame) {
             // A source is genuinely idle when nothing is playing through it, and
             // loopback in particular delivers nothing at all rather than
             // silence. Not an error, so the loop just comes back around — with
             // the sleep keeping it off a core while it waits.
             std::thread::sleep(Duration::from_millis(2));
             continue;
+        }
+
+        // Before the render and after the commands, so an edit that arrived
+        // this pass is animated from the instant it landed. The wall clock
+        // rather than an uptime, so the editor previews the same instant of the
+        // loop without the phase crossing the wire — see `color::timeline`.
+        if animating {
+            renderer.seek(epoch_seconds());
         }
 
         let pixels = renderer.render_stack(&stack.all_levels());

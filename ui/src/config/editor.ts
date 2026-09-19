@@ -24,11 +24,20 @@
  */
 
 import { DEFAULT_SURFACE, type SurfaceConfig } from "../color/surface";
+import { flattenTimeline, type Timeline } from "../color/timeline";
 import type { InputSource, LayerConfig, MidiConfig, ShowConfig } from "../engine";
 import type { CurveConfig } from "./curve";
 import type { EqBand } from "./eq";
 import { DEFAULT_HIGH_NOTE, DEFAULT_LOW_NOTE, noteRange } from "./notes";
 import { DB_MAX, DB_MIN, dbToNorm, hzToNorm, normToDb, normToHz } from "./scales";
+import {
+  clampKey,
+  emptyEditorTimeline,
+  safeLength,
+  toEngineTimeline,
+  type EditorTimeline,
+  type KeyView,
+} from "./timeline";
 
 /** A colour authored at a point on the spectrum plot. */
 export interface ColorKeyframe {
@@ -136,6 +145,16 @@ export interface EditorLayer {
    *  sigma. One number for the whole layer, which is why confining a single
    *  colour is {@link ColorKeyframe.radius} and not this. */
   blend: number;
+  /**
+   * The colour field over time: a loop of whole fields, per layer and with its
+   * own length.
+   *
+   * {@link EditorLayer.colorKeyframes} and {@link EditorLayer.blend} above
+   * *are* the key at the start of the loop, and this holds only the ones after
+   * it — so a layer with no keys is exactly the still layer it always was,
+   * with no migration and no second code path. See `config/timeline.ts`.
+   */
+  timeline: EditorTimeline;
 }
 
 export interface EditorConfig {
@@ -143,6 +162,16 @@ export interface EditorConfig {
   layers: EditorLayer[];
   /** Where edits land. Falls back to the top layer when it names nothing real. */
   activeLayerId: string;
+  /**
+   * Which timeline key the graph is showing and editing. Empty names the key at
+   * the start of the loop, which is the only one a still layer has.
+   *
+   * Editor-only, like {@link GizmoFlags}: the engine runs the whole loop and
+   * has no notion of one key being selected. Kept here rather than in the plot
+   * so it survives a reload, and an id naming nothing falls back to the start —
+   * which is what makes selecting a different layer safe.
+   */
+  activeKeyId: string;
   gizmos: GizmoFlags;
 }
 
@@ -229,6 +258,9 @@ export function defaultLayer(name: string): EditorLayer {
     // either side of each note. Matches the engine's own defaults.
     midi: { lowNote: DEFAULT_LOW_NOTE, highNote: DEFAULT_HIGH_NOTE, spread: 1, sustain: true },
     blend: DEFAULT_SURFACE.sigma,
+    // No keys: a fresh layer is a still one, and renders byte for byte as a
+    // show that predates timelines does.
+    timeline: emptyEditorTimeline(),
   };
 }
 
@@ -260,6 +292,7 @@ export const DEFAULT_CONFIG: EditorConfig = (() => {
   return {
     layers: [layer],
     activeLayerId: layer.id,
+    activeKeyId: "",
     gizmos: {
       thresholds: true,
       colorKeyframes: true,
@@ -289,9 +322,18 @@ export function withLayer(config: EditorConfig, layer: EditorLayer): EditorConfi
  * square, with x on the log frequency axis and y the band's level.
  */
 export function toSurface(layer: EditorLayer): SurfaceConfig {
+  return surfaceOf(layer.colorKeyframes, layer.blend);
+}
+
+/**
+ * The same thing for one timeline key, which has a colour field of its own and
+ * none of the rest of a layer. Split out so the wire form of a key and the wire
+ * form of a layer cannot drift apart.
+ */
+export function surfaceOf(keyframes: ColorKeyframe[], blend: number): SurfaceConfig {
   return {
-    sigma: layer.blend,
-    keyframes: layer.colorKeyframes.map((k) => ({
+    sigma: blend,
+    keyframes: keyframes.map((k) => ({
       x: hzToNorm(k.hz),
       y: dbToNorm(k.db),
       color: k.color,
@@ -301,6 +343,22 @@ export function toSurface(layer: EditorLayer): SurfaceConfig {
       ...(k.radius === null ? {} : { radius: k.radius }),
     })),
   };
+}
+
+/** The wire form of this layer's loop. Empty of keys when nothing animates. */
+export function toTimeline(layer: EditorLayer): Timeline {
+  return toEngineTimeline(layer, (key: KeyView) => surfaceOf(key.colorKeyframes, key.blend));
+}
+
+/**
+ * The loop as it is actually *read*, which for a still layer is not the one
+ * that is stored: every key is projected onto the single row such a layer is
+ * sampled at. The whole-timeline form of {@link toRenderSurface}, and it has to
+ * stay one — this is what the Preview strip draws.
+ */
+export function toRenderTimeline(layer: EditorLayer): Timeline {
+  const timeline = toTimeline(layer);
+  return isStatic(layer) ? flattenTimeline(timeline) : timeline;
 }
 
 /**
@@ -336,7 +394,11 @@ function toEngineLayer(layer: EditorLayer): LayerConfig {
     enabled: layer.enabled,
     opacity: layer.opacity,
     source: layer.source,
+    // Derived from the first key rather than stored beside it, so the mirror an
+    // older peer reads can never disagree with the keys it does not know about.
+    // See `LayerConfig.surface`.
     surface: toSurface(layer),
+    timeline: toTimeline(layer),
     eq: layer.eq,
     ledKeyframes: layer.ledKeyframes,
     reverse: layer.reverse,
@@ -357,6 +419,25 @@ export function toEngineConfig(config: EditorConfig): ShowConfig {
 
 function fromEngineLayer(layer: LayerConfig): EditorLayer {
   const base = defaultLayer(layer.name || "Layer");
+  // The keys are authoritative wherever there are any — the stored surface is
+  // only the view of them a peer that does not understand timelines gets, and
+  // preferring it would quietly discard the loop.
+  const wire = [...(layer.timeline?.keys ?? [])].sort((a, b) => a.at - b.at);
+  const fields = wire.length > 0 ? wire.map((k) => k.surface) : [layer.surface];
+  // One id per keyframe *position*, shared across every key, because position
+  // in the list is the correspondence the engine blends on and the editor's own
+  // rule is that the set of colours belongs to the layer.
+  const width = fields.reduce((n, f) => Math.max(n, f.keyframes.length), 0);
+  const keyframeIds = Array.from({ length: width }, () => nextId("ck"));
+  const toKeyframes = (surface: SurfaceConfig): ColorKeyframe[] =>
+    surface.keyframes.map((k, i) => ({
+      id: keyframeIds[i],
+      hz: normToHz(k.x),
+      db: normToDb(k.y),
+      color: k.color,
+      radius: typeof k.radius === "number" ? k.radius : null,
+    }));
+
   return {
     ...base,
     id: layer.id || base.id,
@@ -364,14 +445,18 @@ function fromEngineLayer(layer: LayerConfig): EditorLayer {
     enabled: layer.enabled !== false,
     opacity: typeof layer.opacity === "number" ? layer.opacity : 1,
     source: layer.source ?? { ...DEFAULT_SOURCE },
-    blend: layer.surface.sigma,
-    colorKeyframes: layer.surface.keyframes.map((k) => ({
-      id: nextId("ck"),
-      hz: normToHz(k.x),
-      db: normToDb(k.y),
-      color: k.color,
-      radius: typeof k.radius === "number" ? k.radius : null,
-    })),
+    blend: fields[0].sigma,
+    colorKeyframes: toKeyframes(fields[0]),
+    timeline: {
+      enabled: layer.timeline?.enabled !== false,
+      length: safeLength(layer.timeline?.length ?? base.timeline.length),
+      keys: wire.slice(1).map((k) => ({
+        id: nextId("key"),
+        at: k.at,
+        colorKeyframes: toKeyframes(k.surface),
+        blend: k.surface.sigma,
+      })),
+    },
     // Ids are the editor's own bookkeeping and never cross the wire, so they
     // are minted fresh rather than expected back.
     eq: layer.eq.map((b) => ({ ...b, id: nextId("eq") })),
@@ -431,6 +516,10 @@ export function loadConfig(): EditorConfig {
       activeLayerId: stack.some((l) => l.id === parsed.activeLayerId)
         ? (parsed.activeLayerId as string)
         : stack[stack.length - 1].id,
+      // Not validated against anything: a key id naming nothing falls back to
+      // the start of the loop wherever it is read, which is the same rule that
+      // makes selecting a different layer safe.
+      activeKeyId: typeof parsed.activeKeyId === "string" ? parsed.activeKeyId : "",
       gizmos: { ...DEFAULT_CONFIG.gizmos, ...parsed.gizmos },
     };
   } catch {
@@ -461,6 +550,10 @@ function sanitiseLayer(stored: Partial<EditorLayer>): EditorLayer {
     colorKeyframes: Array.isArray(stored.colorKeyframes)
       ? stored.colorKeyframes.map((k) => ({ ...k, radius: k.radius ?? null }))
       : base.colorKeyframes,
+    // A stored layer with no timeline is one written before loops existed, and
+    // no keys is exactly what it meant. Anything structurally wrong falls back
+    // the same way rather than discarding the layer.
+    timeline: sanitiseTimeline(stored.timeline, base.timeline),
     // Sectors are not the same: a layer with no sectors reaches no LED at all,
     // and the engine would substitute a spanning layout anyway.
     ledKeyframes:
@@ -490,6 +583,34 @@ function sanitiseLayers(layers: EditorLayer[]): EditorLayer[] {
     return id === layer.id ? layer : { ...layer, id };
   });
   return out.length ? out : [defaultLayer("Layer 1")];
+}
+
+/**
+ * A stored timeline, made safe to run.
+ *
+ * Keys are clamped strictly inside the loop and sorted, because the start of it
+ * is the layer's own field and a key sitting on top of it would be a span of
+ * zero length. A key with no colours is legal — that is a moment the layer
+ * paints nothing, which composes with the stack rather than blanking it.
+ */
+function sanitiseTimeline(
+  stored: Partial<EditorTimeline> | undefined,
+  fallback: EditorTimeline,
+): EditorTimeline {
+  if (!stored || !Array.isArray(stored.keys)) return fallback;
+  return {
+    enabled: stored.enabled !== false,
+    length: safeLength(typeof stored.length === "number" ? stored.length : fallback.length),
+    keys: stored.keys
+      .filter((k) => k && typeof k.id === "string" && Array.isArray(k.colorKeyframes))
+      .map((k) => ({
+        id: k.id,
+        at: clampKey(k.at),
+        colorKeyframes: k.colorKeyframes.map((f) => ({ ...f, radius: f.radius ?? null })),
+        blend: typeof k.blend === "number" ? k.blend : DEFAULT_SURFACE.sigma,
+      }))
+      .sort((a, b) => a.at - b.at),
+  };
 }
 
 function sanitiseSource(stored: InputSource | undefined): InputSource {

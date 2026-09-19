@@ -29,7 +29,8 @@ the primary documentation and are usually more current than any summary here.
 | `dsp/fastpath.rs` | Gated parallel bandpass so bass attacks aren't stuck behind a long window |
 | `dsp/post.rs` | Floor tracking → dB → tilt → AGC → range map → ballistics → smoothing |
 | `dsp/eq.rs` | RBJ cookbook biquads evaluated as `\|H(e^jw)\|`, summed in dB |
-| `color/surface.rs` | The 2D keyframe field over (strip position × intensity) |
+| `color/surface.rs` | The 2D keyframe field over (strip position × intensity), still and animated |
+| `color/timeline.rs` | That field over time: a per-layer looping stack of them |
 | `color/oklab.rs` | Oklab ↔ linear RGB, and what opacity means when compositing |
 | `color/intensity.rs` | Level → brightness: threshold, clamp, curve |
 | `color/strip.rs` | Where each frequency lands: LED sectors, reverse, mirror |
@@ -57,6 +58,11 @@ the primary documentation and are usually more current than any summary here.
 5. `color/render.rs` samples each layer at its own control points and folds
    bottom → top with `source-over` in linear light. Master brightness is applied
    *after* the fold — it is the power budget, not a layer property.
+6. Before that fold, `Renderer::seek` moves every animated layer's field to
+   where its own loop has reached. It takes seconds since the epoch, not an
+   uptime — the editor reads the same clock, so both sides land on the same
+   instant with nothing exchanged. Seeking after rendering would show every
+   frame one behind.
 
 ## Key constants
 
@@ -71,6 +77,8 @@ the primary documentation and are usually more current than any summary here.
 | `MAX_PAYLOAD` / `OVERHEAD` | 255 / 5 → `max_bands()` = 85 | `link/protocol.rs` |
 | `DEFAULT_PORT` (UI) | 9001 | `ui.rs` |
 | `SLOTS` | 12 — fixed by the keyboard, not chosen | `presets.rs` |
+| `UNCONFINED` | 1.45 — what `radius: None` stands in as when interpolated | `color/surface.rs` |
+| `MIN_LENGTH` / `MAX_LENGTH` | 0.05 s / 600 s | `color/timeline.rs` |
 | `WRITE_DELAY` | 750 ms between preset writes | `presets.rs` |
 
 ## Rules that are easy to break
@@ -100,6 +108,23 @@ the primary documentation and are usually more current than any summary here.
   88 semitones). A config edit never can.
 - **A hidden layer is skipped outright**, not composited at zero. Muting is a
   real saving; that is the point.
+- **A timeline's keys win over `Layer::surface` wherever there are any.**
+  `ColorSurface::for_layer` decides this once; nothing else should ask. The
+  stored surface is the *degraded* view of the first key — what an editor that
+  predates timelines, or somebody reading the preset file, is shown — and
+  preferring it would leave two peers that both understand loops arguing about
+  which field is live.
+- **`ColorSurface::seek` must not allocate.** It runs once per layer per frame
+  and refills a buffer it already owns; `seeking_reuses_its_buffer` is there to
+  fail if that changes. Interpolation happens in *authored* units — sigma, not
+  falloff; radius, not `1/r` — because lerping the reciprocals makes an area of
+  effect open fast and close slowly for no reason anybody asked for.
+- **`main.rs` cannot sleep through an idle source while anything animates.** A
+  timeline is the one stage that is a function of the clock rather than of
+  levels, so the idle branch now renders on the display clock when
+  `renderer.animates()`. Without it a show of loops freezes the moment the music
+  stops, on the wall only — the editor's preview has its own clock and would
+  keep running, which is the worst way for this to fail.
 - **Applying a `ShowConfig` must stay cheap.** The editor sends the whole config
   on every pointer move. Each stage compares against what it already holds and
   rebuilds only what changed; don't add unconditional reallocation to an apply
@@ -127,14 +152,14 @@ the primary documentation and are usually more current than any summary here.
 
 ## Tests
 
-281 total: 228 unit (in-module `#[cfg(test)]`) + 53 integration.
+312 total: 252 unit (in-module `#[cfg(test)]`) + 60 integration.
 
 | File | What it defends |
 |---|---|
 | `tests/artifacts.rs` (8) | The reported bugs stay fixed. One independently computes what a naive analyser would produce, so the suppression tests aren't just asserting nothing happens |
-| `tests/pipeline.rs` (25) | Every editor control's effect reaches the LED bytes, including a show of still layers driven through `LiveStack` with no device in the chain. **Add a row here for any new control** |
+| `tests/pipeline.rs` (30) | Every editor control's effect reaches the LED bytes, including a show of still layers driven through `LiveStack` with no device in the chain. **Add a row here for any new control** |
 | `tests/midi_pipeline.rs` (12) | The note path end to end, delivered as bytes — the only MIDI coverage that runs without a port |
-| `tests/color_reference.rs` (4) | The Rust side of the TS parity fixture |
+| `tests/color_reference.rs` (6) | The Rust side of the TS parity fixture, stills and loops |
 | `tests/presets.rs` (4) | A preset stored, reloaded from disk, and rendered — the bytes have to match the show it was saved from |
 
 Layer behaviour is pinned in three places on purpose: `color/render.rs` (the
