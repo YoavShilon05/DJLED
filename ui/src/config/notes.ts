@@ -23,6 +23,23 @@ export const MAX_NOTE = 127;
 export const DEFAULT_LOW_NOTE = 21;
 export const DEFAULT_HIGH_NOTE = 108;
 
+/**
+ * The engine's decay range defaults, in milliseconds: what a note-off asks for
+ * at velocity 0 and at velocity 127.
+ *
+ * A release velocity lands linearly between the two, so these are the ends of a
+ * range rather than release times. The floor is zero because an instant cut is
+ * the obvious reading of a release velocity of 0 — it is there so that does not
+ * have to be the only bottom.
+ */
+export const DEFAULT_MIN_DECAY_MS = 0;
+export const DEFAULT_MAX_DECAY_MS = 2000;
+
+/** As far as the slider goes. Past a few seconds a fade stops reading as a note
+ *  and starts reading as a stuck one; the engine accepts more from a
+ *  hand-edited preset rather than rejecting it. */
+export const MAX_DECAY_CEILING = 8000;
+
 /** Matches the engine's `MIN_SPAN`: below an octave the strip stops reading as
  *  pitch at all. */
 export const MIN_NOTE_SPAN = 12;
@@ -96,6 +113,24 @@ export function noteRange(low: number, high: number): [number, number] {
   const lo = Math.min(Math.min(a, b), MAX_NOTE - MIN_NOTE_SPAN);
   const hi = Math.min(Math.max(Math.max(a, b), lo + MIN_NOTE_SPAN), MAX_NOTE);
   return [Math.max(MIN_NOTE, lo), hi];
+}
+
+/**
+ * The decay range as the engine will read it: ordered, and inside the slider.
+ *
+ * Ordered rather than rejected, exactly as [`noteRange`] treats an inverted
+ * note range — the two ends of a range stored the wrong way round still mean a
+ * range, and a harder note-off should never be the one that vanishes first.
+ */
+export function decayRange(
+  min: number | undefined,
+  max: number | undefined,
+): { minDecayMs: number; maxDecayMs: number } {
+  const end = (v: number | undefined, fallback: number) =>
+    Number.isFinite(v) ? Math.min(MAX_DECAY_CEILING, Math.max(0, v as number)) : fallback;
+  const lo = end(min, DEFAULT_MIN_DECAY_MS);
+  const hi = end(max, DEFAULT_MAX_DECAY_MS);
+  return { minDecayMs: Math.min(lo, hi), maxDecayMs: Math.max(lo, hi) };
 }
 
 /** Note name with octave, middle C (60) being C4. */

@@ -22,7 +22,7 @@ the primary documentation and are usually more current than any summary here.
 | `source.rs` | `Source` (what to listen to, including nothing) and `LiveSource` (the open thing + its analyser) |
 | `capture.rs` | WASAPI via cpal: loopback of a render endpoint, or a capture endpoint |
 | `midi/mod.rs` | WinMM port open, callback → SPSC ring, message parsing |
-| `midi/notes.rs` | Notes → levels on the frequency axis. Envelope, sustain, note range |
+| `midi/notes.rs` | Notes → levels on the frequency axis. Envelope (per-note release, from note-off velocity across the decay range), sustain, note range |
 | `engine.rs` | `Engine` — the analysis chain assembled: DC block → STFT tiers → fast path → post |
 | `dsp/bands.rs` | Bark-like band layout, and the FFT size assigned to each band |
 | `dsp/mrstft.rs` | Runs the tier ladder, merges to per-band magnitudes |

@@ -182,6 +182,18 @@ trip.
   application at a time. Two layers on one keyboard share the handle
   (`Layer::feed_key` drops the channel for MIDI, keeps it for audio). Never open
   a MIDI port per layer.
+- **A note-off's velocity is its fade, and the other spelling of note-off has
+  none.** Release time is per note, latched at note-off from that message's
+  velocity, read across `MidiConfig::decay_range` — `min_decay_ms` at 0,
+  `max_decay_ms` at 127, linear between, and both ends ordered rather than
+  rejected the way an inverted note range is. So a controller that senses
+  release now shapes the fade, and one that does not sends the spec's 64 for
+  every key and lands in the middle of the range.
+  The exception is load-bearing: a note-on at velocity 0 *is* note-off, and that
+  byte is the spelling rather than a velocity, so it falls back to the layer's
+  `decay` — read literally it would cut every sequencer's notes dead. Pinned by
+  `a_zero_velocity_note_on_releases_at_the_layer_decay` and, to the LED bytes,
+  `release_velocity_decides_how_long_a_note_stays_on_the_wall`.
 - **A MIDI channel is a colour, not a filter.** Every channel reaches every MIDI
   layer and is told apart by `MidiConfig::channel_colors` — sixteen sRGB hex
   strings, authored on the 4×4 grid in `ChannelColors.tsx` under Notes. Three

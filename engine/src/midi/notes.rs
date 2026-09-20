@@ -31,8 +31,18 @@
 //!
 //! A note holds at its velocity while the key is down and releases when it
 //! comes up, with the sustain pedal (CC64) latching notes exactly as a piano
-//! does. The release uses the editor's decay control, mapped through the same
-//! curve the audio ballistics use, so one slider means one thing in both modes.
+//! does. How *fast* it releases is the note-off's own velocity, read across the
+//! layer's decay range: 0 takes "Min decay time", 127 takes "Max decay time",
+//! and between them it is linear in velocity. A controller that plays release
+//! velocity therefore shapes the fade the way it shapes the strike, and a floor
+//! above zero is what lets it do that without the softest note-off snapping —
+//! an instant cut is a choice, not the only bottom of the range.
+//!
+//! A note-on at velocity 0 is the other spelling of note-off, and it carries no
+//! release velocity at all — that byte *is* the spelling. Those fall back to
+//! the editor's decay control, mapped through the same curve the audio
+//! ballistics use, so one slider still means one thing in both modes for every
+//! sequencer that speaks that dialect.
 
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +68,19 @@ pub const MIN_SPAN: u8 = 12;
 /// Rise time to a struck note. Fast enough to feel instant, slow enough that a
 /// hard velocity does not read as a single-frame flicker.
 const ATTACK_MS: f32 = 6.0;
+
+/// Longest a note-off can ask a note to take, before the editor changes it.
+/// Two seconds is a long fade on a wall without reading as a stuck note.
+pub const DEFAULT_MAX_DECAY_MS: f32 = 2000.0;
+
+/// Shortest, at the other end of the same range. Zero by default, because an
+/// instant cut is what a release velocity of 0 most obviously means — the floor
+/// exists so it does not *have* to be that.
+pub const DEFAULT_MIN_DECAY_MS: f32 = 0.0;
+
+/// As long as either end of the range is allowed to be. Hostile numbers are
+/// clamped rather than trusted, for the same reason [`MidiConfig::range`] is.
+const DECAY_CEILING_MS: f32 = 20_000.0;
 
 /// Release at the reference decay, in the middle of the audio path's tuned
 /// bass/treble spread. Pitch does not divide into bass and treble here — a note
@@ -125,6 +148,12 @@ pub struct MidiConfig {
     /// Honour the sustain pedal (CC64). Off makes a held pedal do nothing,
     /// which is what you want when a controller sends one by accident.
     pub sustain: bool,
+    /// What a note-off at velocity 0 asks for, in milliseconds. The bottom of
+    /// the range, not the release time: 0 is an instant cut.
+    pub min_decay_ms: f32,
+    /// What a note-off at velocity 127 asks for. The top of the same range —
+    /// a note-off lands linearly between the two on its velocity.
+    pub max_decay_ms: f32,
     /// One colour per channel — see [`default_channel_colors`]. A short list is
     /// legal and a missing entry simply does not tint, which is what keeps a
     /// hand-edited preset naming two channels from being an error.
@@ -138,6 +167,8 @@ impl Default for MidiConfig {
             high_note: DEFAULT_HIGH,
             spread: 1.0,
             sustain: true,
+            min_decay_ms: DEFAULT_MIN_DECAY_MS,
+            max_decay_ms: DEFAULT_MAX_DECAY_MS,
             channel_colors: default_channel_colors(),
         }
     }
@@ -166,6 +197,29 @@ impl MidiConfig {
 
     pub fn spread(&self) -> f32 {
         if self.spread.is_finite() { self.spread.clamp(0.0, 12.0) } else { 0.0 }
+    }
+
+    /// The decay range as it can actually be used: ordered, and inside the
+    /// ceiling. Ordered rather than rejected, exactly as [`Self::range`] treats
+    /// an inverted note range — a hand-edited preset with the ends the wrong
+    /// way round means a range, and a harder note-off should still not be the
+    /// one that vanishes first. A NaN falls back to the default, because an
+    /// envelope that never falls is a stuck note.
+    pub fn decay_range(&self) -> (f32, f32) {
+        let end = |v: f32, fallback: f32| {
+            if v.is_finite() { v.clamp(0.0, DECAY_CEILING_MS) } else { fallback }
+        };
+        let lo = end(self.min_decay_ms, DEFAULT_MIN_DECAY_MS);
+        let hi = end(self.max_decay_ms, DEFAULT_MAX_DECAY_MS);
+        if lo <= hi { (lo, hi) } else { (hi, lo) }
+    }
+
+    /// Release time a note-off at `velocity` asks for: linear across
+    /// [`Self::decay_range`], so half velocity is halfway between the ends
+    /// rather than half the top.
+    pub fn release_ms_for(&self, velocity: u8) -> f32 {
+        let (lo, hi) = self.decay_range();
+        lo + (hi - lo) * (velocity.min(127) as f32 / 127.0)
     }
 }
 
@@ -217,7 +271,14 @@ pub struct NoteEngine {
     eq_bands: Vec<EqBand>,
     /// Half a Gaussian; index 0 is the note itself.
     weights: Vec<f32>,
-    release_ms: f32,
+    /// What the editor's decay control asks for: the release of a note whose
+    /// note-off carried no velocity to ask with.
+    default_release_ms: f32,
+    /// Release time per note, latched at note-off from that message's velocity.
+    /// Per note rather than per layer because two keys lifted differently are
+    /// two different fades, and a chord released one finger at a time is the
+    /// whole point of the control.
+    release_ms: [f32; NOTE_COUNT],
 
     out_of_range: u32,
 }
@@ -243,7 +304,8 @@ impl NoteEngine {
             eq: vec![0.0; points],
             eq_bands: Vec::new(),
             weights: kernel(cfg.spread()),
-            release_ms: BASE_RELEASE_MS * decay_scale(decay),
+            default_release_ms: BASE_RELEASE_MS * decay_scale(decay),
+            release_ms: [BASE_RELEASE_MS * decay_scale(decay); NOTE_COUNT],
             out_of_range: 0,
         };
         engine.resample_eq();
@@ -300,7 +362,11 @@ impl NoteEngine {
             Message::NOTE_ON if msg.data2 > 0 => {
                 self.note_on(msg.data1, msg.data2, msg.channel())
             }
-            Message::NOTE_ON | Message::NOTE_OFF => self.note_off(msg.data1),
+            // A note-on spelling a note-off has no release velocity to read —
+            // its second byte is the spelling, not a velocity — so it releases
+            // at the layer's decay rather than instantly.
+            Message::NOTE_ON => self.note_off(msg.data1, None),
+            Message::NOTE_OFF => self.note_off(msg.data1, Some(msg.data2)),
             Message::CONTROL_CHANGE => match msg.data1 {
                 Message::CC_SUSTAIN => self.set_pedal(msg.data2 >= 64),
                 Message::CC_ALL_SOUND_OFF | Message::CC_ALL_NOTES_OFF => self.silence(),
@@ -313,7 +379,6 @@ impl NoteEngine {
     /// Advance the envelopes by `dt` seconds and redraw the grid.
     pub fn advance(&mut self, dt: f32) {
         let attack = coefficient(ATTACK_MS / 1000.0, dt);
-        let release = coefficient(self.release_ms / 1000.0, dt);
 
         for note in self.low..=self.high {
             let n = note as usize;
@@ -327,6 +392,9 @@ impl NoteEngine {
                 0.0
             };
 
+            // Per note, so it has to be derived inside the loop: the release
+            // a key asked for on its way up is a property of that key.
+            let release = coefficient(self.release_ms[n] / 1000.0, dt);
             let env = &mut self.env[n];
             let c = if target > *env { attack } else { release };
             *env += c * (target - *env);
@@ -379,9 +447,11 @@ impl NoteEngine {
         }
     }
 
-    /// Retune the release, in the same terms the audio ballistics use.
+    /// Retune the fallback release, in the same terms the audio ballistics
+    /// use. Notes already falling keep the time their note-off asked for —
+    /// moving a slider is not a reason for a fade in flight to jump.
     pub fn set_decay(&mut self, decay: f32) {
-        self.release_ms = BASE_RELEASE_MS * decay_scale(decay);
+        self.default_release_ms = BASE_RELEASE_MS * decay_scale(decay);
     }
 
     pub fn set_eq(&mut self, bands: &[EqBand]) {
@@ -409,13 +479,22 @@ impl NoteEngine {
         self.chan[n] = channel.min((CHANNEL_COUNT - 1) as u8);
         self.held[n] = true;
         self.latched[n] = false;
+        // A note struck again has not been released yet, and until it is the
+        // only release time there is to name is the layer's own.
+        self.release_ms[n] = self.default_release_ms;
     }
 
-    fn note_off(&mut self, note: u8) {
+    fn note_off(&mut self, note: u8, velocity: Option<u8>) {
         if note < self.low || note > self.high {
             return;
         }
         let n = note as usize;
+        // Latched before the pedal is consulted: the release was asked for when
+        // the key came up, and the pedal only decides when it is spent.
+        self.release_ms[n] = match velocity {
+            Some(v) => self.cfg.release_ms_for(v),
+            None => self.default_release_ms,
+        };
         self.held[n] = false;
         if self.pedal {
             self.latched[n] = true;
@@ -446,6 +525,9 @@ impl NoteEngine {
         self.held = [false; NOTE_COUNT];
         self.latched = [false; NOTE_COUNT];
         self.pedal = false;
+        // All-notes-off names no velocity, so everything it releases falls at
+        // the layer's decay rather than at whatever the last key asked for.
+        self.release_ms = [self.default_release_ms; NOTE_COUNT];
     }
 
     fn resample_eq(&mut self) {
@@ -525,8 +607,26 @@ mod tests {
         Message { status: 0x90, data1: note, data2: velocity }
     }
 
+    /// A note-off from a keyboard that does not sense release, which sends the
+    /// spec's default velocity of 64 — half of "Max decay time".
     fn off(note: u8) -> Message {
-        Message { status: 0x80, data1: note, data2: 0 }
+        off_at(note, 64)
+    }
+
+    fn off_at(note: u8, velocity: u8) -> Message {
+        Message { status: 0x80, data1: note, data2: velocity }
+    }
+
+    /// Frames until a note has gone out, capped so a stuck note fails the test
+    /// rather than hanging it.
+    fn frames_to_silence(e: &mut NoteEngine, note: u8) -> usize {
+        for frame in 1..4000 {
+            e.advance(DT);
+            if e.levels()[at(note)] == 0.0 {
+                return frame;
+            }
+        }
+        panic!("note {note} never went out");
     }
 
     fn cc(controller: u8, value: u8) -> Message {
@@ -593,8 +693,125 @@ mod tests {
         e.advance(DT);
         assert!(e.levels()[at(60)] < held, "release should start immediately");
 
-        settle(&mut e, 500);
-        assert_eq!(e.levels()[at(60)], 0.0, "release should reach zero, not leave a tail");
+        frames_to_silence(&mut e, 60);
+    }
+
+    /// The release velocity is the fade, read across the decay range: its
+    /// bottom at 0, its top at 127, linear in between. With the default floor
+    /// of zero, the bottom is an instant cut.
+    #[test]
+    fn a_note_off_velocity_of_zero_puts_a_note_out_at_once() {
+        let mut e = engine();
+        e.handle(on(60, 127));
+        settle(&mut e, 200);
+        e.handle(off_at(60, 0));
+        e.advance(DT);
+        assert_eq!(e.levels()[at(60)], 0.0, "velocity 0 means gone, not fading");
+    }
+
+    #[test]
+    fn a_harder_note_off_takes_longer_to_go_out() {
+        let fade = |velocity| {
+            let mut e = engine();
+            e.handle(on(60, 127));
+            settle(&mut e, 200);
+            e.handle(off_at(60, velocity));
+            frames_to_silence(&mut e, 60)
+        };
+        let (quick, middling, slow) = (fade(20), fade(64), fade(127));
+        assert!(quick < middling, "{quick} !< {middling}");
+        assert!(middling < slow, "{middling} !< {slow}");
+    }
+
+    /// The control names the top of the range, so the longest fade there is
+    /// lands within a frame or two of it.
+    #[test]
+    fn full_note_off_velocity_decays_over_the_configured_maximum() {
+        let cfg = MidiConfig { max_decay_ms: 500.0, ..MidiConfig::default() };
+        let mut e = NoteEngine::new(&cfg, None, REFERENCE_DECAY);
+        e.handle(on(60, 127));
+        settle(&mut e, 200);
+        e.handle(off_at(60, 127));
+
+        // One time constant is 1/e of the way down, which is where an
+        // exponential release is actually pinned — the floor it is snapped at
+        // is a tidiness threshold, not the time being set.
+        let frames = (0.5 / DT).round() as usize;
+        settle(&mut e, frames);
+        let left = e.levels()[at(60)];
+        assert!((left - 1.0 / std::f32::consts::E).abs() < 0.05, "{left}");
+    }
+
+    /// The floor is what stops the softest note-off snapping. Raise it and
+    /// velocity 0 fades like everything else — the range moves, the mapping
+    /// does not.
+    #[test]
+    fn a_decay_floor_gives_the_softest_note_off_a_fade() {
+        let cfg = MidiConfig { min_decay_ms: 400.0, ..MidiConfig::default() };
+        let mut e = NoteEngine::new(&cfg, None, REFERENCE_DECAY);
+        e.handle(on(60, 127));
+        settle(&mut e, 200);
+        e.handle(off_at(60, 0));
+        settle(&mut e, 10);
+        assert!(e.levels()[at(60)] > 0.8, "a floored release is still a release");
+        frames_to_silence(&mut e, 60);
+    }
+
+    /// Half velocity is halfway between the ends, not half the top: the pair is
+    /// a range and the interpolation runs across it.
+    #[test]
+    fn a_note_off_lands_between_the_two_ends_on_its_velocity() {
+        let cfg =
+            MidiConfig { min_decay_ms: 200.0, max_decay_ms: 1000.0, ..MidiConfig::default() };
+        assert_eq!(cfg.release_ms_for(0), 200.0);
+        assert_eq!(cfg.release_ms_for(127), 1000.0);
+        assert!((cfg.release_ms_for(64) - 603.0).abs() < 2.0);
+    }
+
+    /// Ordered rather than rejected, as an inverted note range is. A harder
+    /// note-off must not be the one that vanishes first.
+    #[test]
+    fn a_decay_range_stored_the_wrong_way_round_is_still_a_range() {
+        let cfg =
+            MidiConfig { min_decay_ms: 900.0, max_decay_ms: 100.0, ..MidiConfig::default() };
+        assert_eq!(cfg.decay_range(), (100.0, 900.0));
+        assert!(cfg.release_ms_for(0) < cfg.release_ms_for(127));
+
+        let broken = MidiConfig { max_decay_ms: f32::NAN, ..MidiConfig::default() };
+        assert_eq!(broken.decay_range().1, DEFAULT_MAX_DECAY_MS);
+    }
+
+    /// Two keys lifted differently are two fades, not one. A chord released a
+    /// finger at a time is the whole reason this is per note.
+    #[test]
+    fn each_note_keeps_the_fade_its_own_key_asked_for() {
+        let mut e = engine();
+        e.handle(on(60, 127));
+        e.handle(on(72, 127));
+        settle(&mut e, 200);
+        e.handle(off_at(60, 10));
+        e.handle(off_at(72, 127));
+        settle(&mut e, 40);
+        assert!(
+            e.levels()[at(72)] > e.levels()[at(60)] + 0.2,
+            "the slowly released note should still be well ahead"
+        );
+    }
+
+    /// The pedal decides when a release is spent, not how fast it is.
+    #[test]
+    fn the_pedal_spends_the_release_the_key_asked_for() {
+        let mut e = engine();
+        e.handle(cc(Message::CC_SUSTAIN, 127));
+        e.handle(on(60, 127));
+        settle(&mut e, 200);
+        e.handle(off_at(60, 0));
+        settle(&mut e, 10);
+        assert!(e.levels()[at(60)] > 0.9, "the pedal is still holding it");
+
+        e.handle(cc(Message::CC_SUSTAIN, 0));
+        e.advance(DT);
+        assert_eq!(e.levels()[at(60)], 0.0, "and lifting it spends the instant release");
     }
 
     /// Every sequencer sends note-on at velocity 0 for note-off; missing this
@@ -609,6 +826,20 @@ mod tests {
         assert_eq!(e.levels()[at(60)], 0.0);
     }
 
+    /// That spelling carries no release velocity — the byte is the spelling —
+    /// so it must fall at the layer's decay rather than being read as an
+    /// instant cut, which is what a sequencer would otherwise get.
+    #[test]
+    fn a_zero_velocity_note_on_releases_at_the_layer_decay() {
+        let mut e = engine();
+        e.handle(on(60, 127));
+        settle(&mut e, 200);
+        e.handle(on(60, 0));
+        e.advance(DT);
+        let left = e.levels()[at(60)];
+        assert!(left > 0.9 && left < 1.0, "it should be fading, not gone: {left}");
+    }
+
     #[test]
     fn the_sustain_pedal_holds_a_released_note() {
         let mut e = engine();
@@ -620,8 +851,7 @@ mod tests {
         assert!(e.levels()[at(60)] > 0.98, "the pedal should be holding this note");
 
         e.handle(cc(64, 0));
-        settle(&mut e, 500);
-        assert_eq!(e.levels()[at(60)], 0.0, "lifting the pedal releases it");
+        frames_to_silence(&mut e, 60);
     }
 
     #[test]
@@ -632,8 +862,7 @@ mod tests {
         e.handle(on(60, 127));
         e.advance(DT);
         e.handle(off(60));
-        settle(&mut e, 500);
-        assert_eq!(e.levels()[at(60)], 0.0);
+        frames_to_silence(&mut e, 60);
     }
 
     #[test]
@@ -726,7 +955,7 @@ mod tests {
         assert_eq!(e.channels()[at(30)], NO_CHANNEL, "nothing is sounding down here");
 
         e.handle(off(60));
-        settle(&mut e, 500);
+        frames_to_silence(&mut e, 60);
         assert_eq!(e.channels()[at(60)], NO_CHANNEL, "and the note is gone");
     }
 

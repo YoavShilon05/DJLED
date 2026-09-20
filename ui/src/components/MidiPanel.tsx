@@ -3,9 +3,11 @@ import { Checkbox, RangeSlider, Slider, Stack, Text } from "@mantine/core";
 
 import type { EditorLayer } from "../config/editor";
 import {
+  MAX_DECAY_CEILING,
   MAX_NOTE,
   MIN_NOTE,
   MIN_NOTE_SPAN,
+  decayRange,
   noteHz,
   noteName,
   noteRange,
@@ -36,9 +38,14 @@ interface Props {
  * Memoised: nothing in here is driven by a frame, and a frame arrives thirty
  * times a second. See the note on `frame` in `App.tsx`.
  */
+/** A decay end as the panel says it: "instant" reads as what it does, where
+ *  "0.00 s" reads as a number someone forgot to set. */
+const secs = (ms: number) => (ms === 0 ? "instant" : `${(ms / 1000).toFixed(2)} s`);
+
 export const MidiPanel = memo(function MidiPanel({ layer, onChange, live }: Props) {
   const { midi } = layer;
   const [low, high] = noteRange(midi.lowNote, midi.highNote);
+  const { minDecayMs, maxDecayMs } = decayRange(midi.minDecayMs, midi.maxDecayMs);
   const octaves = (high - low) / 12;
 
   const setRange = ([lowNote, highNote]: [number, number]) =>
@@ -94,6 +101,29 @@ export const MidiPanel = memo(function MidiPanel({ layer, onChange, live }: Prop
         <ChannelColors
           colors={midi.channelColors}
           onChange={(channelColors) => onChange({ ...layer, midi: { ...midi, channelColors } })}
+        />
+      </Field>
+
+      <Field
+        label="Decay time"
+        value={`${secs(minDecayMs)} – ${secs(maxDecayMs)}`}
+        hint={
+          minDecayMs === maxDecayMs
+            ? "Every note-off fades the same, whatever its velocity."
+            : `Min at a note-off of 0, max at 127.`
+        }
+        info="A note-off carries a velocity of its own, and it sets the fade: the left end at velocity 0, the right end at 127, linear in between. So this is the range a key can ask for rather than the fade itself — a floor above zero is what stops the softest release snapping, and closing the two ends together makes velocity stop mattering. A keyboard that does not sense release sends 64 for everything and lands in the middle; a sequencer spelling note-off as a note-on at velocity 0 carries no release velocity at all and falls back to the layer's Decay instead."
+      >
+        <RangeSlider
+          min={0}
+          max={MAX_DECAY_CEILING}
+          step={50}
+          minRange={0}
+          value={[minDecayMs, maxDecayMs]}
+          onChange={([min, max]) =>
+            onChange({ ...layer, midi: { ...midi, minDecayMs: min, maxDecayMs: max } })
+          }
+          label={secs}
         />
       </Field>
 

@@ -32,6 +32,9 @@ import {
   DEFAULT_CHANNEL_COLORS,
   DEFAULT_HIGH_NOTE,
   DEFAULT_LOW_NOTE,
+  DEFAULT_MAX_DECAY_MS,
+  DEFAULT_MIN_DECAY_MS,
+  decayRange,
   noteRange,
 } from "./notes";
 import { DB_MAX, DB_MIN, dbToNorm, hzToNorm, normToDb, normToHz } from "./scales";
@@ -281,6 +284,8 @@ export function defaultLayer(name: string): EditorLayer {
       highNote: DEFAULT_HIGH_NOTE,
       spread: 1,
       sustain: true,
+      minDecayMs: DEFAULT_MIN_DECAY_MS,
+      maxDecayMs: DEFAULT_MAX_DECAY_MS,
       channelColors: [...DEFAULT_CHANNEL_COLORS],
     },
     blend: DEFAULT_SURFACE.sigma,
@@ -497,7 +502,9 @@ function fromEngineLayer(layer: LayerConfig): EditorLayer {
     curve: layer.curve,
     decay: layer.decay,
     sampleLength: layer.sampleLength,
-    midi: { ...base.midi, ...layer.midi },
+    // Sanitised rather than merged: an engine that predates a field sends it
+    // as absent, and `undefined` spread over a default is not the default.
+    midi: sanitiseMidi(layer.midi, base.midi),
   };
 }
 
@@ -720,6 +727,7 @@ function sanitiseMidi(stored: Partial<MidiConfig> | undefined, fallback: MidiCon
     highNote,
     spread,
     sustain: merged.sustain !== false,
+    ...decayRange(merged.minDecayMs, merged.maxDecayMs),
     channelColors: sanitiseChannelColors(merged.channelColors),
   };
 }

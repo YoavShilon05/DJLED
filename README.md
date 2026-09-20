@@ -286,7 +286,8 @@ editor relabels the axis with note names so it is not quietly lying about it.
 | Note glow | how far a note bleeds into its neighbours, in semitones. 0 is one hard bar per note |
 | Sustain pedal | whether CC64 holds released notes lit, as it holds them sounding |
 | Channel colour | the sixteen channel colours, on a 4×4 grid. Each one's opacity blends it with the layer's colour field rather than with what is underneath |
-| Decay | the release time after a note is let go — the same control, and the same mapping, as the audio ballistics |
+| Decay time | the range of fades a note-off can ask for. A note-off carries its own velocity, and it reads across the range linearly: the minimum at 0, the maximum at 127. A floor above zero is what stops the softest release snapping, and closing the two ends together makes release velocity stop mattering |
+| Decay | the release time for a note-off that named no velocity — the same control, and the same mapping, as the audio ballistics |
 
 The grid is one point per semitone, which is finer than any audio band plan and
 is what keeps adjacent notes readable as separate bars. The *wire* carries fewer:
@@ -328,8 +329,14 @@ there is room for the full 85.
 ### What it does with the messages
 
 Note-on sets the level to velocity and holds it there — a held chord does not
-fade under your fingers. Note-off starts the release. Note-on at velocity 0 is
-treated as note-off, which every sequencer including FL's relies on. CC64 latches
+fade under your fingers. Note-off starts the release, and how fast it falls is that
+message's *own* velocity, read across the layer's decay range — "Min decay
+time" at velocity 0, "Max decay time" at 127, linear between. A keyboard that
+does not sense release sends 64 for every note and lands in the middle;
+one that does plays the fade the way it plays the strike. Note-on at velocity 0
+is treated as note-off, which every sequencer including FL's relies on — and it
+carries no release velocity to read, since that byte is the spelling, so it falls
+at the layer's Decay instead of being cut dead. CC64 latches
 notes like a piano; CC120 and CC123 release everything. Pitch bend, aftertouch
 and program change are ignored.
 
@@ -544,7 +551,7 @@ controls land in three different places, and which one matters:
 |---|---|---|
 | Layer order, opacity, enable | `color/render.rs` | the fold itself, applied after every layer has been sampled |
 | Source, channel | `stack.rs`, then `source.rs` | it is the signal itself; the stack decides which layers share a device, and a kind change rebuilds that layer's renderer |
-| Note range, glow, sustain | `midi/notes.rs` | they define the grid the levels sit on |
+| Note range, glow, sustain, decay time | `midi/notes.rs` | they define the grid the levels sit on, and the envelope that rides it |
 | EQ | `dsp/post.rs`, after AGC, before the range map | see below |
 | Decay | release ballistics in `dsp/post.rs` | it *is* the release time |
 | Frame hop | rebuilds the analyser | changes how often transforms run |

@@ -101,8 +101,14 @@ impl Pipeline {
         self.send(Message { status: 0x90 | channel, data1: note, data2: velocity });
     }
 
+    /// Note-off at velocity 0: the fastest release there is, and the one the
+    /// rest of this file wants when it lets a note go.
     fn note_off(&mut self, note: u8) {
-        self.send(Message { status: 0x80, data1: note, data2: 0 });
+        self.note_off_at(note, 0);
+    }
+
+    fn note_off_at(&mut self, note: u8, velocity: u8) {
+        self.send(Message { status: 0x80, data1: note, data2: velocity });
     }
 
     /// Advance the whole chain for `secs`, at the rate the engine runs it.
@@ -479,4 +485,44 @@ fn two_channels_reach_the_strip_in_two_colours() {
     let high = p.leds[led_of(96)];
     assert!(low[0] > low[2], "the left hand should be red, got {low:?}");
     assert!(high[2] > high[0], "the right hand should be blue, got {high:?}");
+}
+
+
+/// Release velocity reaches the LED bytes, which is the only place it counts.
+///
+/// A note let go gently and the same note let go hard are the same note-off
+/// message but for one byte, and a second later the wall has to disagree about
+/// them — otherwise the control is a slider that moves a number nobody reads.
+#[test]
+fn release_velocity_decides_how_long_a_note_stays_on_the_wall() {
+    let after = |velocity| {
+        let mut p = Pipeline::new();
+        p.note_on(60, 127);
+        p.run(1.0);
+        p.note_off_at(60, velocity);
+        p.run(0.5);
+        p.lit()
+    };
+
+    let cut = after(0);
+    let middling = after(64);
+    let slow = after(127);
+    assert_eq!(cut, 0, "velocity 0 is gone, not fading");
+    assert!(middling < slow, "{middling} !< {slow}");
+}
+
+/// And the control is the top of that range: shorten it and every release
+/// shortens with it, including one that asked for the maximum.
+#[test]
+fn max_decay_time_bounds_the_longest_release() {
+    let held_for = |max_decay_ms| {
+        let cfg = MidiConfig { max_decay_ms, ..MidiConfig::default() };
+        let mut p = Pipeline::with(cfg, LayoutConfig::spanning(LEDS));
+        p.note_on(60, 127);
+        p.run(1.0);
+        p.note_off_at(60, 127);
+        p.run(0.5);
+        p.lit()
+    };
+    assert!(held_for(100.0) < held_for(4000.0));
 }

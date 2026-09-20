@@ -113,6 +113,22 @@ export interface MidiConfig {
   /** Honour the sustain pedal (CC64). */
   sustain: boolean;
   /**
+   * What a note-off at velocity 0 asks for, in milliseconds.
+   *
+   * The bottom of the decay range rather than a release time: 0 puts the note
+   * out on the frame the key comes up, and anything above it is what stops the
+   * softest note-off snapping.
+   */
+  minDecayMs: number;
+  /**
+   * What a note-off at velocity 127 asks for, in milliseconds.
+   *
+   * A note-off carries a velocity of its own, and it lands linearly between
+   * `minDecayMs` and this one, so the pair is a range and the velocity reads
+   * across it.
+   */
+  maxDecayMs: number;
+  /**
    * A colour per MIDI channel, index 0 being channel 1. Sixteen of them, as
    * `#rrggbb` or `#rrggbbaa`.
    *

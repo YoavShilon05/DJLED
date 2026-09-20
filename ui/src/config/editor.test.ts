@@ -17,7 +17,13 @@ import {
   withLayer,
   type EditorConfig,
 } from "./editor";
-import { DEFAULT_CHANNEL_COLORS } from "./notes";
+import {
+  DEFAULT_CHANNEL_COLORS,
+  DEFAULT_MAX_DECAY_MS,
+  DEFAULT_MIN_DECAY_MS,
+  MAX_DECAY_CEILING,
+  decayRange,
+} from "./notes";
 
 const STORAGE_KEY = "djled.editor";
 
@@ -182,6 +188,42 @@ describe("a MIDI layer's channel", () => {
       activeLayerId: layer.id,
     }));
     expect(adopted.layers[0].source.channel).toBeNull();
+  });
+});
+
+describe("the decay range", () => {
+  it("survives a round trip and defaults for a preset that predates it", () => {
+    const layer = { ...defaultLayer("Keys") };
+    expect(layer.midi.minDecayMs).toBe(DEFAULT_MIN_DECAY_MS);
+    expect(layer.midi.maxDecayMs).toBe(DEFAULT_MAX_DECAY_MS);
+
+    layer.midi = { ...layer.midi, minDecayMs: 120, maxDecayMs: 750 };
+    const show = toEngineConfig({ ...DEFAULT_CONFIG, layers: [layer], activeLayerId: layer.id });
+    expect(show.layers[0].midi).toMatchObject({ minDecayMs: 120, maxDecayMs: 750 });
+    expect(fromEngineConfig(DEFAULT_CONFIG, show).layers[0].midi).toMatchObject({
+      minDecayMs: 120,
+      maxDecayMs: 750,
+    });
+
+    // A show written before the controls existed: the fields are missing rather
+    // than zero, and zero for the top would mean every note cuts dead.
+    const older = {
+      ...show,
+      layers: [
+        {
+          ...show.layers[0],
+          midi: { ...show.layers[0].midi, minDecayMs: undefined, maxDecayMs: undefined },
+        },
+      ],
+    };
+    const back = fromEngineConfig(DEFAULT_CONFIG, older as unknown as typeof show);
+    expect(back.layers[0].midi.maxDecayMs).toBe(DEFAULT_MAX_DECAY_MS);
+    expect(back.layers[0].midi.minDecayMs).toBe(DEFAULT_MIN_DECAY_MS);
+  });
+
+  it("orders a range stored the wrong way round rather than rejecting it", () => {
+    expect(decayRange(900, 100)).toEqual({ minDecayMs: 100, maxDecayMs: 900 });
+    expect(decayRange(-5, 99999)).toEqual({ minDecayMs: 0, maxDecayMs: MAX_DECAY_CEILING });
   });
 });
 
