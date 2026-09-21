@@ -37,7 +37,20 @@ import type { CurveConfig } from "./config/curve";
 import type { EqBand } from "./config/eq";
 import type { LedKeyframe } from "./config/editor";
 
-export const DEFAULT_URL = "ws://127.0.0.1:9001";
+/**
+ * Where the editor connects, unless it was told otherwise.
+ *
+ * Two ways in, one of which does not know the answer in advance. In
+ * development the page comes from vite and the engine is on its default port,
+ * which is a constant. Installed, the page is served by the engine itself on a
+ * port the OS chose, and `web.rs` writes the socket it belongs to into the
+ * document on the way out — so a page always talks to the engine that served
+ * it, and the fixed port stays what it has always been for vite and the three
+ * smoke scripts.
+ */
+const INJECTED = typeof window === "undefined" ? undefined : (window as { __DJLED_WS__?: string }).__DJLED_WS__;
+
+export const DEFAULT_URL = INJECTED ?? "ws://127.0.0.1:9001";
 
 /**
  * The engine's `show::Layer`, verbatim.

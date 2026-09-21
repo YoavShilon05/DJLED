@@ -44,8 +44,8 @@ cargo run --manifest-path engine/Cargo.toml --release -- --port COM3
 cd ui && npm install && npm run dev
 
 # Tests
-cargo test --manifest-path engine/Cargo.toml        # 330 pass (266 lib + 64 integration)
-cd ui && npm test                                   # 131 pass across 10 files
+cargo test --manifest-path engine/Cargo.toml        # 344 pass (278 lib + 66 integration)
+cd ui && npm test                                   # 133 pass across 10 files
 cd ui && npm run typecheck                          # tsc --noEmit, clean
 
 # End-to-end over the real socket, against a running engine
@@ -56,7 +56,22 @@ cd ui && npm run timeline-smoke     # a loop, against the clock both sides read
 # Regenerate the Rust→TS colour parity fixture (see Invariants)
 cargo run --manifest-path engine/Cargo.toml --example color_reference \
   > ui/src/color/reference.json
+
+# Release: editor → ui/dist → baked into the exe → dist/
+powershell -ExecutionPolicy Bypass -File scripts/release.ps1
+
+# …and put it in %LOCALAPPDATA%\Programs\DJLED, starting at every logon
+powershell -ExecutionPolicy Bypass -File scripts/release.ps1 -Install -Start -Port COM6
+powershell -ExecutionPolicy Bypass -File scripts/release.ps1 -Uninstall
 ```
+
+Two binaries come out of the one crate and they are the same program — the
+subsystem is a link-time flag, which is the only reason there are two:
+
+| | |
+|---|---|
+| `djled.exe` | Console. Every diagnostic below, the bar display, ctrl-c to stop. |
+| `djledw.exe` | No console. Tray icon, and stdout is `%LOCALAPPDATA%\DJLED\djled.log`. What gets installed. |
 
 Diagnostics that answer "is it the wiring or the software":
 
@@ -67,6 +82,7 @@ Diagnostics that answer "is it the wiring or the software":
 --test rgb|chase|white  drive the strip with no audio at all — see docs/wiring.md
 --presets PATH          where the twelve presets live
 --no-hotkeys            give ctrl+alt+F1..F12 back to whatever else wants them
+--tray                  run as an installed release does, from a terminal
 ```
 
 There is no CI, no linter config, and no `rustfmt.toml`.
@@ -78,6 +94,7 @@ There is no CI, no linter config, and no `rustfmt.toml`.
 | `engine/src/` | Rust. See `engine/CLAUDE.md`. |
 | `ui/src/` | React + TS + Mantine editor. See `ui/CLAUDE.md`. |
 | `firmware/djled/djled.ino` | Arduino sketch. See `firmware/CLAUDE.md`. |
+| `scripts/release.ps1` | Build, stage into `dist/`, install, uninstall. |
 | `docs/wiring.md` | Electrical. Read before anyone powers a strip. |
 | `README.md` | Design rationale for every non-obvious decision. |
 | `tmp_albumart.cs`, `tmp_colors.cs` (+ `.exe`) | **Orphans.** See Housekeeping. |
@@ -357,6 +374,42 @@ trip.
   here; the engine names the ones it lost at startup, because a hotkey that never
   registered is otherwise indistinguishable from one that fired and did
   nothing.
+
+- **The installed editor is whatever `ui/dist` held when the engine was
+  compiled.** `engine/build.rs` bakes it in, so a UI change reaches an installed
+  copy only after `npm run build` *and* a rebuild, in that order. That is what
+  `scripts/release.ps1` is for; running the two by hand in the other order
+  ships the previous bundle with nothing to show for it. Cargo does rerun the
+  build script when `ui/dist` changes, so the ordering is the only trap.
+- **The page's port is random, the socket's is not.** The editor is served on
+  whatever `web.rs` was given by the OS, because only the tray menu opens it.
+  The WebSocket keeps 9001, because vite's editor and the three smoke scripts
+  connect to it by name. A page served by the engine is told its own socket
+  through an injected `window.__DJLED_WS__`; one served by vite falls back to
+  the default. Change one side of that and the installed editor connects to a
+  port that may belong to something else entirely.
+- **Restart is two processes, and they overlap.** The serial port, the capture
+  endpoint, the MIDI handle and 9001 are all single-holder, and the parent has
+  not exited when the child starts, so the child waits a second first
+  (`DJLED_RESTART_WAIT`). Removing that wait makes a tray restart come back with
+  the wall dark and a line in the log about a port that was busy.
+- **No `--port` is not an error, and that is what makes it expensive.** The
+  engine falls back to the mock link, so the editor is alive, the bars move,
+  the preview strip lights, and the wall is dark — every display on the PC side
+  agrees that everything is fine, because none of them cross the wire. It is
+  the same failure shape as the READY starvation above. `--list-ports`, the
+  `output` line in the log, and the tray tooltip all answer it in one look;
+  `scripts/release.ps1 -Port` exists so an install cannot land in that state by
+  accident.
+- **`powershell -File` does not parse PowerShell.** `-EngineArgs '--port','COM6'`
+  reaches the script as the one literal string `--port,COM6`, which clap
+  rejects — and a windowed binary that rejects its arguments exits instantly
+  with nothing on screen. `release.ps1` splits commas itself and offers `-Port`,
+  but anything else invoked through `-File` has the same trap.
+- **A tray icon on Windows 11 starts in the overflow.** New icons are hidden
+  until they are dragged onto the taskbar, so "there is no icon" after an
+  install usually means "click the chevron". Nothing in the code can change
+  that.
 
 ## Conventions
 

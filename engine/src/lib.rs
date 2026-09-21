@@ -20,7 +20,9 @@ pub mod presets;
 pub mod show;
 pub mod source;
 pub mod stack;
+pub mod tray;
 pub mod ui;
+pub mod web;
 
 pub use engine::{Engine, EngineConfig};
 pub use midi::MidiConfig;

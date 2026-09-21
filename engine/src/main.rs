@@ -17,7 +17,9 @@ use djled_engine::link::{expand_bands_to_leds, Link, MockLink, SerialLink};
 use djled_engine::presets::{Presets, SLOTS};
 use djled_engine::source::{self, LiveSource, Source, SourceKind};
 use djled_engine::stack::LiveStack;
+use djled_engine::tray::{Tray, TrayEvent};
 use djled_engine::ui::{encode_strip, Command, LayerFrame, State, UiServer};
+use djled_engine::web;
 use djled_engine::{EngineConfig, ShowConfig};
 
 const BAR_HEIGHT: usize = 20;
@@ -106,7 +108,32 @@ struct Args {
     /// whatever else wants them.
     #[arg(long)]
     no_hotkeys: bool,
+
+    /// Put an icon in the notification area and stop drawing to the terminal.
+    ///
+    /// What an installed release runs as. `djledw.exe` sets `DJLED_TRAY` and so
+    /// implies this; the flag is here so the same behaviour can be had from a
+    /// terminal while working on it.
+    #[arg(long)]
+    tray: bool,
 }
+
+/// How the run loop ended. It only ends on purpose — from the tray — so there
+/// are exactly two ways, and the difference between them is whether `main`
+/// starts another process on the way out.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Exit {
+    Stopped,
+    Restarting,
+}
+
+/// Set on the child of a restart, as a number of milliseconds to wait before
+/// touching anything. See `relaunch`.
+const RESTART_WAIT: &str = "DJLED_RESTART_WAIT";
+
+/// Set by `djledw.exe`, the windowed binary, which has no command line of its
+/// own to put `--tray` on.
+const TRAY_ENV: &str = "DJLED_TRAY";
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum Pattern {
@@ -128,8 +155,22 @@ impl From<Pattern> for TestPattern {
     }
 }
 
-fn main() -> Result<()> {
+/// `pub` because the windowed binary is the same program: `src/bin/djledw.rs`
+/// includes this file as a module and calls straight into here, so that there
+/// is one engine with two entry points rather than two engines.
+pub fn main() -> Result<()> {
     let args = Args::parse();
+    let tray_mode = args.tray || std::env::var_os(TRAY_ENV).is_some();
+
+    // A restart is two processes, and for a moment both exist: the one that
+    // spawned this one is still holding the serial port, the capture endpoint,
+    // the MIDI handle and port 9001, none of which can be opened twice. Waiting
+    // here rather than in the parent is what makes the parent's exit prompt —
+    // it spawns and goes — and the wait is under a second, which nobody
+    // notices in a menu click.
+    if let Some(ms) = std::env::var(RESTART_WAIT).ok().and_then(|v| v.parse::<u64>().ok()) {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
 
     if args.list_devices {
         list_devices();
@@ -228,7 +269,7 @@ fn main() -> Result<()> {
         }
     };
 
-    print_header(&stack, link.as_ref(), led_count, point_cap);
+    print_header(&stack, link.as_ref(), led_count, point_cap, tray_mode);
     print_presets(&presets, hotkeys.as_ref());
 
     // The UI is optional by design: the engine is a headless service and
@@ -249,10 +290,7 @@ fn main() -> Result<()> {
             active_preset: presets.active(),
         };
         match UiServer::start(args.ui_port, state) {
-            Ok(s) => {
-                println!("  editor   ws://127.0.0.1:{} — run `npm run dev` in ui/\n", s.port());
-                Some(s)
-            }
+            Ok(s) => Some(s),
             Err(e) => {
                 println!("  editor   unavailable: {e}\n");
                 None
@@ -260,7 +298,44 @@ fn main() -> Result<()> {
         }
     };
 
-    run(
+    // The page and the socket are two servers on two ports, deliberately: the
+    // socket keeps the fixed 9001 that vite's editor and the smoke scripts
+    // connect to by name, and the page gets whatever port the OS hands out,
+    // because nothing has to know it in advance — see `web`.
+    let site = match server.as_ref() {
+        Some(server) => match web::start(server.port()) {
+            Ok(site) => {
+                println!("  editor   {}  (socket ws://127.0.0.1:{})\n", site.url(), server.port());
+                Some(site)
+            }
+            Err(e) => {
+                // Not fatal, and not silent. `npm run dev` is still a perfectly
+                // good editor against the same socket.
+                println!(
+                    "  editor   ws://127.0.0.1:{} — run `npm run dev` in ui/\n           {e}\n",
+                    server.port()
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
+    // Last, so the icon appears once everything it can open is actually open.
+    let tray = if tray_mode {
+        let url = site.as_ref().map(|s| s.url()).unwrap_or_default();
+        match Tray::start(url, link.describe()) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                println!("  tray     unavailable: {e}\n");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let exit = run(
         &mut stack,
         show,
         &mut renderer,
@@ -270,7 +345,41 @@ fn main() -> Result<()> {
         server.as_ref(),
         &mut presets,
         hotkeys.as_ref(),
-    )
+        tray.as_ref(),
+        !tray_mode,
+    )?;
+
+    // Before the replacement process is started, so the two icons are never
+    // both up — and before the last flush of the presets, which `Presets`
+    // does on the way out.
+    if let Some(tray) = &tray {
+        tray.remove();
+    }
+
+    if exit == Exit::Restarting {
+        relaunch()?;
+    }
+    Ok(())
+}
+
+/// Start a fresh copy of this program with the arguments this one was given,
+/// then return so the caller can exit.
+///
+/// Spawn and go, rather than waiting: everything this process holds — the
+/// serial port, the capture endpoint, the socket — is released by its exit and
+/// not before, so the child is told to wait instead (`RESTART_WAIT`). The
+/// arguments are inherited verbatim because they are what somebody chose; a
+/// restart that quietly dropped `--port COM3` would come back with the wall
+/// dark and no explanation.
+fn relaunch() -> Result<()> {
+    let exe = std::env::current_exe().context("could not find this program to restart it")?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    std::process::Command::new(exe)
+        .args(args)
+        .env(RESTART_WAIT, "1000")
+        .spawn()
+        .context("could not start the replacement process")?;
+    Ok(())
 }
 
 /// The show the engine starts with: one layer, spanning the strip, listening to
@@ -466,6 +575,12 @@ fn available_ports_hint(requested: &str) -> String {
     }
 }
 
+/// The run loop: drain what has been asked for, render, send, display.
+///
+/// `console` says whether to paint the bars, the strip and the status line.
+/// False when there is a tray icon instead — the windowed binary's stdout is a
+/// log file, and sixty redraws a second of a display nobody can see would fill
+/// it with cursor movements and bury the one line that mattered.
 #[allow(clippy::too_many_arguments)]
 fn run(
     stack: &mut LiveStack,
@@ -477,13 +592,18 @@ fn run(
     server: Option<&UiServer>,
     presets: &mut Presets,
     hotkeys: Option<&Hotkeys>,
-) -> Result<()> {
+    tray: Option<&Tray>,
+    console: bool,
+) -> Result<Exit> {
     let mut leds = vec![[0u8; 3]; led_count];
     let mut last_draw = Instant::now();
     let frame = Duration::from_millis(1000 / TARGET_FPS);
     let mut first = true;
     let mut dropped = 0u64;
     let mut status = String::new();
+    // The last status written to the log, so a fault that persists for an hour
+    // is one line rather than a hundred thousand.
+    let mut logged = String::new();
 
     loop {
         // Before the idle check, not after: a stream that has died delivers
@@ -667,6 +787,20 @@ fn run(
             }
         }
 
+        // Beside the hotkeys, and for the same reason: the menu is the half of
+        // this that works with no editor attached. Stopping from here rather
+        // than from the tray thread is what makes it orderly — the loop leaves
+        // by its own door, so the presets reach the disk and the serial port is
+        // closed rather than yanked out from under a frame.
+        if let Some(tray) = tray {
+            if let Some(event) = tray.drain().last() {
+                return Ok(match event {
+                    TrayEvent::Stop => Exit::Stopped,
+                    TrayEvent::Restart => Exit::Restarting,
+                });
+            }
+        }
+
         // Coalesced writes: an edit marks the store dirty and this is where it
         // reaches the disk, at most once every 750 ms rather than once per
         // pointer move. Costs one comparison when there is nothing to save.
@@ -730,9 +864,21 @@ fn run(
                 });
             }
 
-            draw(stack, &leds, dropped, &status, first);
+            if console {
+                draw(stack, &leds, dropped, &status, first);
+                first = false;
+            } else if status != logged {
+                // The only thing worth a line in a log file: what went wrong,
+                // once, when it changes. Everything else the display shows is a
+                // picture of the present moment and means nothing after it.
+                if status.is_empty() {
+                    println!("recovered");
+                } else {
+                    println!("{status}");
+                }
+                logged = status.clone();
+            }
             last_draw = Instant::now();
-            first = false;
         }
     }
 }
@@ -873,7 +1019,13 @@ fn probe_midi(live: &mut LiveSource, secs: f64) -> Result<()> {
     Ok(())
 }
 
-fn print_header(stack: &LiveStack, link: &dyn Link, led_count: usize, point_cap: usize) {
+fn print_header(
+    stack: &LiveStack,
+    link: &dyn Link,
+    led_count: usize,
+    point_cap: usize,
+    tray_mode: bool,
+) {
     println!("DJLED");
     println!("  source   {}", stack.describe(0));
     println!("  output   {}", link.describe());
@@ -919,7 +1071,13 @@ fn print_header(stack: &LiveStack, link: &dyn Link, led_count: usize, point_cap:
         );
     }
 
-    println!("\n  play something. ctrl-c to quit.\n");
+    // How to stop it, which is not the same question in the two modes: there is
+    // no console to press ctrl-c in when the icon is the whole interface.
+    if tray_mode {
+        println!("\n  play something. right-click the tray icon to open the editor or stop.\n");
+    } else {
+        println!("\n  play something. ctrl-c to quit.\n");
+    }
 }
 
 /// What the twelve slots hold and which keys reach them.

@@ -67,7 +67,65 @@ Useful flags:
 --no-ui               don't open the editor's WebSocket port
 --presets PATH        where the twelve presets live
 --no-hotkeys          give ctrl+alt+F1..F12 back to whatever else wants them
+--tray                run as an installed release does, from a terminal
 ```
+
+## Installing it
+
+Development is two terminals: cargo in one, vite in the other, the editor on
+5173 talking to the engine on 9001. That is the wrong shape for something that
+is supposed to be *up* — during a set nobody wants a terminal, and a terminal
+that gets closed by accident takes the wall with it.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\release.ps1 -Install -Start -Port COM6
+```
+
+`-Port` is a parameter of its own rather than one more thing in `-EngineArgs`,
+because `powershell -File` does not parse PowerShell: an array written
+`-EngineArgs '--port','COM6'` arrives as the single literal string
+`--port,COM6`, the engine rejects it, and an installed copy started that way
+exits the instant it launches with no console to say so. What made that
+expensive was the *symptom* — without a port the engine falls back to the mock
+link, so the editor is alive, the bars move, the preview strip lights, and the
+wall is dark. The script now splits commas itself, checks the port is visible
+before it registers anything, and with `-Start` confirms the process survived
+and prints what the engine says it is driving. The tray tooltip says the same
+thing, for the same reason.
+
+What that builds is one file with no console, no window and no dependency on a
+checkout:
+
+- **The editor is inside the executable.** `engine/build.rs` reads `ui/dist` at
+  compile time and emits it as an asset table; `web.rs` serves it. Loose asset
+  files beside the exe would be one careless copy away from a blank page, and
+  the editor is the only way to author a show.
+- **It is served on a port the OS picks.** Nothing links to it and nothing
+  bookmarks it — the tray menu is how it opens, and the menu knows the port
+  because the process chose it. The WebSocket keeps its fixed 9001, because
+  vite's editor and the smoke scripts connect to that by name; the served page
+  is told which socket it belongs to on the way out, so the two are never
+  confused.
+- **A tray icon is the whole interface.** It answers the only two questions a
+  background service leaves open — is it running, and how do I get at it — and
+  its menu is three items, because anything about the *show* belongs in the
+  editor. Stop and restart go through the run loop rather than killing the
+  process, so the presets reach disk and the serial port is closed rather than
+  yanked; a restart's replacement waits a second before starting, since every
+  device it wants is still held by the process that spawned it.
+- **Its output is a log file.** A windowed process has no console to print to —
+  and `println!` panics when the write fails, so the startup banner would
+  otherwise be the last thing it ever did. `%LOCALAPPDATA%\DJLED\djled.log`,
+  appended across runs, with the per-frame bar display switched off: what is
+  worth keeping is what went wrong, once, when it changed.
+
+`djled.exe` is still there and still exactly what it was — every diagnostic
+flag, the bars in the terminal, ctrl-c to stop. The two binaries are one
+program compiled behind two headers, because whether Windows gives a process a
+console is decided when it is linked and cannot be a flag.
+
+`scripts\release.ps1 -Uninstall` removes the autostart entry, the shortcut and
+the folder, and leaves the presets and the log alone.
 
 ## Presets
 

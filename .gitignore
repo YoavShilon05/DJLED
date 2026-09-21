@@ -17,3 +17,5 @@ yarn-error.log*
 /ui/node_modules
 /ui/dist
 .idea
+# Release staging — scripts/release.ps1 rebuilds it from scratch
+/dist

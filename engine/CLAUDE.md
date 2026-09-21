@@ -3,8 +3,20 @@
 Capture, analysis, colour, compositing, wire protocol and the UI bridge. All
 signal processing happens here; the Arduino is a pixel expander.
 
-Edition 2024, no build script, no `rustfmt.toml`. See the root `CLAUDE.md` for
-cross-cutting invariants — especially that `cargo fmt` would rewrite 30 files.
+Edition 2024, no `rustfmt.toml`. See the root `CLAUDE.md` for cross-cutting
+invariants — especially that `cargo fmt` would rewrite 30 files.
+
+`build.rs` reads `../ui/dist` and emits the asset table `web.rs` serves from, so
+the built editor is inside the binary. A missing `ui/dist` is not an error: the
+table comes out empty and `web::start` says the editor was not bundled, which is
+what keeps `cargo test` from needing npm.
+
+Two binaries, one program. `src/main.rs` is `djled.exe`, the console one;
+`src/bin/djledw.rs` includes it as a module behind `#![windows_subsystem =
+"windows"]` and is `djledw.exe`, which has no console, puts up a tray icon and
+writes what it would have printed to `%LOCALAPPDATA%\DJLED\djled.log`. The
+subsystem is a link-time flag, which is the whole reason it cannot be an option
+on one binary.
 
 ## Reading order
 
@@ -41,6 +53,8 @@ the primary documentation and are usually more current than any summary here.
 | `ui.rs` | WebSocket server: `Snapshot` out per frame, `Command` in |
 | `presets.rs` | Twelve shows on disk, one live. Coalesced writes, atomic rename |
 | `hotkeys.rs` | `RegisterHotKey` for ctrl+alt+F1..F12 on a message-pump thread |
+| `web.rs` | HTTP server for the baked-in editor, on a port the OS picks |
+| `tray.rs` | The notification-area icon and its three-item menu, on a pump thread of its own |
 
 ## Signal flow, in order
 
@@ -76,6 +90,7 @@ the primary documentation and are usually more current than any summary here.
 | `READY` / `MAGIC` | `0x7E` / `A5 5A` | `link/protocol.rs` |
 | `MAX_PAYLOAD` / `OVERHEAD` | 255 / 5 → `max_bands()` = 85 | `link/protocol.rs` |
 | `DEFAULT_PORT` (UI) | 9001 | `ui.rs` |
+| the editor's HTTP port | whatever `:0` returns | `web.rs` |
 | `SLOTS` | 12 — fixed by the keyboard, not chosen | `presets.rs` |
 | `UNCONFINED` | 1.45 — what `radius: None` stands in as when interpolated | `color/surface.rs` |
 | `MIN_LENGTH` / `MAX_LENGTH` | 0.05 s / 600 s | `color/timeline.rs` |
@@ -159,12 +174,22 @@ the primary documentation and are usually more current than any summary here.
 - **The hotkey drain sits outside the `if let Some(server)` block.** The keys are
   the half of this that works with no editor attached, which is the entire reason
   they are registered with the OS rather than handled in the browser.
+- **The run loop only ends on purpose.** `run` returns `Exit::Stopped` or
+  `Exit::Restarting`, and both come from the tray menu — drained beside the
+  hotkeys, for the same reason, so that stopping goes out through the loop's own
+  door rather than killing the process from under the serial port. Everything
+  else in there still loops forever.
+- **The tray icon is removed before the replacement process starts.** An icon
+  whose process has gone is not cleared until something repaints the tray, so a
+  restart without that leaves a dead one beside the live one. `Tray::remove`
+  *sends* rather than posts for the same reason: a posted close races the
+  process's own exit.
 - **Failing to persist is never fatal.** A corrupt or unwritable presets file
   costs the presets and not the strip; the reason goes to the status line.
 
 ## Tests
 
-330 total: 266 unit (in-module `#[cfg(test)]`) + 64 integration.
+344 total: 278 unit (in-module `#[cfg(test)]`) + 66 integration.
 
 | File | What it defends |
 |---|---|

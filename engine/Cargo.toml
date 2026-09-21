@@ -2,6 +2,20 @@
 name = "djled-engine"
 version = "0.1.0"
 edition = "2024"
+# Two binaries, one program. `djled` is the console one: every diagnostic flag,
+# the bar display, ctrl-c to stop. `djledw` is the same code with no console at
+# all — what an installed release runs as, so that starting with the machine
+# does not flash a terminal on the desktop. Subsystem is decided at link time,
+# which is why it has to be a second binary rather than a flag.
+default-run = "djled"
+
+[[bin]]
+name = "djled"
+path = "src/main.rs"
+
+[[bin]]
+name = "djledw"
+path = "src/bin/djledw.rs"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -16,4 +30,4 @@ serialport = "4.9.0"
 tungstenite = "0.30.0"
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

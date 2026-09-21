@@ -34,7 +34,7 @@ editor's squiggles.
 | Path | Responsibility |
 |---|---|
 | `App.tsx` | Wires the client to the panels. Owns `EditorConfig` state and the debounced send |
-| `engine.ts` | `EngineClient` — socket, auto-reconnect, and the engine's wire types *verbatim* |
+| `engine.ts` | `EngineClient` — socket, auto-reconnect, and the engine's wire types *verbatim*. `DEFAULT_URL` prefers an injected `window.__DJLED_WS__`: vite serves this page against the fixed 9001, an installed engine serves it against its own socket |
 | `config/editor.ts` | `EditorConfig`, defaults, localStorage (`djled.editor`), `toEngineConfig` / `fromEngineConfig`, and `isStatic` / `toRenderSurface` / `toRenderTimeline` |
 | `config/scales.ts` | The two axes. Every gizmo, tick and hit test goes through here |
 | `config/eq.ts` | RBJ cookbook biquads, verbatim |

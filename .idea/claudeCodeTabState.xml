@@ -7,11 +7,8 @@
           <value>
             <TabSessionState>
               <option name="provider" value="claude" />
-              <option name="sessionId" value="fd3513f8-d095-4e2b-b00d-b1fa918504f4" />
-              <option name="cwd" value="C:\Users\draco\WebstormProjects\DJLED" />
               <option name="model" value="claude-opus-5[1m]" />
               <option name="permissionMode" value="bypassPermissions" />
-              <option name="reasoningEffort" value="low" />
             </TabSessionState>
           </value>
         </entry>
